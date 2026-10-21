@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-radv-server.sh (v8) — build the static RADV archive on the Bytesized server (no root).
+# build-radv-server.sh (v9) — build the static RADV archive on the Bytesized server (no root).
 #
 # It does what SETUP-RADV.md describes by hand would: make a host clang available, install
 # meson+ninja for your user, clone Mihawk's three public repos as siblings, and run THEIR OWN
@@ -163,16 +163,29 @@ export LIBRARY_PATH="$HOSTLIB${LIBRARY_PATH:+:$LIBRARY_PATH}"
 export PKG_CONFIG_PATH="$HOSTLIB/pkgconfig:$ZLIB_ROOT/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 export ZLIB_ROOT   # CMake's FindZLIB (LLVMConfig.cmake runs it) honours <Pkg>_ROOT
 
-# SPIRV-Tools v2025.4 (static libs + SPIRV-Tools.pc). Its git-sync-deps fetches the SPIRV-Headers
-# revision it pins.
+# On this server `git clone --branch <tag>` (and plain clones that follow tags) abort with
+# "multiple updates for ref 'refs/tags/...' not allowed" — the upstream repos carry each tag once, so
+# it is the server's git configuration mapping tags twice. Fetching one explicit revision into a bare
+# init bypasses every configured refspec, so that is how every pinned checkout is made here.
+fetch_rev() {   # fetch_rev DIR URL REV(tag name or commit sha)
+    local dir="$1" url="$2" rev="$3" ref="$3"
+    [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || ref="refs/tags/$rev"
+    if [[ -f "$dir/.fetched-rev" && "$(<"$dir/.fetched-rev")" == "$rev" ]]; then return 0; fi
+    rm -rf "$dir"; mkdir -p "$dir"
+    git -C "$dir" init -q
+    git -C "$dir" remote add origin "$url"
+    git -C "$dir" fetch -q --no-tags --depth 1 origin "$ref" || die "git fetch $url $ref failed"
+    git -C "$dir" -c advice.detachedHead=false checkout -q FETCH_HEAD || die "git checkout of $ref failed"
+    printf '%s\n' "$rev" > "$dir/.fetched-rev"
+}
+
+# SPIRV-Tools v2025.4 (static libs + SPIRV-Tools.pc) with the SPIRV-Headers revision its DEPS pins
+# (external/spirv-headers, where its CMake looks). Tests and their deps are skipped.
 if [[ ! -f "$HOSTLIB/pkgconfig/SPIRV-Tools.pc" ]]; then
     echo "  building SPIRV-Tools v2025.4"
-    if [[ ! -d "$HOSTSRC/SPIRV-Tools/.git" ]]; then
-        git clone -q --no-tags --depth 1 --branch v2025.4 https://github.com/KhronosGroup/SPIRV-Tools.git "$HOSTSRC/SPIRV-Tools" \
-            || die "clone SPIRV-Tools failed"
-    fi
-    ( cd "$HOSTSRC/SPIRV-Tools" && python3 utils/git-sync-deps ) >"$HOSTSRC/spirv-tools-deps.log" 2>&1 \
-        || die "SPIRV-Tools git-sync-deps failed — see $HOSTSRC/spirv-tools-deps.log"
+    fetch_rev "$HOSTSRC/SPIRV-Tools" https://github.com/KhronosGroup/SPIRV-Tools.git v2025.4
+    fetch_rev "$HOSTSRC/SPIRV-Tools/external/spirv-headers" https://github.com/KhronosGroup/SPIRV-Headers.git \
+        01e0577914a75a2569c846778c2f93aa8e6feddd
     cmake -S "$HOSTSRC/SPIRV-Tools" -B "$HOSTSRC/SPIRV-Tools/build" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOST" -DCMAKE_INSTALL_LIBDIR=lib \
         -DCMAKE_C_COMPILER="$HOSTCC" -DCMAKE_CXX_COMPILER="$HOSTCXX" \
@@ -183,18 +196,20 @@ if [[ ! -f "$HOSTLIB/pkgconfig/SPIRV-Tools.pc" ]]; then
 fi
 echo "  SPIRV-Tools: $(PKG_CONFIG_PATH=$HOSTLIB/pkgconfig pkg-config --modversion SPIRV-Tools 2>/dev/null || echo '?')"
 
-# SPIRV-LLVM-Translator v18.1.9 against the static LLVM 18 (libLLVMSPIRVLib.a + LLVMSPIRVLib.pc). It
-# fetches the SPIRV-Headers tag it pins by itself.
+# SPIRV-LLVM-Translator v18.1.9 against the static LLVM 18 (libLLVMSPIRVLib.a + LLVMSPIRVLib.pc). Its
+# CMake would git-clone the SPIRV-Headers tag it pins (spirv-headers-tag.conf = 1c6bb274, the
+# vulkan-sdk-1.3.275.0 tag) — that clone would hit the same git problem, so it is fetched here and
+# handed over.
 if [[ ! -f "$HOSTLIB/pkgconfig/LLVMSPIRVLib.pc" ]]; then
     echo "  building SPIRV-LLVM-Translator v18.1.9 (several minutes)"
-    if [[ ! -d "$HOSTSRC/SPIRV-LLVM-Translator/.git" ]]; then
-        git clone -q --no-tags --depth 1 --branch v18.1.9 https://github.com/KhronosGroup/SPIRV-LLVM-Translator.git "$HOSTSRC/SPIRV-LLVM-Translator" \
-            || die "clone SPIRV-LLVM-Translator failed"
-    fi
+    fetch_rev "$HOSTSRC/SPIRV-LLVM-Translator" https://github.com/KhronosGroup/SPIRV-LLVM-Translator.git v18.1.9
+    fetch_rev "$HOSTSRC/spirv-headers-for-translator" https://github.com/KhronosGroup/SPIRV-Headers.git \
+        1c6bb2743599e6eb6f37b2969acc0aef812e32e3
     cmake -S "$HOSTSRC/SPIRV-LLVM-Translator" -B "$HOSTSRC/SPIRV-LLVM-Translator/build" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOST" -DCMAKE_INSTALL_LIBDIR=lib \
         -DCMAKE_PREFIX_PATH="$HOST" -DCMAKE_C_COMPILER="$HOSTCC" -DCMAKE_CXX_COMPILER="$HOSTCXX" \
         -DLLVM_DIR="$LLVM_ROOT/lib/cmake/llvm" -DLLVM_SPIRV_BUILD_EXTERNAL=YES -DLLVM_SPIRV_INCLUDE_TESTS=OFF \
+        -DLLVM_EXTERNAL_SPIRV_HEADERS_SOURCE_DIR="$HOSTSRC/spirv-headers-for-translator" \
         >"$HOSTSRC/translator-cmake.log" 2>&1 || { tail -20 "$HOSTSRC/translator-cmake.log"; die "SPIRV-LLVM-Translator cmake failed"; }
     ninja -C "$HOSTSRC/SPIRV-LLVM-Translator/build" -j "$JOBS" install >"$HOSTSRC/translator-build.log" 2>&1 \
         || { grep -E "error|FAILED" "$HOSTSRC/translator-build.log" | head -20; die "SPIRV-LLVM-Translator build failed — send me $HOSTSRC/translator-build.log"; }
