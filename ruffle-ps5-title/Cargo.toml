@@ -1,0 +1,49 @@
+[package]
+name = "ruffle-ps5"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Ruffle (Flash emulator) as a native PlayStation 5 title, rendering through RADV (Vulkan) with wgpu"
+
+# A staticlib: cargo produces lib/libruffle_ps5.a, build-title.sh links it with RADV + the title runtime.
+# An rlib too, so `cargo check`/tests work on the host.
+[lib]
+name = "ruffle_ps5"
+path = "src/lib.rs"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Pinned to a Ruffle revision whose render/wgpu uses wgpu 30 (clone HEAD 2026-10-19).
+# Rev is pinned, not "branch = master", so a build is reproducible.
+ruffle_core = { git = "https://github.com/ruffle-rs/ruffle", rev = "be342ba07b48f3045a16659bdda5bd654ba064fe", default-features = false, features = [
+    "default_font",
+    "default_compatibility_rules",
+    "audio",
+    "mp3",
+] }
+ruffle_render = { git = "https://github.com/ruffle-rs/ruffle", rev = "be342ba07b48f3045a16659bdda5bd654ba064fe" }
+ruffle_render_wgpu = { git = "https://github.com/ruffle-rs/ruffle", rev = "be342ba07b48f3045a16659bdda5bd654ba064fe" }
+
+# Bring-your-own-Vulkan: we construct the instance/surface/device against the statically linked RADV
+# and hand them to wgpu through its `*_from_hal` seams. Versions must match what Ruffle's wgpu pins
+# (wgpu 30.0.1, wgpu-hal 30.0.1, ash 0.38) — Cargo unifies them because they are the same crates.
+wgpu = { version = "=30.0.1", default-features = false, features = ["wgsl", "vulkan"] }
+wgpu-hal = { version = "=30.0.1", default-features = false, features = ["vulkan"] }
+wgpu-types = "=30.0.1"
+# ash with NO default features: no dynamic loader is linked (a title cannot dlopen libvulkan).
+ash = { version = "=0.38.0", default-features = false, features = ["debug"] }
+raw-window-handle = "0.6"
+
+log = "0.4"
+
+[profile.release]
+panic = "abort"
+# Ruffle + wgpu + RADV is large; keep the title's code small and let LTO drop what a Flash title
+# never reaches. opt-level "s" first; revisit if AVM2 throughput needs it.
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = false
+
+[profile.dev]
+panic = "abort"

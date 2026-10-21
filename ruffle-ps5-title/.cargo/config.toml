@@ -1,0 +1,22 @@
+# PS5_RUFFLE_CARGO_V1 — cargo build settings for the Ruffle PS5 title.
+# Same PS5 target as milestone 1 (x86_64-sie-ps5, FreeBSD-11 ABI, build-std). The crate is a
+# staticlib: cargo compiles it to lib/libruffle_ps5.a, and build-title.sh links that with the
+# static RADV archive and the title runtime. The linker below is only used if cargo links a
+# binary (the optional payload test bin); the title's real link is in build-title.sh.
+
+[build]
+target = "x86_64-sie-ps5.json"
+
+[unstable]
+build-std = ["std", "panic_abort"]
+build-std-features = ["panic_immediate_abort"]
+json-target-spec = true
+
+[target.x86_64-sie-ps5]
+linker = "./tools/ps5-rust-linker.sh"
+rustflags = [
+  "--cfg", "libc_unstable_freebsd_version=\"11\"",
+  # wgpu's Vulkan backend talks to RADV through ash. ash must NOT try to dlopen libvulkan: a
+  # title cannot dlopen (the SDK loader makes raw syscalls). We build ash with its "loaded"
+  # feature off and hand it a static vkGetInstanceProcAddr (src/gpu.rs), so no loader is linked.
+]

@@ -364,6 +364,35 @@ So the three launch paths measured today:
 | websrv Homebrew page (big app) | title image replaced, uid 0 | 12 GB | **sceAgcInit fails** |
 | John's elfldr spawn: `budget_set(0)` **before** exec into SceSpZeroConf (websrv's payload page `/elfldr`, or `elfldr.elf` on port 9021) | daemon-class, uid 0 | budget 0 (12 GB expected) | expected OK — the next run |
 
+## 5l. Milestone 3 begins: Ruffle as a title on static RADV (2026-10-20, 21:15 MDT)
+
+The payload route is set aside: both launcher processes that have the direct-memory budget are
+refused by `libSceAgc` (`FS Table offset has shifted`, `sceAgcInit = 0x8a6c002f`), and the one that
+passes `sceAgcInit` has no budget. A **title** has both — it is the process type the system loader
+builds, the one PS5_RetroArch and the milestone-1 Rust tile already run in. So the renderer moves
+into a title, and because a title cannot `dlopen`, everything is static. The static GPU path on this
+console is **Vulkan through a RADV archive** (PS5_RetroArch links exactly this), so Ruffle's renderer
+becomes `ruffle_render_wgpu` on RADV, not glow/GL.
+
+The stack: `ruffle_core → ruffle_render_wgpu → wgpu 30 → wgpu-hal (vulkan) → RADV (static archive)`,
+presenting through `VK_KHR_display` on VideoOut (RADV flips). The one piece with no Rust prior art is
+adopting the statically linked RADV into wgpu: the C shell exports RADV's `vk_icdGetInstanceProcAddr`
+(as PS5_RetroArch's `src/radv_icd_ps5.c`), `src/gpu.rs` builds `ash::Entry` from that static symbol
+(no loader), creates the instance + a `VK_KHR_display` surface with plain Vulkan, and hands them to
+wgpu through its `*_from_hal` seams. The ash/Vulkan half is ordinary; the wgpu-hal argument lists are
+version-sensitive and get pinned against the compiler on the server, as the m1 shim was.
+
+Built this turn (`ruffle-ps5-title/`, in the repo): the crate (`Cargo.toml` pinning ruffle_core /
+ruffle_render_wgpu / wgpu 30 / ash 0.38 to a Ruffle rev), `src/gpu.rs`, `src/lib.rs` (3a clear-screen,
+3b player), the C shell (compiles clean against the SDK; `sceAgcInit(8)` from the executable), and a
+`build-title.sh` skeleton that reuses ps5-rust-title's converter/signer and PS5_Vulkan's
+`radv-link.sh`. Phases: **3a** — wgpu on RADV clears the display (the first server build, exercises
+only the GPU seam); **3b** (`--features ruffle`) — play a SWF.
+
+**The gating dependency:** a title links RADV as `libvulkan_radeon.ps5.a`, built by PS5_Vulkan from
+its Mesa fork (`tools/build-radv.sh release`). PS5_Vulkan + PS5_Mesa must be building before this
+links — the largest single setup step in the project.
+
 ## 6. Risks, in order
 
 1. The Rust `sdl2` crate against pacbrew's patched SDL2 (static link, PS5 video driver): version
