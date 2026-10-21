@@ -1,0 +1,28 @@
+[package]
+name = "ps5-rust-hello"
+version = "0.1.0"
+edition = "2021"
+description = "Milestone 1 of Ruffle-on-PS5: a Rust std program that runs as a ps5-payload-dev payload"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+# none on purpose: milestone 1 proves the toolchain, not the crate ecosystem
+
+[lib]
+name = "ps5_rust_hello"
+path = "src/lib.rs"
+# rlib for the payload binary; staticlib for the title (ps5-rust-title links it into the C shell)
+crate-type = ["rlib", "staticlib"]
+
+[[bin]]
+name = "ps5-rust-hello"
+path = "src/main.rs"
+
+# panic=abort on both profiles: the target spec says so and std is built to match (-Zbuild-std=std,panic_abort)
+[profile.release]
+panic = "abort"
+opt-level = 2
+debug = 1
+
+[profile.dev]
+panic = "abort"

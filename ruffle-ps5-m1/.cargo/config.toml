@@ -1,0 +1,22 @@
+# PS5_RUST_CARGO_V1 — everything cargo needs to build for the PS5 with the ps5-payload-dev SDK.
+# build.sh sets PS5_PAYLOAD_SDK (and PATH) before calling cargo; the linker script below needs it.
+
+[build]
+target = "x86_64-sie-ps5.json"
+
+[unstable]
+# A custom target has no prebuilt std: build it from the rust-src component.
+build-std = ["std", "panic_abort"]
+# cargo 1.101-nightly gates .json target specs behind this flag
+json-target-spec = true
+
+[target.x86_64-sie-ps5]
+# cargo resolves a relative linker path (one with a slash) against the folder that holds .cargo/
+linker = "./tools/ps5-rust-linker.sh"
+rustflags = [
+  # The libc crate must use the pre-FreeBSD-12 ABI: the SDK's <sys/stat.h> is the FreeBSD-11
+  # layout (32-bit st_dev/st_ino, 16-bit st_mode/st_nlink, 120-byte struct stat; old dirent,
+  # statfs and kevent). With this cfg the crate asks for versioned names (fstat@FBSD_1.0 …);
+  # shim/ps5_shim.c defines those over the console's plain functions.
+  "--cfg", "libc_unstable_freebsd_version=\"11\"",
+]
