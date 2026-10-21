@@ -70,12 +70,15 @@ printf 'meson %s, ninja %s\n' "$(meson --version)" "$(ninja --version)"
 log "1. cloning repos into $BASE (as siblings)"
 mkdir -p "$BASE"
 for repo in PS5_Vulkan PS5_Mesa PS5_PayloadSDK; do
-    if [[ -d "$BASE/$repo/.git" ]]; then
+    if git -C "$BASE/$repo" rev-parse HEAD >/dev/null 2>&1; then
         echo "  $repo already cloned — leaving it as is"
     else
-        # blobless: full commit/tree history (the setup scripts git-archive a pinned commit) but
-        # blobs fetched on demand, so the big Mesa fork comes down fast instead of in full.
-        git clone --filter=blob:none "https://github.com/mihawk-99/$repo.git" "$BASE/$repo" \
+        rm -rf "$BASE/$repo"      # clear a half-made dir from an earlier failed clone
+        # --no-tags: these repos carry a duplicate tag that makes a normal clone abort
+        #   (multiple updates for ref .../retroarch-v0.6.0-alpha.6); the setup scripts pin commits
+        #   by SHA, not tags, so dropping tags is harmless.
+        # --filter=blob:none: full commit/tree history, blobs on demand, so the Mesa fork is fast.
+        git clone --no-tags --filter=blob:none "https://github.com/mihawk-99/$repo.git" "$BASE/$repo" \
             || die "git clone $repo failed (network/allowlist?). Clone it by hand into $BASE and re-run."
     fi
 done
