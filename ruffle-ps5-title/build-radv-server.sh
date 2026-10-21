@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-radv-server.sh (v10) — build the static RADV archive on the Bytesized server (no root).
+# build-radv-server.sh (v11) — build the static RADV archive on the Bytesized server (no root).
 #
 # It does what SETUP-RADV.md describes by hand would: make a host clang available, install
 # meson+ninja for your user, clone Mihawk's three public repos as siblings, and run THEIR OWN
@@ -243,6 +243,27 @@ if [[ ! -f "$CLC_BUILD/build.ninja" ]]; then
         -Dtools= -Dcpp_rtti=false > "$CLC_BUILD.setup.log" 2>&1 \
         || { tail -30 "$CLC_BUILD.setup.log"; die "mesa_clc meson setup failed — send me $CLC_BUILD.setup.log"; }
 fi
+
+# glslangValidator (>= 11.3): RADV compiles its internal BVH shaders with it at build time. Ubuntu
+# packages it only as a system package, so build glslang 16.0.0 into $HOST — the GLSL->SPIR-V front end
+# only (ENABLE_OPT=OFF: no SPIRV-Tools optimizer needed), static, no tests.
+if [[ ! -x "$HOST/bin/glslangValidator" ]]; then
+    echo "  building glslang 16.0.0 (glslangValidator)"
+    fetch_rev "$HOSTSRC/glslang" https://github.com/KhronosGroup/glslang.git 16.0.0
+    cmake -S "$HOSTSRC/glslang" -B "$HOSTSRC/glslang/build" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOST" -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_C_COMPILER="$HOSTCC" -DCMAKE_CXX_COMPILER="$HOSTCXX" \
+        -DENABLE_OPT=OFF -DBUILD_EXTERNAL=OFF -DGLSLANG_TESTS=OFF -DENABLE_GLSLANG_BINARIES=ON -DBUILD_SHARED_LIBS=OFF \
+        >"$HOSTSRC/glslang-cmake.log" 2>&1 || { tail -20 "$HOSTSRC/glslang-cmake.log"; die "glslang cmake failed"; }
+    ninja -C "$HOSTSRC/glslang/build" -j "$JOBS" install >"$HOSTSRC/glslang-build.log" 2>&1 \
+        || { grep -E "error|FAILED" "$HOSTSRC/glslang-build.log" | head -20; die "glslang build failed — send me $HOSTSRC/glslang-build.log"; }
+fi
+export PATH="$HOST/bin:$PATH"
+echo "  glslangValidator: $(glslangValidator --version 2>/dev/null | head -1)"
+
+# A cross configure that failed part-way leaves a build dir with no build.ninja; start it clean.
+REL_BUILD="$BASE/PS5_Vulkan/.deps/work/radv-build-ps5-release"
+[[ -d "$REL_BUILD" && ! -f "$REL_BUILD/build.ninja" ]] && rm -rf "$REL_BUILD"
 
 log "2b. build-radv.sh release (Mesa build; minutes, one-time subproject fetches are normal)"
 bash tools/build-radv.sh release || die "build-radv.sh failed — send me the error lines it printed."
