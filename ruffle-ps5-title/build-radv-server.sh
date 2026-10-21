@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-radv-server.sh (v2) — build the static RADV archive on the Bytesized server (no root).
+# build-radv-server.sh (v7) — build the static RADV archive on the Bytesized server (no root).
 #
 # It does what SETUP-RADV.md describes by hand would: make a host clang available, install
 # meson+ninja for your user, clone Mihawk's three public repos as siblings, and run THEIR OWN
@@ -16,6 +16,32 @@ export PATH="$HOME/.local/bin:$SHIM:$PATH"
 
 log() { printf '\n=== %s ===\n' "$*"; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+
+# ---- 00. LLVM 18 (clang + lld + llvm-config) — the PS5 TARGET compiler ----------------------
+# The fork SDK's Makefile.inc finds its compiler through `llvm-config --bindir`; with no llvm-config
+# on PATH it silently ends up running `--bindir` and `/clang` (the "make: /clang: No such file"
+# error). Milestone 1 installed an official LLVM 18 tarball in ~/llvm18; reuse it (or fetch it).
+log "00. LLVM 18 for the PS5 target (llvm-config / clang / ld.lld)"
+LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-18.04.tar.xz"
+if [[ -z "${LLVM_CONFIG:-}" ]]; then
+    if [[ -x "$HOME/llvm18/bin/llvm-config" ]]; then
+        LLVM_CONFIG="$HOME/llvm18/bin/llvm-config"
+    elif lc="$(command -v llvm-config-18 llvm-config 2>/dev/null | head -1)" && [[ -n "$lc" ]]; then
+        LLVM_CONFIG="$lc"
+    else
+        log "no LLVM found — downloading LLVM 18.1.8 into ~/llvm18 (about 1 GB, unpacks to ~2.5 GB)"
+        curl -fL -o "$HOME/llvm18.tar.xz" "$LLVM_URL" || die "LLVM download failed; fetch it by hand into ~/llvm18 and re-run."
+        mkdir -p "$HOME/llvm18"
+        tar -xJf "$HOME/llvm18.tar.xz" -C "$HOME/llvm18" --strip-components=1
+        rm -f "$HOME/llvm18.tar.xz"
+        LLVM_CONFIG="$HOME/llvm18/bin/llvm-config"
+    fi
+fi
+export LLVM_CONFIG
+LLVM_BIN="$("$LLVM_CONFIG" --bindir)"
+[[ -x "$LLVM_BIN/clang" && -x "$LLVM_BIN/ld.lld" ]] || die "$LLVM_BIN lacks clang or ld.lld — LLVM_CONFIG must point at a full LLVM 18+ (clang+lld)."
+export PATH="$LLVM_BIN:$PATH"
+printf 'LLVM_CONFIG=%s\n  %s\n' "$LLVM_CONFIG" "$("$LLVM_BIN/clang" --version | head -1)"
 
 # ---- 0. a working host C/C++ compiler ------------------------------------------------------
 # PS5_Vulkan's dep setup insists on `clang` by name, only for HOST-side helper compiles (zlib, the
@@ -38,6 +64,8 @@ HOSTCC=""; HOSTCXX=""; USING=""
 # SDK's own clang, not this compiler, so gcc here changes nothing about the output.
 if [[ -n "${CLANG:-}" ]] && works "$CLANG"; then
     HOSTCC="$CLANG"; HOSTCXX="${CLANG}++"; works "$HOSTCXX" || HOSTCXX="$CLANG"; USING="clang"
+elif works "$LLVM_BIN/clang"; then
+    HOSTCC="$LLVM_BIN/clang"; HOSTCXX="$LLVM_BIN/clang++"; USING="clang 18 (LLVM_CONFIG)"
 elif command -v gcc >/dev/null && works "$(command -v gcc)"; then
     HOSTCC="$(command -v gcc)"; HOSTCXX="$(command -v g++ || command -v gcc)"; USING="gcc"
 elif command -v cc >/dev/null && works "$(command -v cc)"; then
@@ -103,7 +131,8 @@ ls -la "$ARCHIVE"
 sha256sum "$ARCHIVE" 2>/dev/null | cut -c1-16 | sed 's/^/  sha256: /'
 cat > "$HOME/.ruffle-radv-env" <<ENV
 # source this before ./build-title.sh
-export PATH="\$HOME/.local/bin:$SHIM:\$PATH"
+export PATH="\$HOME/.local/bin:$SHIM:$LLVM_BIN:\$PATH"
+export LLVM_CONFIG=$LLVM_CONFIG
 export PS5_PAYLOAD_SDK=$BASE/PS5_Vulkan/.deps/native/ps5-payload-sdk
 export PS5_VULKAN_DIR=$BASE/PS5_Vulkan
 ENV
