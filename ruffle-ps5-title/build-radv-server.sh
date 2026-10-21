@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-radv-server.sh (v12) — build the static RADV archive on the Bytesized server (no root).
+# build-radv-server.sh (v13) — build the static RADV archive on the Bytesized server (no root).
 #
 # It does what SETUP-RADV.md describes by hand would: make a host clang available, install
 # meson+ninja for your user, clone Mihawk's three public repos as siblings, and run THEIR OWN
@@ -124,11 +124,14 @@ bash tools/setup-native-dependencies.sh || die "setup-native-dependencies.sh fai
 # build-radv.sh first builds mesa_clc + vtn_bindgen2 natively (they compile RADV's OpenCL kernels at
 # build time). At this Mesa revision that needs: python mako/pyyaml/packaging; SPIRV-Tools >= 2024.1
 # (Ubuntu 22.04 ships 2022.1); a SPIRV-LLVM-Translator matching LLVM 18.1; and LLVM+clang libraries.
-# The LLVM 18 tarball ships only STATIC libLLVM*.a/libclang*.a (no libLLVM.so), while Mihawk's script
-# hardcodes -Dshared-llvm=enabled — so we configure that one build directory ourselves with static
-# LLVM, and build-radv.sh, seeing build.ninja already there, only runs ninja in it. The tarball's LLVM
-# is built without RTTI, so Mesa must be too (cpp_rtti=false; Mesa checks and says so).
-log "2b0. host tools for mesa_clc (python modules, SPIRV-Tools, SPIRV-LLVM-Translator; one-time)"
+# The LLVM 18 tarball cannot back these: it is the ubuntu-18.04 build, compiled against GCC 7's
+# libstdc++, whose std::optional is passed by reference, while code built on 22.04 (libstdc++ 11)
+# passes it in registers — any std::optional crossing into those libraries is miscalled (verified:
+# llvm::GlobalVariable's constructor reads a pointer where the caller put the value; that is the
+# mesa_clc segfault in the translator). So the host tools get an LLVM 18.1.8 built HERE from source,
+# libraries only (libLLVM + libclang-cpp, no tools, no zlib/zstd/xml2/terminfo), with this box's
+# libstdc++. The tarball stays what it is good for: the PS5 target's clang/lld binaries.
+log "2b0. host tools for mesa_clc (python modules, host LLVM 18, SPIRV-Tools, translator; one-time)"
 HOST="$BASE/host"; HOSTLIB="$HOST/lib"; HOSTSRC="$BASE/host-src"
 mkdir -p "$HOSTLIB/pkgconfig" "$HOSTSRC"
 LLVM_ROOT="$(dirname "$LLVM_BIN")"
@@ -180,6 +183,41 @@ fetch_rev() {   # fetch_rev DIR URL REV(tag name or commit sha)
     printf '%s\n' "$rev" > "$dir/.fetched-rev"
 }
 
+# Host LLVM 18.1.8 libraries from source. Built with the tarball's clang + lld (fast), installed to
+# $HOSTLLVM. Only libLLVM / libclang-cpp / headers / cmake files / llvm-config are needed; tools,
+# tests and every optional external dependency are off, so nothing else has to exist on the server.
+HOSTLLVM="$HOST/llvm18"
+LLVM_SRC_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/llvm-project-18.1.8.src.tar.xz"
+if [[ ! -x "$HOSTLLVM/bin/llvm-config" || ! -e "$HOSTLLVM/lib/libLLVM-18.so" || ! -e "$HOSTLLVM/lib/libclang-cpp.so" ]]; then
+    LLVMJOBS=$(( JOBS > 16 ? 16 : JOBS ))   # a clang compile of LLVM takes ~1 GB; keep a shared box sane
+    echo "  building host LLVM 18.1.8 libraries (one-time; ~3250 compile steps, $LLVMJOBS at a time)"
+    LSRC="$HOSTSRC/llvm-project-18.1.8"
+    if [[ ! -f "$LSRC/llvm/CMakeLists.txt" ]]; then
+        rm -rf "$LSRC"; mkdir -p "$LSRC"
+        curl -fsSL "$LLVM_SRC_URL" | tar -xJf - -C "$LSRC" --strip-components=1 \
+            --wildcards '*/llvm/*' '*/clang/*' '*/cmake/*' '*/third-party/*' \
+            || die "downloading/extracting the LLVM source failed"
+    fi
+    cmake -S "$LSRC/llvm" -B "$LSRC/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOSTLLVM" \
+        -DCMAKE_C_COMPILER="$LLVM_BIN/clang" -DCMAKE_CXX_COMPILER="$LLVM_BIN/clang++" -DLLVM_USE_LINKER=lld \
+        -DLLVM_ENABLE_PROJECTS=clang -DLLVM_TARGETS_TO_BUILD=X86 \
+        -DLLVM_LINK_LLVM_DYLIB=ON -DCLANG_LINK_CLANG_DYLIB=ON -DLLVM_ENABLE_RTTI=ON -DLLVM_ENABLE_ASSERTIONS=OFF \
+        -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBEDIT=OFF \
+        -DLLVM_ENABLE_Z3_SOLVER=OFF -DLLVM_ENABLE_FFI=OFF -DLLVM_ENABLE_LIBPFM=OFF -DLLVM_ENABLE_BINDINGS=OFF -DLLVM_ENABLE_OCAMLDOC=OFF \
+        -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_DOCS=OFF -DLLVM_INCLUDE_UTILS=OFF \
+        -DCLANG_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_DOCS=OFF -DCLANG_ENABLE_STATIC_ANALYZER=OFF -DCLANG_ENABLE_ARCMT=OFF \
+        -DLLVM_BUILD_TOOLS=OFF -DCLANG_BUILD_TOOLS=OFF -DLLVM_PARALLEL_LINK_JOBS=2 \
+        > "$HOSTSRC/hostllvm-cmake.log" 2>&1 || { tail -20 "$HOSTSRC/hostllvm-cmake.log"; die "host LLVM cmake failed"; }
+    ninja -C "$LSRC/build" -j "$LLVMJOBS" llvm-config install > "$HOSTSRC/hostllvm-build.log" 2>&1 \
+        || { grep -E "error:|FAILED" "$HOSTSRC/hostllvm-build.log" | head -20; die "host LLVM build failed — send me the last 40 lines of $HOSTSRC/hostllvm-build.log"; }
+    mkdir -p "$HOSTLLVM/bin" && cp "$LSRC/build/bin/llvm-config" "$HOSTLLVM/bin/llvm-config"
+fi
+echo "  host LLVM: $("$HOSTLLVM/bin/llvm-config" --version) at $HOSTLLVM ($("$HOSTLLVM/bin/llvm-config" --link-shared --libs core))"
+# the host tools (mesa_clc, vtn_bindgen2, llvm-spirv) link these shared libraries; make them findable
+# for every later step, including the cross build that runs mesa_clc
+export LD_LIBRARY_PATH="$HOSTLLVM/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+printf "[binaries]\nllvm-config = '%s'\n" "$HOSTLLVM/bin/llvm-config" > "$HOSTSRC/host-llvm.ini"
+
 # SPIRV-Tools v2025.4 (static libs + SPIRV-Tools.pc) with the SPIRV-Headers revision its DEPS pins
 # (external/spirv-headers, where its CMake looks). Tests and their deps are skipped.
 if [[ ! -f "$HOSTLIB/pkgconfig/SPIRV-Tools.pc" ]]; then
@@ -197,30 +235,31 @@ if [[ ! -f "$HOSTLIB/pkgconfig/SPIRV-Tools.pc" ]]; then
 fi
 echo "  SPIRV-Tools: $(PKG_CONFIG_PATH=$HOSTLIB/pkgconfig pkg-config --modversion SPIRV-Tools 2>/dev/null || echo '?')"
 
-# SPIRV-LLVM-Translator v18.1.9 against the static LLVM 18 (libLLVMSPIRVLib.a + LLVMSPIRVLib.pc). Its
+# SPIRV-LLVM-Translator v18.1.9 against the host LLVM (libLLVMSPIRVLib.a + LLVMSPIRVLib.pc). Its
 # CMake would git-clone the SPIRV-Headers tag it pins (spirv-headers-tag.conf = 1c6bb274, the
 # vulkan-sdk-1.3.275.0 tag) — that clone would hit the same git problem, so it is fetched here and
-# handed over.
-if [[ ! -f "$HOSTLIB/pkgconfig/LLVMSPIRVLib.pc" ]]; then
+# handed over. A translator built against another LLVM (the tarball, in earlier runs) is rebuilt.
+if [[ ! -f "$HOSTLIB/pkgconfig/LLVMSPIRVLib.pc" || "$(cat "$HOST/.translator-llvm" 2>/dev/null)" != "$HOSTLLVM" ]]; then
     echo "  building SPIRV-LLVM-Translator v18.1.9 (several minutes)"
+    rm -rf "$HOSTSRC/SPIRV-LLVM-Translator/build" "$HOSTLIB/libLLVMSPIRVLib.a" "$HOSTLIB/pkgconfig/LLVMSPIRVLib.pc" "$HOST/include/LLVMSPIRVLib"
     fetch_rev "$HOSTSRC/SPIRV-LLVM-Translator" https://github.com/KhronosGroup/SPIRV-LLVM-Translator.git v18.1.9
     fetch_rev "$HOSTSRC/spirv-headers-for-translator" https://github.com/KhronosGroup/SPIRV-Headers.git \
         1c6bb2743599e6eb6f37b2969acc0aef812e32e3
     cmake -S "$HOSTSRC/SPIRV-LLVM-Translator" -B "$HOSTSRC/SPIRV-LLVM-Translator/build" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOST" -DCMAKE_INSTALL_LIBDIR=lib \
         -DCMAKE_PREFIX_PATH="$HOST" -DCMAKE_C_COMPILER="$HOSTCC" -DCMAKE_CXX_COMPILER="$HOSTCXX" \
-        -DLLVM_DIR="$LLVM_ROOT/lib/cmake/llvm" -DLLVM_SPIRV_BUILD_EXTERNAL=YES -DLLVM_SPIRV_INCLUDE_TESTS=OFF \
+        -DLLVM_DIR="$HOSTLLVM/lib/cmake/llvm" -DLLVM_SPIRV_BUILD_EXTERNAL=YES -DLLVM_SPIRV_INCLUDE_TESTS=OFF \
         -DLLVM_EXTERNAL_SPIRV_HEADERS_SOURCE_DIR="$HOSTSRC/spirv-headers-for-translator" \
         >"$HOSTSRC/translator-cmake.log" 2>&1 || { tail -20 "$HOSTSRC/translator-cmake.log"; die "SPIRV-LLVM-Translator cmake failed"; }
     ninja -C "$HOSTSRC/SPIRV-LLVM-Translator/build" -j "$JOBS" install >"$HOSTSRC/translator-build.log" 2>&1 \
         || { grep -E "error|FAILED" "$HOSTSRC/translator-build.log" | head -20; die "SPIRV-LLVM-Translator build failed — send me $HOSTSRC/translator-build.log"; }
+    printf '%s\n' "$HOSTLLVM" > "$HOST/.translator-llvm"
 fi
 echo "  LLVMSPIRVLib: $(PKG_CONFIG_PATH=$HOSTLIB/pkgconfig pkg-config --modversion LLVMSPIRVLib 2>/dev/null || echo '?')"
 
-# Mihawk's mesa_clc build directory, configured here with static LLVM. Same source export and option
-# list as build-radv.sh, differing only in -Dshared-llvm=disabled. LDFLAGS=-Wl,--start-group lets the
-# static clang/LLVM/LLVMSPIRVLib archives resolve each other whatever order meson emits them in (both
-# ld and lld accept the group left open).
+# Mihawk's mesa_clc build directory, configured here so meson takes the host LLVM (a native file names
+# its llvm-config; on PATH the tarball's would be found first). Same source export and option list as
+# build-radv.sh. A directory configured against another LLVM (earlier runs) is redone.
 MESA_REV="${PS5_MESA_REVISION:-1ba9874f478657ccf6da72ce55f0260164cc0bd0}"
 SRC_TREE="$BASE/PS5_Vulkan/.deps/work/radv-src"
 CLC_BUILD="$BASE/PS5_Vulkan/.deps/work/radv-clc-build"
@@ -232,16 +271,18 @@ if [[ ! -f "$SRC_TREE/.revision" || "$(<"$SRC_TREE/.revision")" != "$MESA_REV" ]
         --exclude=/subprojects/zlib-*/ "$staging/" "$SRC_TREE/"
     rm -rf "$staging"; printf '%s\n' "$MESA_REV" > "$SRC_TREE/.revision"
 fi
-if [[ ! -f "$CLC_BUILD/build.ninja" ]]; then
-    echo "  configuring mesa_clc with static LLVM 18"
+if [[ ! -f "$CLC_BUILD/build.ninja" || "$(cat "$CLC_BUILD/.host-llvm" 2>/dev/null)" != "$HOSTLLVM" ]]; then
+    echo "  configuring mesa_clc against the host LLVM 18"
     rm -rf "$CLC_BUILD"
-    LDFLAGS="-Wl,--start-group -L$HOSTLIB" CC="$HOSTCC" CXX="$HOSTCXX" \
-    meson setup "$CLC_BUILD" "$SRC_TREE" -Dbuildtype=release -Dmesa-clc=enabled -Dinstall-mesa-clc=true \
+    LDFLAGS="-L$HOSTLIB" CC="$HOSTCC" CXX="$HOSTCXX" \
+    meson setup "$CLC_BUILD" "$SRC_TREE" --native-file "$HOSTSRC/host-llvm.ini" \
+        -Dbuildtype=release -Dmesa-clc=enabled -Dinstall-mesa-clc=true \
         -Dgallium-drivers= -Dvulkan-drivers= -Dplatforms= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
-        -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dllvm=enabled -Dshared-llvm=disabled \
+        -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dllvm=enabled -Dshared-llvm=enabled \
         -Dbuild-tests=false -Dvalgrind=disabled -Dlibunwind=disabled -Dzstd=disabled -Dxmlconfig=disabled \
-        -Dtools= -Dcpp_rtti=false > "$CLC_BUILD.setup.log" 2>&1 \
+        -Dtools= > "$CLC_BUILD.setup.log" 2>&1 \
         || { tail -30 "$CLC_BUILD.setup.log"; die "mesa_clc meson setup failed — send me $CLC_BUILD.setup.log"; }
+    printf '%s\n' "$HOSTLLVM" > "$CLC_BUILD/.host-llvm"
 fi
 
 # glslangValidator (>= 11.3): RADV compiles its internal BVH shaders with it at build time. Ubuntu
