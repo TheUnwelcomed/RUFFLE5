@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-radv-server.sh (v7) — build the static RADV archive on the Bytesized server (no root).
+# build-radv-server.sh (v8) — build the static RADV archive on the Bytesized server (no root).
 #
 # It does what SETUP-RADV.md describes by hand would: make a host clang available, install
 # meson+ninja for your user, clone Mihawk's three public repos as siblings, and run THEIR OWN
@@ -119,6 +119,114 @@ find "$BASE/PS5_Vulkan" "$BASE/PS5_Mesa" "$BASE/PS5_PayloadSDK" -name '*.sh' -ex
 cd "$BASE/PS5_Vulkan"
 log "2a. setup-native-dependencies.sh (downloads upstream SDK v0.42, installs the platform layer over it)"
 bash tools/setup-native-dependencies.sh || die "setup-native-dependencies.sh failed — send me its output."
+
+# ---- 2b0. what Mesa's host tool (mesa_clc) needs, none of it packaged on the server ------------
+# build-radv.sh first builds mesa_clc + vtn_bindgen2 natively (they compile RADV's OpenCL kernels at
+# build time). At this Mesa revision that needs: python mako/pyyaml/packaging; SPIRV-Tools >= 2024.1
+# (Ubuntu 22.04 ships 2022.1); a SPIRV-LLVM-Translator matching LLVM 18.1; and LLVM+clang libraries.
+# The LLVM 18 tarball ships only STATIC libLLVM*.a/libclang*.a (no libLLVM.so), while Mihawk's script
+# hardcodes -Dshared-llvm=enabled — so we configure that one build directory ourselves with static
+# LLVM, and build-radv.sh, seeing build.ninja already there, only runs ninja in it.
+log "2b0. host tools for mesa_clc (python modules, SPIRV-Tools, SPIRV-LLVM-Translator; one-time)"
+HOST="$BASE/host"; HOSTLIB="$HOST/lib"; HOSTSRC="$BASE/host-src"
+mkdir -p "$HOSTLIB/pkgconfig" "$HOSTSRC"
+LLVM_ROOT="$(dirname "$LLVM_BIN")"
+ZLIB_ROOT="$BASE/PS5_Vulkan/.deps/native/zlib/root/usr"
+[[ -f "$ZLIB_ROOT/lib/libz.a" ]] || die "expected setup's zlib at $ZLIB_ROOT/lib/libz.a — send me 2a's output."
+JOBS="$(nproc 2>/dev/null || echo 4)"
+
+python3 -c 'import mako, yaml, packaging' 2>/dev/null \
+    || python3 -m pip install --user --upgrade mako pyyaml packaging \
+    || die "pip install mako pyyaml packaging failed."
+python3 -c 'import mako, yaml, packaging' || die "python3 still cannot import mako/yaml/packaging."
+
+# cmake >= 3.22.1 (SPIRV-Tools' minimum); a pip wheel if the server's is missing or older.
+cmake_ok() { command -v cmake >/dev/null && python3 - "$(cmake --version | head -1 | awk '{print $3}')" <<'PY'
+import sys; v=tuple(int(x) for x in sys.argv[1].split('.')[:3]); sys.exit(0 if v>=(3,22,1) else 1)
+PY
+}
+cmake_ok || python3 -m pip install --user --upgrade cmake || die "pip install cmake failed."
+cmake_ok || die "cmake >= 3.22.1 still not on PATH."
+
+# llvm-config says the static LLVM links with: -lrt -ldl -lpthread -lm -lz -ltinfo. On a server without
+# the -dev packages, -lz and -ltinfo have no libz.so/libtinfo.so to resolve against; provide them in
+# $HOSTLIB (zlib: the static one 2a built; tinfo: a link to the runtime library already installed).
+ln -sf "$ZLIB_ROOT/lib/libz.a" "$HOSTLIB/libz.a"
+if ! printf 'int main(void){return 0;}' | "$HOSTCC" -x c - -ltinfo -o /dev/null 2>/dev/null; then
+    tinfo="$(ls /lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.6 \
+               /lib/x86_64-linux-gnu/libtinfo.so.5 /usr/lib/x86_64-linux-gnu/libtinfo.so.5 2>/dev/null | head -1)"
+    [[ -n "$tinfo" ]] || die "no libtinfo.so.[56] on this system (LLVM links -ltinfo)."
+    ln -sf "$tinfo" "$HOSTLIB/libtinfo.so"
+    echo "  -ltinfo via $HOSTLIB/libtinfo.so -> $tinfo"
+fi
+export LIBRARY_PATH="$HOSTLIB${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export PKG_CONFIG_PATH="$HOSTLIB/pkgconfig:$ZLIB_ROOT/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export ZLIB_ROOT   # CMake's FindZLIB (LLVMConfig.cmake runs it) honours <Pkg>_ROOT
+
+# SPIRV-Tools v2025.4 (static libs + SPIRV-Tools.pc). Its git-sync-deps fetches the SPIRV-Headers
+# revision it pins.
+if [[ ! -f "$HOSTLIB/pkgconfig/SPIRV-Tools.pc" ]]; then
+    echo "  building SPIRV-Tools v2025.4"
+    if [[ ! -d "$HOSTSRC/SPIRV-Tools/.git" ]]; then
+        git clone -q --no-tags --depth 1 --branch v2025.4 https://github.com/KhronosGroup/SPIRV-Tools.git "$HOSTSRC/SPIRV-Tools" \
+            || die "clone SPIRV-Tools failed"
+    fi
+    ( cd "$HOSTSRC/SPIRV-Tools" && python3 utils/git-sync-deps ) >"$HOSTSRC/spirv-tools-deps.log" 2>&1 \
+        || die "SPIRV-Tools git-sync-deps failed — see $HOSTSRC/spirv-tools-deps.log"
+    cmake -S "$HOSTSRC/SPIRV-Tools" -B "$HOSTSRC/SPIRV-Tools/build" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOST" -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_C_COMPILER="$HOSTCC" -DCMAKE_CXX_COMPILER="$HOSTCXX" \
+        -DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=ON -DBUILD_SHARED_LIBS=OFF \
+        >"$HOSTSRC/spirv-tools-cmake.log" 2>&1 || { tail -20 "$HOSTSRC/spirv-tools-cmake.log"; die "SPIRV-Tools cmake failed"; }
+    ninja -C "$HOSTSRC/SPIRV-Tools/build" -j "$JOBS" install >"$HOSTSRC/spirv-tools-build.log" 2>&1 \
+        || { grep -E "error|FAILED" "$HOSTSRC/spirv-tools-build.log" | head -20; die "SPIRV-Tools build failed — send me $HOSTSRC/spirv-tools-build.log"; }
+fi
+echo "  SPIRV-Tools: $(PKG_CONFIG_PATH=$HOSTLIB/pkgconfig pkg-config --modversion SPIRV-Tools 2>/dev/null || echo '?')"
+
+# SPIRV-LLVM-Translator v18.1.9 against the static LLVM 18 (libLLVMSPIRVLib.a + LLVMSPIRVLib.pc). It
+# fetches the SPIRV-Headers tag it pins by itself.
+if [[ ! -f "$HOSTLIB/pkgconfig/LLVMSPIRVLib.pc" ]]; then
+    echo "  building SPIRV-LLVM-Translator v18.1.9 (several minutes)"
+    if [[ ! -d "$HOSTSRC/SPIRV-LLVM-Translator/.git" ]]; then
+        git clone -q --no-tags --depth 1 --branch v18.1.9 https://github.com/KhronosGroup/SPIRV-LLVM-Translator.git "$HOSTSRC/SPIRV-LLVM-Translator" \
+            || die "clone SPIRV-LLVM-Translator failed"
+    fi
+    cmake -S "$HOSTSRC/SPIRV-LLVM-Translator" -B "$HOSTSRC/SPIRV-LLVM-Translator/build" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOST" -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_PREFIX_PATH="$HOST" -DCMAKE_C_COMPILER="$HOSTCC" -DCMAKE_CXX_COMPILER="$HOSTCXX" \
+        -DLLVM_DIR="$LLVM_ROOT/lib/cmake/llvm" -DLLVM_SPIRV_BUILD_EXTERNAL=YES -DLLVM_SPIRV_INCLUDE_TESTS=OFF \
+        >"$HOSTSRC/translator-cmake.log" 2>&1 || { tail -20 "$HOSTSRC/translator-cmake.log"; die "SPIRV-LLVM-Translator cmake failed"; }
+    ninja -C "$HOSTSRC/SPIRV-LLVM-Translator/build" -j "$JOBS" install >"$HOSTSRC/translator-build.log" 2>&1 \
+        || { grep -E "error|FAILED" "$HOSTSRC/translator-build.log" | head -20; die "SPIRV-LLVM-Translator build failed — send me $HOSTSRC/translator-build.log"; }
+fi
+echo "  LLVMSPIRVLib: $(PKG_CONFIG_PATH=$HOSTLIB/pkgconfig pkg-config --modversion LLVMSPIRVLib 2>/dev/null || echo '?')"
+
+# Mihawk's mesa_clc build directory, configured here with static LLVM. Same source export and option
+# list as build-radv.sh, differing only in -Dshared-llvm=disabled. LDFLAGS=-Wl,--start-group lets the
+# static clang/LLVM/LLVMSPIRVLib archives resolve each other whatever order meson emits them in (both
+# ld and lld accept the group left open).
+MESA_REV="${PS5_MESA_REVISION:-1ba9874f478657ccf6da72ce55f0260164cc0bd0}"
+SRC_TREE="$BASE/PS5_Vulkan/.deps/work/radv-src"
+CLC_BUILD="$BASE/PS5_Vulkan/.deps/work/radv-clc-build"
+if [[ ! -f "$SRC_TREE/.revision" || "$(<"$SRC_TREE/.revision")" != "$MESA_REV" ]]; then
+    echo "  exporting Mesa $MESA_REV into $SRC_TREE"
+    staging="$SRC_TREE.new"; rm -rf "$staging"; mkdir -p "$staging" "$SRC_TREE"
+    git -C "$BASE/PS5_Mesa" archive "$MESA_REV" | tar -x -C "$staging"
+    rsync -rlp --checksum --delete --exclude=/.revision --exclude=/subprojects/packagecache/ \
+        --exclude=/subprojects/zlib-*/ "$staging/" "$SRC_TREE/"
+    rm -rf "$staging"; printf '%s\n' "$MESA_REV" > "$SRC_TREE/.revision"
+fi
+if [[ ! -f "$CLC_BUILD/build.ninja" ]]; then
+    echo "  configuring mesa_clc with static LLVM 18"
+    rm -rf "$CLC_BUILD"
+    LDFLAGS="-Wl,--start-group -L$HOSTLIB" CC="$HOSTCC" CXX="$HOSTCXX" \
+    meson setup "$CLC_BUILD" "$SRC_TREE" -Dbuildtype=release -Dmesa-clc=enabled -Dinstall-mesa-clc=true \
+        -Dgallium-drivers= -Dvulkan-drivers= -Dplatforms= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
+        -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dllvm=enabled -Dshared-llvm=disabled \
+        -Dbuild-tests=false -Dvalgrind=disabled -Dlibunwind=disabled -Dzstd=disabled -Dxmlconfig=disabled \
+        -Dtools= > "$CLC_BUILD.setup.log" 2>&1 \
+        || { tail -30 "$CLC_BUILD.setup.log"; die "mesa_clc meson setup failed — send me $CLC_BUILD.setup.log"; }
+fi
 
 log "2b. build-radv.sh release (Mesa build; minutes, one-time subproject fetches are normal)"
 bash tools/build-radv.sh release || die "build-radv.sh failed — send me the error lines it printed."
