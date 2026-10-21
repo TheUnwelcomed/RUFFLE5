@@ -336,6 +336,34 @@ Rule for milestone 2, then: **the Ruffle payload is "homebrew" in websrv's sense
 launched from the Homebrew page as a big app.** Delivered: `GLProbe-homebrew.zip` (the v3 probe as
 `/data/homebrew/GLProbe/eboot.elf` with an icon, plus pacbrew v0.41.1's `websrv.elf`/`elfldr.elf`).
 
+## 5k. GL probe v3 as websrv homebrew (2026-10-20, 20:39 MDT): memory solved, AGC refuses the big-app process
+
+Launched from websrv's Homebrew page: pid 152, uid 0, euid 0, **direct memory pool 12288 MB**, 16 MB and
+64 MB allocate and map — the budget question is closed. The new stop is one level down:
+
+```
+[AgcDriver] Info - Initialized, submit.mode= 1.
+[Agc] FS Table offset has shifted. This is not survivable.
+radv/ps5: sceAgcInit(8) failed: 0x8a6c002f
+radv/ps5: the platform did not initialise; no device
+MESA: error: ZINK: failed to choose pdev
+```
+
+and `vkEnumeratePhysicalDevices` = 0 devices. libSceAgc's own check: the thread-local table it set up
+at load is not where it expects it at `sceAgcInit`. The big-app loader starts a real title process
+(`FAKE00000`) and then replaces its image with the ELF (`bigapp_replace`); the sprx modules and their
+TLS layout come from that process's original start, and the payload SDK's emulated TLS runs on top. In
+the daemon-class process of v2/v3 (`SceSpZeroConf` exec'd, the ELF injected before any module ran)
+`sceAgcInit` succeeded and RADV enumerated the GPU — that process only lacked the budget.
+
+So the three launch paths measured today:
+
+| launch | process | direct memory | AGC/RADV |
+|---|---|---|---|
+| payload manager overlay | daemon-class, uid 1 | pool 0, ≤ 64 MB | OK (device found) |
+| websrv Homebrew page (big app) | title image replaced, uid 0 | 12 GB | **sceAgcInit fails** |
+| John's elfldr spawn: `budget_set(0)` **before** exec into SceSpZeroConf (websrv's payload page `/elfldr`, or `elfldr.elf` on port 9021) | daemon-class, uid 0 | budget 0 (12 GB expected) | expected OK — the next run |
+
 ## 6. Risks, in order
 
 1. The Rust `sdl2` crate against pacbrew's patched SDL2 (static link, PS5 video driver): version
