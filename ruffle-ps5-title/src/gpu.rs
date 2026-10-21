@@ -58,7 +58,7 @@ unsafe fn static_entry() -> Result<ash::Entry, String> {
         return Err("the shell returned a null vkGetInstanceProcAddr".into());
     }
     let gipa: vk::PFN_vkGetInstanceProcAddr = std::mem::transmute(p);
-    Ok(ash::Entry::from_static_fn(vk::StaticFn {
+    Ok(ash::Entry::from_static_fn(ash::StaticFn {
         get_instance_proc_addr: gipa,
     }))
 }

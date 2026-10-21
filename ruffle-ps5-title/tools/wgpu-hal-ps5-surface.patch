@@ -1,5 +1,5 @@
 diff --git a/wgpu-hal/src/vulkan/instance.rs b/wgpu-hal/src/vulkan/instance.rs
-index 1775875..d0f6176 100644
+index 1775875..f984b7d 100644
 --- a/wgpu-hal/src/vulkan/instance.rs
 +++ b/wgpu-hal/src/vulkan/instance.rs
 @@ -931,6 +931,17 @@ impl crate::Instance for super::Instance {
@@ -12,7 +12,7 @@ index 1775875..d0f6176 100644
 +            // that carries a single opaque pointer and reaches no platform code, Gbm: the pointer's
 +            // bits are the surface handle. wgpu takes ownership and destroys it with the surface.
 +            (Rwh::Gbm(handle), _) => {
-+                let raw = <vk::SurfaceKHR as ash::vk::Handle>::from_raw(
++                let raw = <vk::SurfaceKHR as vk::Handle>::from_raw(
 +                    handle.gbm_surface.as_ptr() as usize as u64,
 +                );
 +                Ok(self.create_surface_from_vk_surface_khr(raw, None))
