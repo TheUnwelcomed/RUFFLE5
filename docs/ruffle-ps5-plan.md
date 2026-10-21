@@ -315,6 +315,27 @@ the `sdl2` crate (static, through `prospero-pkg-config`), glow from `SDL_GL_GetP
 `ruffle_render_glow` (GLSL ES 1.00, Ruffle LLC MIT/Apache, from the Vita port), `ruffle_core` with the
 null audio/navigator/ui backends first, playing a SWF from `/data/ruffle/`.
 
+## 5j. GL probe v2/v3 (2026-10-20, 20:00–20:21 MDT): the GPU is fine, the launching process is not
+
+- v2: RADV initialises in the payload (`[AgcDriver] Info - Initialized`, instance 1.4.354, "PlayStation 5
+  GPU (RADV NAVI21)", one `VK_KHR_display` display); zink's `vkCreateDevice` returns
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY`, which RADV's ps5 winsys gives when `sceKernelAllocateDirectMemory`
+  /`sceKernelMapDirectMemory` fails; `RADV_DEBUG=info` shows `vram_size = 0 MB` (the pool it measured).
+- v3, measured the way RADV allocates (type 12, 2 MiB aligned, CPU+GPU): `sceKernelGetDirectMemorySize()`
+  = 0, 16 MB allocates and maps (also at RADV's region 0x4000000000), **64 MB fails with 0x80020023
+  (EAGAIN)**. `budget_set(0)` (syscall 0x23b) returns 0 at run time but changes nothing. The process was
+  pid 149, uid 1, euid 0, started from the payload manager overlay.
+- Why pacbrew's GL/SDL homebrew works for its author: websrv's *Homebrew* page does not run an ELF as a
+  payload. `src/ps5/hbldr.c`: it launches a title process (`sceSystemServiceLaunchApp("FAKE00000")`, a
+  "Homebrew Loader" app with its own param.json), raises its privileges, calls budget_set(0) through
+  ptrace **before** the ELF runs, and replaces the process image with the ELF — a big app, with a game's
+  direct memory and the display. The payload page (`/elfldr`, port 9021) and the user's payload manager
+  spawn a daemon-class process (SceSpZeroConf) whose direct memory stops between 16 and 64 MB.
+
+Rule for milestone 2, then: **the Ruffle payload is "homebrew" in websrv's sense — `/data/homebrew/<name>/eboot.elf`,
+launched from the Homebrew page as a big app.** Delivered: `GLProbe-homebrew.zip` (the v3 probe as
+`/data/homebrew/GLProbe/eboot.elf` with an icon, plus pacbrew v0.41.1's `websrv.elf`/`elfldr.elf`).
+
 ## 6. Risks, in order
 
 1. The Rust `sdl2` crate against pacbrew's patched SDL2 (static link, PS5 video driver): version
