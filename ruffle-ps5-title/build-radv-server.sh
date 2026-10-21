@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-radv-server.sh (v11) — build the static RADV archive on the Bytesized server (no root).
+# build-radv-server.sh (v12) — build the static RADV archive on the Bytesized server (no root).
 #
 # It does what SETUP-RADV.md describes by hand would: make a host clang available, install
 # meson+ninja for your user, clone Mihawk's three public repos as siblings, and run THEIR OWN
@@ -265,8 +265,64 @@ echo "  glslangValidator: $(glslangValidator --version 2>/dev/null | head -1)"
 REL_BUILD="$BASE/PS5_Vulkan/.deps/work/radv-build-ps5-release"
 [[ -d "$REL_BUILD" && ! -f "$REL_BUILD/build.ninja" ]] && rm -rf "$REL_BUILD"
 
+# When a build step dies of a signal (ninja: "FAILED: [code=139]" = SIGSEGV), get a backtrace rather
+# than guess: re-run that exact command under gdb, or, without gdb, under a preloaded signal handler
+# whose addresses are resolved against the binary's symbol table.
+crash_diagnose() {
+    local blog="$1" cmd mesa_clc
+    grep -q "^FAILED: \[code=1[0-9][0-9]\]" "$blog" || return 0
+    set +e   # everything below is expected to fail; keep going and report
+    printf '\n=== crash diagnosis ===\n'
+    grep -m1 "^FAILED:" "$blog"
+    cmd="$(grep -A1 -m1 "^FAILED:" "$blog" | tail -1)"
+    printf 'command (run from %s):\n  %s\n' "$REL_BUILD" "$cmd"
+    mesa_clc="$CLC_BUILD/src/compiler/clc/mesa_clc"
+    [[ -x "$mesa_clc" ]] && { file "$mesa_clc" | cut -d, -f1-3; ldd "$mesa_clc" | grep -v "linux-vdso\|ld-linux" | sed 's/^/  /'; }
+    printf 'kernel void k(global int *p){ p[0] = 1; }\n' > "$HOSTSRC/trivial.cl"
+    ( cd "$HOSTSRC" && "$mesa_clc" -o trivial.spv trivial.cl ) 2>&1 | tail -5
+    echo "trivial kernel through mesa_clc: rc=${PIPESTATUS[0]}"
+    if command -v gdb >/dev/null; then
+        echo "--- gdb backtrace ---"
+        ( cd "$REL_BUILD" && eval "gdb -q -batch -ex run -ex bt -ex 'info registers rip' --args $cmd" ) 2>&1 | grep -v "^\[New Thread\|^\[Thread debugging\|^Using host libthread" | tail -45
+    else
+        echo "--- no gdb: backtrace from a preloaded signal handler ---"
+        cat > "$HOSTSRC/segv.c" <<'C'
+#define _GNU_SOURCE
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
+#include <stdlib.h>
+static void h(int s){ void *b[64]; int n = backtrace(b, 64);
+    write(2, "\n=== signal backtrace ===\n", 26); backtrace_symbols_fd(b, n, 2); _exit(128 + s); }
+__attribute__((constructor)) static void i(void){ signal(SIGSEGV, h); signal(SIGABRT, h); signal(SIGBUS, h); signal(SIGILL, h); }
+C
+        "$HOSTCC" -shared -fPIC -o "$HOSTSRC/segv.so" "$HOSTSRC/segv.c" || echo "(could not build the handler)"
+        ( cd "$REL_BUILD" && eval "LD_PRELOAD=$HOSTSRC/segv.so $cmd" ) 2>"$HOSTSRC/crash.txt" || true
+        grep -A40 "signal backtrace" "$HOSTSRC/crash.txt" | head -42
+        echo "--- offsets resolved against mesa_clc's symbol table ---"
+        nm -nC --defined-only "$mesa_clc" 2>/dev/null | grep -i " [tTwW] " > "$HOSTSRC/mesa_clc.syms"
+        grep -o "mesa_clc(+0x[0-9a-f]*)\|mesa_clc() \[0x[0-9a-f]*\]" "$HOSTSRC/crash.txt" | grep -o "0x[0-9a-f]*" | head -30 \
+            | python3 -c '
+import sys, bisect
+syms = []
+for line in open(sys.argv[1]):
+    p = line.split(None, 2)
+    if len(p) == 3: syms.append((int(p[0], 16), p[2].strip()))
+syms.sort(); keys = [a for a, _ in syms]
+for tok in sys.stdin:
+    off = int(tok, 16); i = bisect.bisect_right(keys, off) - 1
+    print("  %s  %s" % (tok.strip(), syms[i][1] if i >= 0 else "?"))' "$HOSTSRC/mesa_clc.syms"
+    fi
+    echo "=== end crash diagnosis — send me everything from 'crash diagnosis' down ==="
+    set -e
+}
+
 log "2b. build-radv.sh release (Mesa build; minutes, one-time subproject fetches are normal)"
-bash tools/build-radv.sh release || die "build-radv.sh failed — send me the error lines it printed."
+if ! bash tools/build-radv.sh release; then
+    crash_diagnose "$REL_BUILD.log"
+    crash_diagnose "$CLC_BUILD.log"
+    die "build-radv.sh failed — send me the error lines it printed."
+fi
 
 # ---- 3. report + next command --------------------------------------------------------------
 ARCHIVE="$BASE/PS5_Vulkan/.deps/native/radv-release/lib/libvulkan_radeon.ps5.a"
