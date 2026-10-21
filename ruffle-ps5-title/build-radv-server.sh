@@ -83,13 +83,17 @@ for repo in PS5_Vulkan PS5_Mesa PS5_PayloadSDK; do
     fi
 done
 
+# The clone didn't preserve executable bits on the repos' scripts; restore them so internal
+# ./script calls work, and invoke the entry scripts via bash either way.
+find "$BASE/PS5_Vulkan" "$BASE/PS5_Mesa" "$BASE/PS5_PayloadSDK" -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
+
 # ---- 2. platform-layer SDK, then RADV ------------------------------------------------------
 cd "$BASE/PS5_Vulkan"
 log "2a. setup-native-dependencies.sh (downloads upstream SDK v0.42, installs the platform layer over it)"
-tools/setup-native-dependencies.sh || die "setup-native-dependencies.sh failed — send me its output."
+bash tools/setup-native-dependencies.sh || die "setup-native-dependencies.sh failed — send me its output."
 
 log "2b. build-radv.sh release (Mesa build; minutes, one-time subproject fetches are normal)"
-tools/build-radv.sh release || die "build-radv.sh failed — send me the error lines it printed."
+bash tools/build-radv.sh release || die "build-radv.sh failed — send me the error lines it printed."
 
 # ---- 3. report + next command --------------------------------------------------------------
 ARCHIVE="$BASE/PS5_Vulkan/.deps/native/radv-release/lib/libvulkan_radeon.ps5.a"
