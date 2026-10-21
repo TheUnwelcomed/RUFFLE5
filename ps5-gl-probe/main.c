@@ -1,4 +1,4 @@
-/* PS5_GL_PROBE_V3 — OpenGL ES on the PS5 through pacbrew's Mesa (zink on RADV, EGL "videoout"),
+/* PS5_GL_PROBE_V4 — OpenGL ES on the PS5 through pacbrew's Mesa (zink on RADV, EGL "videoout"),
  * as an elfldr payload: the GPU path Ruffle-on-PS5 milestone 2 renders through, proven on its own
  * before any Rust is involved.
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -29,12 +29,24 @@
  * in the child before exec, the payload manager that launched v1/v2 (pid 145, uid 1, euid 0) may
  * not. So v3 measures the pool and allocates the way RADV does, then — if that fails — calls
  * budget_set(0) itself and measures again, before SDL runs. A payload may make raw syscalls.
+ *
+ * v4 (2026-10-20): through websrv (Homebrew page and payload page alike) the pool is 12 GB, and
+ * the stop moved into Sony's GPU library: "[Agc] FS Table offset has shifted. This is not
+ * survivable." then sceAgcInit(8) = 0x8a6c002f, no device. In the payload manager's process
+ * (uid 1, small pool) the same call succeeded. PS5_Vulkan's notes (docs/M5_PHASE_B.md, driver/
+ * ps5vk_device.c): sceAgcInit made from code in anonymous memory (a dlopen'd module) failed
+ * where the same call from the executable succeeded, and AGC tolerates a second sceAgcInit(8).
+ * RADV calls it from libvulkan.so.1, which the SDK's loader maps into anonymous memory. So v4
+ * calls sceAgcInit(8) from this executable (a linked import, loaded with the ELF) before
+ * anything else, and if that is refused too, tries the other budget ids, logging each answer.
  */
 #define VK_NO_PROTOTYPES 1
 #include <vulkan/vulkan.h>
 #include <EGL/egl.h>
 #include <dlfcn.h>
 #include <SDL2/SDL.h>
+#include <stdint.h>
+int32_t sceAgcInit(uint32_t version);
 #include <GLES3/gl3.h>
 #include <errno.h>
 #include <math.h>
@@ -375,6 +387,22 @@ int main(int argc, char **argv)
         }
     } else {
         say("ok    direct memory is there");
+    }
+
+    /* AGC from the executable itself, before any module is dlopen()ed (v4) */
+    say("..    sceAgcInit(8) from the executable (PS5_Vulkan: from a dlopen()ed module it was refused)");
+    int32_t agc = sceAgcInit(8);
+    say("%s  sceAgcInit(8) from the executable = 0x%08x", agc == 0 ? "ok  " : "warn", (unsigned)agc);
+    if (agc != 0) {
+        for (long k = 1; k <= 8 && agc != 0; k++) {
+            long rc = syscall(0x23b, k);
+            if (rc != 0) { say("      budget_set(%ld) = %ld (errno %d)", k, rc, errno); continue; }
+            agc = sceAgcInit(8);
+            say("      budget_set(%ld) = 0, sceAgcInit(8) = 0x%08x, pool %lld MB", k, (unsigned)agc,
+                (long long)(sceKernelGetDirectMemorySize() >> 20));
+        }
+        if (agc != 0) say("warn  AGC refused this process under every budget tried; the GPU library's reason is the line above");
+        else toast("GL probe: AGC initialised after a budget change (see log)");
     }
     toast("GL probe: starting SDL");
 

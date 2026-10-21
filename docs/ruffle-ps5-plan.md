@@ -412,3 +412,13 @@ links — the largest single setup step in the project.
    is ample for Flash content.
 5. CPU-heavy AVM2 content: interpreted on both PC and PS5; the Zen 2 cores are fast. Unknown until
    it runs.
+
+## 5m–5o. 2026-10-21: the RADV archive builds on the server; phase 3a builds and runs to the adapter
+
+Continued in [`findings-2026-10-21.md`](findings-2026-10-21.md): what the server build of
+`libvulkan_radeon.ps5.a` took (LLVM 18 for 22.04's libstdc++ from LLVM's own packages, after the
+tarball's GCC-7 `std::optional` ABI crashed mesa_clc; a job cap after 16 clang jobs took the shared box
+down), the phase-3a title pipeline (`ruffle-ps5-title/build-title.sh`: m1 target + ps5-rust-title tail +
+PS5_Vulkan's `radv-link.sh`; wgpu 30 patched to adopt an application-made `VkSurfaceKHR`), its first
+build (four one-line fixes; Mesa's weak entry points need `--no-dynamic-linker`), and its first run on
+the console (RADV_PS5 reports conformance 0.0.0.0; wgpu-hal needs the non-compliant-adapter opt-in).

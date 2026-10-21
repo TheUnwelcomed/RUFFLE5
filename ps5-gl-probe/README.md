@@ -8,8 +8,8 @@ first release with Mesa 26.2 for the PS5 and the SDL2 that loads it).
 
 | file | what |
 |---|---|
-| `ps5-gl-probe.elf` | the payload (v3), built here against pacbrew v0.41.1 (SDL 2.30.12) — ready to run |
-| `main.c` | PS5_GL_PROBE_V3: direct-memory check and budget_set(0) first, then every step logged, Mesa's own stderr captured into the log, every GL function fetched with `SDL_GL_GetProcAddress` (as glow does); when SDL fails, RADV and EGL are driven by hand and each call's result is logged |
+| `ps5-gl-probe.elf` | the payload (v4, not in git — `build.sh` makes it), built against pacbrew v0.41.1 (SDL 2.30.12) — ready to run |
+| `main.c` | PS5_GL_PROBE_V4 (v4: `sceAgcInit(8)` from the executable first, then the budget ids): direct-memory check and budget_set(0) first, then every step logged, Mesa's own stderr captured into the log, every GL function fetched with `SDL_GL_GetProcAddress` (as glow does); when SDL fails, RADV and EGL are driven by hand and each call's result is logged |
 | `build.sh` | rebuilds it: `PS5_PAYLOAD_SDK=<pacbrew sdk> ./build.sh` |
 | `ruffle-ps5-mesa-v0.41.1.zip` (separate) | the five Mesa shared objects the console needs, from the same release |
 

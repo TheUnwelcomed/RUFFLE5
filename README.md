@@ -6,13 +6,13 @@ brought Jellyfin and [PS5_RetroArch](https://github.com/mihawk-99/PS5_RetroArch)
 The plan, the decisions and every measurement taken on the console are in
 [`docs/ruffle-ps5-plan.md`](docs/ruffle-ps5-plan.md).
 
-## Status (2026-10-20)
+## Status (2026-10-21)
 
 | milestone | state |
 |---|---|
 | 1 — Rust's standard library on the console, as a Games-row title | **done, 10/10 checks on hardware** (threads, clocks, files, directories, 64 MB allocations, random, TCP in and out of the sandbox) |
-| 2 — Flash on the TV as a payload (SDL2 + Mesa/zink on RADV + Ruffle core) | in progress: the GL probe runs RADV on the GPU; direct-memory budget of the launching process under investigation |
-| 3 — the standalone title | not started |
+| 2 — Flash on the TV as a payload (SDL2 + Mesa/zink on RADV + Ruffle core) | set aside: RADV runs in a payload process, but every launcher that gives a payload the GPU's memory budget is refused by `libSceAgc` (`FS Table offset has shifted`) — see the plan, §5j–5l |
+| 3 — the standalone title: Ruffle's wgpu renderer on a **statically linked RADV** | **in progress, running on hardware**: `ruffle-ps5-title/` builds a 28 MB Games-row title (Rust std + wgpu 30 + the RADV archive + the SDK fork's platform layer); on the console it initialises AGC, creates the Vulkan instance, device and `VK_KHR_display` surface — phase 3a (clear the screen through wgpu) is at the adapter step |
 
 ## What is here
 
@@ -21,6 +21,7 @@ The plan, the decisions and every measurement taken on the console are in
 | `ruffle-ps5-m1/` | the Rust toolchain for the PS5: a custom target spec (`x86_64-sie-ps5.json`, FreeBSD-11 ABI, no native TLS), `build-std`, a C shim that gives std what the console lacks or refuses (`shim/ps5_shim.c`), and the milestone-1 test program (`src/lib.rs`). `build.sh` builds it as an elfldr payload. |
 | `ps5-rust-title/` | packages the same Rust code as a PPSA title for `/data/homebrew` (ShadowMount+): a C shell, the PIE→module converter and FSELF signer from Jelly5's toolkit (`native-app/`, GPL-3.0, BlackBearReloaded), the title-mode shim (no raw syscalls), and the checks that catch what a sandboxed title cannot do. `build-title.sh` does it all. |
 | `ps5-gl-probe/` | milestone 2, step 1: a C payload that drives SDL2 → EGL → zink → RADV on the console and logs every step (`/data/ruffle/gl-probe.log`). Needs pacbrew ≥ v0.41.1 and its Mesa shared objects on the console. |
+| `ruffle-ps5-title/` | milestone 3: the Ruffle title. `build-radv-server.sh` builds PS5_Vulkan's RADV archive on a shared Ubuntu 22.04 host with no root (the host LLVM 18 from LLVM's own packages, every build job-capped); `build-title.sh` builds the title from the m1 target, ps5-rust-title's tail and PS5_Vulkan's `radv-link.sh`; `src/gpu.rs` brings wgpu up on the static RADV (`tools/wgpu-hal-ps5-surface.patch` lets wgpu 30 adopt the title's `VK_KHR_display` surface); `src/lib.rs` is phase 3a (clear the screen) and, behind `--ruffle`, 3b (play a SWF). |
 | `docs/` | the plan and the findings, section by section, as they were made. |
 
 ## Building
@@ -45,8 +46,13 @@ Measured on hardware, firmware with the usual homebrew setup; details and the pr
 4. `sceNetInit()` before the first socket.
 5. `ioctl(FIONBIO)` and `fcntl(O_NONBLOCK)` are EACCES; non-blocking is `setsockopt(SOL_SOCKET, 0x1200)`
    (`SCE_NET_SO_NBIO`), which the shim does for std behind `--wrap=ioctl`. `kqueue` works.
-6. The `dlopen` of the payload SDK cannot be used in a title (its loader makes raw syscalls), so Mesa
-   has to be linked statically there — hence milestone 2 as a payload first.
+6. The `dlopen` of the payload SDK cannot be used in a title (its loader makes raw syscalls), so the
+   GPU driver is linked statically: RADV as `libvulkan_radeon.ps5.a`, built by PS5_Vulkan's Mesa fork,
+   and linked the way its titles link it (`tools/radv-link.sh`).
+7. Mesa's dispatch tables reference every Vulkan entry point weakly; lld exports the undefined ones as
+   dynamic imports unless the title links with `--no-dynamic-linker`, and the converter refuses them.
+8. RADV on the PS5 reports Vulkan conformance version 0.0.0.0 (no CTS release has passed yet); wgpu
+   needs `ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER` to use it.
 
 ## Licence
 

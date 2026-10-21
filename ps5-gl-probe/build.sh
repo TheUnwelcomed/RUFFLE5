@@ -20,7 +20,7 @@ PKG="$SDK/bin/prospero-pkg-config"
 CFLAGS="$("$PKG" --cflags sdl2)"
 LIBS="$("$PKG" --libs sdl2)"
 echo "==> SDK $SDK (SDL $("$PKG" --modversion sdl2))"
-"$SDK/bin/prospero-clang" -std=gnu11 -O2 -Wall -Wextra $CFLAGS -o "$HERE/ps5-gl-probe.elf" "$HERE/main.c" $LIBS -lm
+"$SDK/bin/prospero-clang" -std=gnu11 -O2 -Wall -Wextra $CFLAGS -o "$HERE/ps5-gl-probe.elf" "$HERE/main.c" $LIBS -lSceAgc -lm
 "$SDK/bin/prospero-strip" --strip-debug "$HERE/ps5-gl-probe.elf" 2>/dev/null || true
 ls -la "$HERE/ps5-gl-probe.elf"
 echo "==> NEEDED: $(readelf -d "$HERE/ps5-gl-probe.elf" | grep NEEDED | sed 's/.*\[\(.*\)\]/\1/' | tr '\n' ' ')"
