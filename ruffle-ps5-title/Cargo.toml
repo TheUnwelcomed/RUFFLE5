@@ -5,12 +5,18 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Ruffle (Flash emulator) as a native PlayStation 5 title, rendering through RADV (Vulkan) with wgpu"
 
-# A staticlib: cargo produces lib/libruffle_ps5.a, build-title.sh links it with RADV + the title runtime.
-# An rlib too, so `cargo check`/tests work on the host.
+# A staticlib: cargo produces target/x86_64-sie-ps5/release/libruffle_ps5.a, build-title.sh links it with
+# the RADV archive and the title runtime. An rlib too, so `cargo check`/tests work on the host.
 [lib]
 name = "ruffle_ps5"
 path = "src/lib.rs"
 crate-type = ["staticlib", "rlib"]
+
+[features]
+default = []
+# Phase 3b: Ruffle itself. The default build (3a) is only the GPU seam: wgpu on the static RADV,
+# clearing the display — nothing of Ruffle is compiled, so nothing of Ruffle can block it.
+ruffle = ["dep:ruffle_core", "dep:ruffle_render", "dep:ruffle_render_wgpu"]
 
 [dependencies]
 # Pinned to a Ruffle revision whose render/wgpu uses wgpu 30 (clone HEAD 2026-10-19).
@@ -20,21 +26,36 @@ ruffle_core = { git = "https://github.com/ruffle-rs/ruffle", rev = "be342ba07b48
     "default_compatibility_rules",
     "audio",
     "mp3",
-] }
-ruffle_render = { git = "https://github.com/ruffle-rs/ruffle", rev = "be342ba07b48f3045a16659bdda5bd654ba064fe" }
-ruffle_render_wgpu = { git = "https://github.com/ruffle-rs/ruffle", rev = "be342ba07b48f3045a16659bdda5bd654ba064fe" }
+], optional = true }
+ruffle_render = { git = "https://github.com/ruffle-rs/ruffle", rev = "be342ba07b48f3045a16659bdda5bd654ba064fe", optional = true }
+ruffle_render_wgpu = { git = "https://github.com/ruffle-rs/ruffle", rev = "be342ba07b48f3045a16659bdda5bd654ba064fe", optional = true }
 
-# Bring-your-own-Vulkan: we construct the instance/surface/device against the statically linked RADV
-# and hand them to wgpu through its `*_from_hal` seams. Versions must match what Ruffle's wgpu pins
+# Bring-your-own-Vulkan: the instance/surface/device are built on the statically linked RADV and
+# handed to wgpu through its `from_hal` seams. Versions must match what Ruffle's wgpu pins
 # (wgpu 30.0.1, wgpu-hal 30.0.1, ash 0.38) — Cargo unifies them because they are the same crates.
-wgpu = { version = "=30.0.1", default-features = false, features = ["wgsl", "vulkan"] }
-wgpu-hal = { version = "=30.0.1", default-features = false, features = ["vulkan"] }
+# wgpu's defaults are off: no DX12/Metal/GLES/WebGPU backends, only Vulkan (+ std, parking_lot).
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }
+wgpu-hal = { version = "=30.0.1", features = ["vulkan"] }
 wgpu-types = "=30.0.1"
-# ash with NO default features: no dynamic loader is linked (a title cannot dlopen libvulkan).
-ash = { version = "=0.38.0", default-features = false, features = ["debug"] }
+# ash: the title hands it a static vkGetInstanceProcAddr (src/gpu.rs); its dlopen loader ("loaded",
+# which wgpu-hal turns on) is never called, and shell/dl_stubs.c gives the linker the dl* names a
+# title does not have, should any of that code survive LTO.
+ash = "=0.38.0"
 raw-window-handle = "0.6"
 
 log = "0.4"
+
+# wgpu 30 has no public way to adopt a VkSurfaceKHR the application created itself (the only
+# display-less route, VK_KHR_display, is reachable only through a Linux DRM fd). build-title.sh
+# fetches wgpu v30.0.1 into vendor/wgpu and applies tools/wgpu-hal-ps5-surface.patch — eleven
+# lines in wgpu-hal that accept the surface through a raw-window-handle; everything else is the
+# release as published. The whole family comes from that one tree so there is a single wgpu-types.
+[patch.crates-io]
+wgpu = { path = "vendor/wgpu/wgpu" }
+wgpu-core = { path = "vendor/wgpu/wgpu-core" }
+wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }
+wgpu-types = { path = "vendor/wgpu/wgpu-types" }
+naga = { path = "vendor/wgpu/naga" }
 
 [profile.release]
 panic = "abort"

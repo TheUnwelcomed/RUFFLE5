@@ -28,9 +28,13 @@ linked** RADV instead of a `dlopen`'d `libvulkan.so.1`:
   through its `*_from_hal` seams;
 * `ruffle_render_wgpu` then runs unchanged.
 
-The ash/Vulkan half of `src/gpu.rs` is ordinary and should be right; the wgpu-hal adoption calls
-(`from_raw`, `*_from_hal`, `create_device_from_hal`) are version-sensitive and get finalized against
-the compiler on the server, the way milestone 1's shim was. Those spots are marked `SERVER:`.
+Every wgpu-hal / wgpu call in `src/gpu.rs` is written against the sources of the pinned versions
+(wgpu 30.0.1, ash 0.38): `Instance::from_raw`, `expose_adapter`, `Adapter::open`, `from_hal`,
+`create_adapter_from_hal`, `create_device_from_hal`. One thing wgpu 30 cannot do is adopt a
+`VkSurfaceKHR` the application made itself (its only display-less route wants a Linux DRM fd), so
+`build-title.sh` fetches wgpu v30.0.1 into `vendor/wgpu` and applies
+`tools/wgpu-hal-ps5-surface.patch` — eleven lines in wgpu-hal's Vulkan backend that take the surface
+handle through a raw-window-handle; `Cargo.toml` points `[patch.crates-io]` at that tree.
 
 ## The one dependency you must build first: the static RADV archive
 

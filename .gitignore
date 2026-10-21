@@ -9,3 +9,6 @@
 *.tar.gz
 # the Mesa runtime bundle comes from pacbrew's release, not from this repository
 /mesa-bundle/
+/ruffle-ps5-title/target/
+/ruffle-ps5-title/build/
+/ruffle-ps5-title/vendor/

@@ -1,23 +1,30 @@
-//! PS5_RUFFLE_GPU_V1 — bring up a `wgpu::Device` on the statically linked RADV, in a title.
+//! PS5_RUFFLE_GPU_V2 — bring up a `wgpu::Device` on the statically linked RADV, in a title.
 //!
 //! This is the one piece with no prior art in Rust: PS5_RetroArch and PS5_Vulkan drive RADV from
-//! C/C++. The console facts they established still hold and shape every step here:
+//! C/C++. The console facts they established shape every step here:
 //!   * A title links RADV as a static archive and resolves Vulkan through `vk_icdGetInstanceProcAddr`
-//!     (PS5_RetroArch src/radv_icd_ps5.c). The shell exports it to us as `ps5_vk_get_instance_proc_addr`.
-//!   * `sceAgcInit(8)` must be called from the executable before any Vulkan call; the shell does that.
-//!   * The display is RADV's `VK_KHR_display` on VideoOut (Mesa patch 0011): one display, one mode,
-//!     3840x2160 BGRA. We create a `VkSurfaceKHR` from it with plain Vulkan and hand it to wgpu.
-//!   * A title cannot dlopen, so ash carries no loader: we build `ash::Entry` from the static symbol.
+//!     (PS5_RetroArch src/radv_icd_ps5.c). The shell hands it to us as `ps5_vk_get_instance_proc_addr`.
+//!   * The display is RADV's `VK_KHR_display` on VideoOut (the Mesa fork's wsi_common_videoout.c):
+//!     one display, one plane, a mode per size VideoOut takes (3840x2160 first, 2560x1440,
+//!     1920x1080), FIFO the only present mode, BGRA8 unorm/srgb the formats.
+//!   * A title cannot dlopen, so ash carries no loader: `ash::Entry` is built from the static symbol.
 //!
-//! The ash / Vulkan side below is ordinary Vulkan and should be right. The wgpu-hal adoption seam
-//! (`from_raw` / `*_from_hal`) is version-sensitive (wgpu-hal 30.0.1); its exact argument lists are
-//! finalized against the compiler on the server, the way milestone 1's shim was. Those spots are
-//! marked `SERVER:`.
+//! Every call below is pinned to wgpu 30.0.1 / wgpu-hal 30.0.1 / ash 0.38 (read from their sources):
+//!   `wgpu_hal::vulkan::Instance::from_raw`, `expose_adapter`, `wgpu_hal::Adapter::open`,
+//!   `wgpu::Instance::from_hal`, `as_hal`, `create_surface_unsafe`, `create_adapter_from_hal`,
+//!   `Adapter::create_device_from_hal`.
+//! The surface is the one step wgpu 30 has no door for: a `VkSurfaceKHR` made by the application
+//! cannot be adopted (its only display-less route wants a Linux DRM fd). build-title.sh applies
+//! tools/wgpu-hal-ps5-surface.patch, which teaches wgpu-hal's Vulkan backend to take the surface
+//! handle through a raw-window-handle (`Gbm`, the one variant that is a single opaque pointer).
 #![allow(clippy::missing_safety_doc)]
 
 use ash::vk;
-use std::ffi::{c_void, CStr};
-use std::sync::Arc;
+use ash::vk::Handle as _;
+use raw_window_handle::{GbmDisplayHandle, GbmWindowHandle, RawDisplayHandle, RawWindowHandle};
+use std::ffi::{c_char, c_void, CStr};
+use std::ptr::NonNull;
+use wgpu_hal::Adapter as _;
 
 extern "C" {
     /// The RADV archive's ICD entry point, exported by the C shell. Same signature and semantics as
@@ -33,210 +40,357 @@ pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub surface: wgpu::Surface<'static>,
+    pub format: wgpu::TextureFormat,
     pub width: u32,
     pub height: u32,
+    /// What was found and chosen, for the log.
+    pub report: String,
 }
+
+/// The display size to ask for. VideoOut scales any of its sizes to the screen; 1080p is plenty for
+/// Flash content and a quarter of the fill of 2160p. The first mode (3840x2160) is the fallback.
+const PREFERRED_MODE: (u32, u32) = (1920, 1080);
 
 /// Build the ash `Entry` from the statically linked RADV, with no dynamic loader.
-unsafe fn static_entry() -> ash::Entry {
+unsafe fn static_entry() -> Result<ash::Entry, String> {
     let p = ps5_vk_get_instance_proc_addr();
-    assert!(!p.is_null(), "the shell returned a null vkGetInstanceProcAddr");
+    if p.is_null() {
+        return Err("the shell returned a null vkGetInstanceProcAddr".into());
+    }
     let gipa: vk::PFN_vkGetInstanceProcAddr = std::mem::transmute(p);
-    ash::Entry::from_static_fn(vk::StaticFn { get_instance_proc_addr: gipa })
+    Ok(ash::Entry::from_static_fn(vk::StaticFn {
+        get_instance_proc_addr: gipa,
+    }))
 }
 
-/// Create the VkInstance with the extensions the display surface needs. RADV's ICD serves these.
-unsafe fn create_instance(entry: &ash::Entry) -> ash::Instance {
-    let app = vk::ApplicationInfo::default()
-        .application_name(CStr::from_bytes_with_nul_unchecked(b"ruffle-ps5\0"))
-        .api_version(vk::make_api_version(0, 1, 3, 0));
-    let exts = [
-        vk::KHR_SURFACE_NAME.as_ptr(),
-        vk::KHR_DISPLAY_NAME.as_ptr(),
-        vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_NAME.as_ptr(),
-    ];
-    let info = vk::InstanceCreateInfo::default()
-        .application_info(&app)
-        .enabled_extension_names(&exts);
-    entry
-        .create_instance(&info, None)
-        .expect("vkCreateInstance on RADV failed")
+/// The instance extensions wgpu-hal would ask for on this driver (it filters by what is
+/// available), plus VK_KHR_display for the surface. Returned as the `'static` names wgpu-hal keeps.
+unsafe fn instance_extensions(
+    entry: &ash::Entry,
+    api_version: u32,
+) -> Result<Vec<&'static CStr>, String> {
+    let mut exts = wgpu_hal::vulkan::Instance::desired_extensions(
+        entry,
+        api_version,
+        wgpu::InstanceFlags::empty(),
+    )
+    .map_err(|e| format!("desired_extensions: {e:?}"))?;
+    let available = entry
+        .enumerate_instance_extension_properties(None)
+        .map_err(|e| format!("vkEnumerateInstanceExtensionProperties: {e}"))?;
+    let has = |name: &CStr| {
+        available
+            .iter()
+            .any(|p| p.extension_name_as_c_str() == Ok(name))
+    };
+    for wanted in [ash::khr::surface::NAME, ash::khr::display::NAME] {
+        if !exts.contains(&wanted) {
+            if !has(wanted) {
+                return Err(format!("RADV does not offer {}", wanted.to_string_lossy()));
+            }
+            exts.push(wanted);
+        }
+    }
+    Ok(exts)
 }
 
-/// Pick the console's one display and its one mode, and make a full-screen surface on plane 0.
-/// Straight `VK_KHR_display`; RADV flips it through VideoOut (Mesa patch 0011).
+/// Pick the console's one display and a mode, and make a full-screen surface on a plane that
+/// supports it. Straight `VK_KHR_display`; RADV flips it through VideoOut.
 unsafe fn create_display_surface(
     entry: &ash::Entry,
     instance: &ash::Instance,
     phys: vk::PhysicalDevice,
-) -> (vk::SurfaceKHR, u32, u32) {
+    report: &mut String,
+) -> Result<(vk::SurfaceKHR, vk::Extent2D), String> {
     let display = ash::khr::display::Instance::new(entry, instance);
 
     let props = display
         .get_physical_device_display_properties(phys)
-        .expect("vkGetPhysicalDeviceDisplayPropertiesKHR failed");
-    assert!(!props.is_empty(), "RADV reports no display");
-    let disp = props[0].display;
-    let panel = props[0].physical_resolution; // 3840x2160 on this console
+        .map_err(|e| format!("vkGetPhysicalDeviceDisplayPropertiesKHR: {e}"))?;
+    let first = props.first().ok_or("RADV reports no display")?;
+    let disp = first.display;
+    report.push_str(&format!(
+        "display: {} {}x{} ",
+        first
+            .display_name_as_c_str()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        first.physical_resolution.width,
+        first.physical_resolution.height
+    ));
 
     let modes = display
         .get_display_mode_properties(phys, disp)
-        .expect("vkGetDisplayModePropertiesKHR failed");
-    assert!(!modes.is_empty(), "the display has no modes");
-    let mode = modes[0].display_mode;
-    let extent = modes[0].parameters.visible_region;
+        .map_err(|e| format!("vkGetDisplayModePropertiesKHR: {e}"))?;
+    if modes.is_empty() {
+        return Err("the display has no modes".into());
+    }
+    for m in &modes {
+        report.push_str(&format!(
+            "[{}x{}@{}] ",
+            m.parameters.visible_region.width,
+            m.parameters.visible_region.height,
+            m.parameters.refresh_rate
+        ));
+    }
+    let chosen = modes
+        .iter()
+        .find(|m| {
+            m.parameters.visible_region.width == PREFERRED_MODE.0
+                && m.parameters.visible_region.height == PREFERRED_MODE.1
+        })
+        .unwrap_or(&modes[0]);
+    let extent = chosen.parameters.visible_region;
+    report.push_str(&format!("-> {}x{}; ", extent.width, extent.height));
 
-    // Find a plane that supports this display.
+    // A plane that supports this display (the console has one).
     let plane_props = display
         .get_physical_device_display_plane_properties(phys)
-        .expect("vkGetPhysicalDeviceDisplayPlanePropertiesKHR failed");
+        .map_err(|e| format!("vkGetPhysicalDeviceDisplayPlanePropertiesKHR: {e}"))?;
     let mut plane_index = 0u32;
-    for (i, _) in plane_props.iter().enumerate() {
-        if let Ok(supported) = display.get_display_plane_supported_displays(phys, i as u32) {
+    for i in 0..plane_props.len() as u32 {
+        if let Ok(supported) = display.get_display_plane_supported_displays(phys, i) {
             if supported.contains(&disp) {
-                plane_index = i as u32;
+                plane_index = i;
                 break;
             }
         }
     }
 
     let create = vk::DisplaySurfaceCreateInfoKHR::default()
-        .display_mode(mode)
+        .display_mode(chosen.display_mode)
         .plane_index(plane_index)
+        .plane_stack_index(0)
         .transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+        .global_alpha(1.0)
         .alpha_mode(vk::DisplayPlaneAlphaFlagsKHR::OPAQUE)
         .image_extent(extent);
     let surface = display
         .create_display_plane_surface(&create, None)
-        .expect("vkCreateDisplayPlaneSurfaceKHR failed");
-
-    let w = if extent.width != 0 { extent.width } else { panel.width as u32 };
-    let h = if extent.height != 0 { extent.height } else { panel.height as u32 };
-    (surface, w, h)
+        .map_err(|e| format!("vkCreateDisplayPlaneSurfaceKHR: {e}"))?;
+    Ok((surface, extent))
 }
 
-/// Bring the whole chain up and hand back wgpu primitives + the display surface.
+/// Bring the whole chain up and hand back the wgpu primitives + the configured display surface.
 pub fn create() -> Result<Gpu, String> {
     unsafe {
-        let entry = static_entry();
-        let raw_instance = create_instance(&entry);
+        let mut report = String::new();
+        let entry = static_entry()?;
 
-        // The one physical device RADV presents (PS5 GPU, NAVI21).
-        let phys = raw_instance
+        // The instance version RADV reports (1.1+ has vkEnumerateInstanceVersion), as wgpu-hal's own
+        // init does; the app_info api_version below is that too.
+        let api_version = match entry.try_enumerate_instance_version() {
+            Ok(Some(v)) => v,
+            Ok(None) => vk::API_VERSION_1_0,
+            Err(e) => return Err(format!("vkEnumerateInstanceVersion: {e}")),
+        };
+        report.push_str(&format!(
+            "instance {}.{}.{}; ",
+            vk::api_version_major(api_version),
+            vk::api_version_minor(api_version),
+            vk::api_version_patch(api_version)
+        ));
+
+        let exts = instance_extensions(&entry, api_version)?;
+        let ext_ptrs: Vec<*const c_char> = exts.iter().map(|e| e.as_ptr()).collect();
+        let app = vk::ApplicationInfo::default()
+            .application_name(c"ruffle-ps5")
+            .application_version(1)
+            .engine_name(c"wgpu-hal")
+            .api_version(api_version);
+        let info = vk::InstanceCreateInfo::default()
+            .application_info(&app)
+            .enabled_extension_names(&ext_ptrs);
+        let raw_instance = entry
+            .create_instance(&info, None)
+            .map_err(|e| format!("vkCreateInstance on RADV: {e}"))?;
+
+        // The one physical device RADV presents (PlayStation 5 GPU, NAVI21).
+        let phys_all = raw_instance
             .enumerate_physical_devices()
-            .map_err(|e| format!("enumerate_physical_devices: {e}"))?;
-        let phys = *phys.first().ok_or("RADV enumerated no physical device")?;
+            .map_err(|e| format!("vkEnumeratePhysicalDevices: {e}"))?;
+        let phys = *phys_all
+            .first()
+            .ok_or("RADV enumerated no physical device")?;
+        {
+            let p = raw_instance.get_physical_device_properties(phys);
+            report.push_str(&format!(
+                "device {} (api {}.{}.{}); ",
+                p.device_name_as_c_str()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                vk::api_version_major(p.api_version),
+                vk::api_version_minor(p.api_version),
+                vk::api_version_patch(p.api_version)
+            ));
+        }
 
-        let (raw_surface, width, height) = create_display_surface(&entry, &raw_instance, phys);
+        let (raw_surface, extent) =
+            create_display_surface(&entry, &raw_instance, phys, &mut report)?;
+        let (width, height) = (extent.width, extent.height);
 
-        // ---- wgpu-hal adoption (SERVER: pin these argument lists to wgpu-hal 30.0.1) ----
-        // Wrap our entry+instance as a hal Vulkan instance. The extension list we enabled must be
-        // echoed here so wgpu-hal knows what is loaded.
-        let instance_exts = vec![
-            ash::khr::surface::NAME,
-            ash::khr::display::NAME,
-            ash::khr::get_physical_device_properties2::NAME,
-        ];
+        // ---- wgpu-hal adopts the instance (and owns it from here: it destroys it on drop) ----
         let hal_instance = wgpu_hal::vulkan::Instance::from_raw(
-            entry,
+            entry.clone(),
             raw_instance.clone(),
-            vk::make_api_version(0, 1, 3, 0), // instance_api_version
-            0,                                // android_sdk_version
-            None,                             // debug_utils_create_info
-            instance_exts,
-            wgpu_hal::InstanceFlags::empty(),
-            Default::default(),               // memory_budget_thresholds / memory hints
-            false,                            // has_nv_optimus
-            None,                             // drop_guard — we keep raw_instance alive via wgpu
+            api_version,
+            0,    // android_sdk_version
+            None, // debug utils: none (no validation layer in a title)
+            exts,
+            wgpu::InstanceFlags::empty(),
+            wgpu::MemoryBudgetThresholds::default(),
+            false, // has_nv_optimus
+            None,  // drop_callback: wgpu-hal takes ownership of raw_instance
         )
-        .map_err(|e| format!("wgpu_hal vulkan Instance::from_raw: {e:?}"))?;
-
-        // The hal surface from our raw VkSurfaceKHR.
-        let hal_surface = hal_instance.create_surface_from_vk_surface_khr(raw_surface);
-
-        // The hal adapter from our physical device.
-        let hal_adapter = hal_instance
-            .expose_adapter(phys)
-            .ok_or("wgpu-hal could not expose the RADV physical device")?;
+        .map_err(|e| format!("wgpu_hal::vulkan::Instance::from_raw: {e:?}"))?;
 
         // ---- into wgpu ----
         let instance = wgpu::Instance::from_hal::<wgpu_hal::vulkan::Api>(hal_instance);
+
+        // The surface: our VkSurfaceKHR, through the patched wgpu-hal (tools/wgpu-hal-ps5-surface.patch).
+        // wgpu owns it from here and destroys it with the wgpu::Surface.
+        let surface_ptr = NonNull::new(raw_surface.as_raw() as usize as *mut c_void)
+            .ok_or("vkCreateDisplayPlaneSurfaceKHR returned a null handle")?;
         let surface = instance
-            .create_surface_from_hal::<wgpu_hal::vulkan::Api>(hal_surface)
-            .map_err(|e| format!("create_surface_from_hal: {e:?}"))?;
+            .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: Some(RawDisplayHandle::Gbm(GbmDisplayHandle::new(
+                    NonNull::dangling(),
+                ))),
+                raw_window_handle: RawWindowHandle::Gbm(GbmWindowHandle::new(surface_ptr)),
+            })
+            .map_err(|e| {
+                format!("create_surface_unsafe (is tools/wgpu-hal-ps5-surface.patch applied?): {e}")
+            })?;
+
+        // The adapter from our physical device, and the device opened from the hal adapter so
+        // RADV's features/limits carry over. Features and limits as Ruffle's own request_device asks
+        // for them (render/wgpu/src/backend.rs): GL-ES-3-class limits raised to the adapter's
+        // resolution and alignment, the optional features the adapter has.
+        let hal_adapter = instance
+            .as_hal::<wgpu_hal::vulkan::Api>()
+            .ok_or("wgpu lost its Vulkan instance")?
+            .expose_adapter(phys)
+            .ok_or("wgpu-hal would not expose the RADV physical device as an adapter")?;
+        report.push_str(&format!(
+            "adapter {} ({:?}, driver {} {}); ",
+            hal_adapter.info.name,
+            hal_adapter.info.device_type,
+            hal_adapter.info.driver,
+            hal_adapter.info.driver_info
+        ));
+        let adapter_limits = hal_adapter.capabilities.limits.clone();
+        let mut limits = wgpu::Limits::downlevel_webgl2_defaults()
+            .using_resolution(adapter_limits.clone())
+            .using_alignment(adapter_limits.clone());
+        limits.max_uniform_buffer_binding_size = adapter_limits.max_uniform_buffer_binding_size;
+        limits.max_inter_stage_shader_variables = adapter_limits.max_inter_stage_shader_variables;
+        limits.max_color_attachments = 4;
+        let optional_features = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+            | wgpu::Features::TEXTURE_COMPRESSION_BC
+            | wgpu::Features::FLOAT32_FILTERABLE
+            | wgpu::Features::TIMESTAMP_QUERY
+            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
+        let features = optional_features & hal_adapter.features;
+        let memory_hints = wgpu::MemoryHints::Performance;
+        let open = hal_adapter
+            .adapter
+            .open(features, &limits, &memory_hints)
+            .map_err(|e| format!("wgpu-hal open (vkCreateDevice on RADV): {e:?}"))?;
         let adapter = instance.create_adapter_from_hal::<wgpu_hal::vulkan::Api>(hal_adapter);
+        let (device, queue) = adapter
+            .create_device_from_hal::<wgpu_hal::vulkan::Api>(
+                open,
+                &wgpu::DeviceDescriptor {
+                    label: Some("ruffle-ps5 RADV"),
+                    required_features: features,
+                    required_limits: limits,
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                    memory_hints,
+                    trace: wgpu::Trace::Off,
+                },
+            )
+            .map_err(|e| format!("create_device_from_hal: {e}"))?;
 
-        let (device, queue) = {
-            // Open the device from the hal adapter so RADV's features/limits carry over.
-            let open = hal_adapter_open(&adapter)?;
-            adapter
-                .create_device_from_hal(
-                    open,
-                    &wgpu::DeviceDescriptor {
-                        label: Some("ruffle-ps5 RADV"),
-                        required_features: wgpu::Features::empty(),
-                        required_limits: adapter.limits(),
-                        memory_hints: wgpu::MemoryHints::Performance,
-                        trace: wgpu::Trace::Off,
-                    },
-                    None,
-                )
-                .map_err(|e| format!("create_device_from_hal: {e:?}"))?
-        };
-
-        // Configure the surface to the display size, mailbox/fifo as RADV allows.
+        // The surface at the display size. VideoOut's WSI offers FIFO only and BGRA8; Flash colours
+        // are sRGB values written as they are, so the unorm view is what Ruffle wants too.
         let caps = surface.get_capabilities(&adapter);
+        report.push_str(&format!(
+            "surface formats {:?}, present modes {:?}, alpha {:?}",
+            caps.formats, caps.present_modes, caps.alpha_modes
+        ));
         let format = caps
             .formats
             .iter()
             .copied()
-            .find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb))
-            .unwrap_or(caps.formats[0]);
+            .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm)
+            .or_else(|| {
+                caps.formats
+                    .iter()
+                    .copied()
+                    .find(|f| *f == wgpu::TextureFormat::Bgra8UnormSrgb)
+            })
+            .or_else(|| caps.formats.first().copied())
+            .ok_or("the surface reports no formats")?;
+        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto)
+        };
         surface.configure(
             &device,
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format,
+                color_space: wgpu::SurfaceColorSpace::Auto,
                 width,
                 height,
                 present_mode: wgpu::PresentMode::Fifo,
-                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                alpha_mode,
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
             },
         );
 
-        Ok(Gpu { instance, adapter, device, queue, surface, width, height })
+        Ok(Gpu {
+            instance,
+            adapter,
+            device,
+            queue,
+            surface,
+            format,
+            width,
+            height,
+            report,
+        })
     }
 }
 
-/// SERVER: wgpu-hal 30's `Adapter::open` returns `OpenDevice`; wire the exact call once the crate is
-/// resolved. Kept separate so the signature churn is in one place.
-fn hal_adapter_open(
-    _adapter: &wgpu::Adapter,
-) -> Result<wgpu_hal::OpenDevice<wgpu_hal::vulkan::Api>, String> {
-    // The hal adapter is inside `adapter`; wgpu 30 exposes it through `adapter.as_hal::<Api,_,_>()`.
-    // Opening yields queues + device. Finalized on the server where the method shapes are visible.
-    Err("hal_adapter_open: finalize against wgpu-hal 30.0.1 on the server".to_string())
-}
-
-/// Convenience used by milestone 3a (clear the screen) and 3b (Ruffle). Wraps the surface frame.
+/// Milestone 3a: clear the display to a colour and present it. One frame.
 pub fn present_clear(gpu: &Gpu, r: f64, g: f64, b: f64) -> Result<(), String> {
-    let frame = gpu
-        .surface
-        .get_current_texture()
-        .map_err(|e| format!("get_current_texture: {e:?}"))?;
-    let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+    // wgpu 30: an enum, not a Result; presenting goes through the queue.
+    let frame = match gpu.surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+        other => return Err(format!("get_current_texture: {other:?}")),
+    };
+    let view = frame
+        .texture
+        .create_view(&wgpu::TextureViewDescriptor::default());
     let mut enc = gpu
         .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("clear") });
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("clear"),
+        });
     {
         let _pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("clear"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &view,
-                resolve_target: None,
                 depth_slice: None,
+                resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a: 1.0 }),
                     store: wgpu::StoreOp::Store,
@@ -245,16 +399,18 @@ pub fn present_clear(gpu: &Gpu, r: f64, g: f64, b: f64) -> Result<(), String> {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
     }
     gpu.queue.submit(Some(enc.finish()));
-    frame.present();
+    gpu.queue.present(frame);
     Ok(())
 }
 
 /// Shared descriptors for Ruffle (milestone 3b): wrap the wgpu primitives Ruffle's renderer wants.
-pub fn descriptors(gpu: &Gpu) -> Arc<ruffle_render_wgpu::descriptors::Descriptors> {
-    Arc::new(ruffle_render_wgpu::descriptors::Descriptors::new(
+#[cfg(feature = "ruffle")]
+pub fn descriptors(gpu: &Gpu) -> std::sync::Arc<ruffle_render_wgpu::descriptors::Descriptors> {
+    std::sync::Arc::new(ruffle_render_wgpu::descriptors::Descriptors::new(
         gpu.instance.clone(),
         gpu.adapter.clone(),
         gpu.device.clone(),
