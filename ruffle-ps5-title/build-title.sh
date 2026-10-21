@@ -317,7 +317,8 @@ echo "   $(du -sh "$APPDIR/eboot.bin" | cut -f1) eboot.bin · zip: $ZIP"
 echo "   install: copy the $TITLE_ID folder to /data/homebrew/ on the console (FTP), so that"
 echo "   /data/homebrew/$TITLE_ID/eboot.bin exists; a 'Ruffle' tile appears under Games."
 if [[ $RUFFLE == 1 ]]; then
-    echo "   3b: put a movie at /data/ruffle/movie.swf first. Log: /data/ruffle/ruffle.log"
+    echo "   3b: put a movie at /data/ruffle/movie.swf first (test-swf/bounce.swf is a known-good one:"
+    echo "       two squares, one sliding, one spinning, 90 frames at 30 fps). Log: /data/ruffle/ruffle.log"
 else
     echo "   3a: the screen should cycle through colours for 8 s, with toasts. Log: /data/ruffle/ruffle.log"
 fi

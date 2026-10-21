@@ -12,7 +12,7 @@ The plan, the decisions and every measurement taken on the console are in
 |---|---|
 | 1 — Rust's standard library on the console, as a Games-row title | **done, 10/10 checks on hardware** (threads, clocks, files, directories, 64 MB allocations, random, TCP in and out of the sandbox) |
 | 2 — Flash on the TV as a payload (SDL2 + Mesa/zink on RADV + Ruffle core) | set aside: RADV runs in a payload process, but every launcher that gives a payload the GPU's memory budget is refused by `libSceAgc` (`FS Table offset has shifted`) — see the plan, §5j–5l |
-| 3 — the standalone title: Ruffle's wgpu renderer on a **statically linked RADV** | **in progress, running on hardware**: `ruffle-ps5-title/` builds a 28 MB Games-row title (Rust std + wgpu 30 + the RADV archive + the SDK fork's platform layer); on the console it initialises AGC, creates the Vulkan instance, device and `VK_KHR_display` surface — phase 3a (clear the screen through wgpu) is at the adapter step |
+| 3 — the standalone title: Ruffle's wgpu renderer on a **statically linked RADV** | **phase 3a done on hardware**: `ruffle-ps5-title/` builds a 28 MB Games-row title (Rust std + wgpu 30 + the RADV archive + the SDK fork's platform layer) that brings wgpu up on RADV in 90 ms and presents at 1920x1080, 59.7 fps, through `VK_KHR_display` on VideoOut. Next: 3b, Ruffle itself (`./build-title.sh --ruffle`) |
 
 ## What is here
 
