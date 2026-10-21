@@ -9,14 +9,12 @@ target = "x86_64-sie-ps5.json"
 
 [unstable]
 build-std = ["std", "panic_abort"]
-build-std-features = ["panic_immediate_abort"]
 json-target-spec = true
 
 [target.x86_64-sie-ps5]
 linker = "./tools/ps5-rust-linker.sh"
 rustflags = [
   "--cfg", "libc_unstable_freebsd_version=\"11\"",
-  # wgpu's Vulkan backend talks to RADV through ash. ash must NOT try to dlopen libvulkan: a
-  # title cannot dlopen (the SDK loader makes raw syscalls). We build ash with its "loaded"
-  # feature off and hand it a static vkGetInstanceProcAddr (src/gpu.rs), so no loader is linked.
+  # (ash's dlopen loader is compiled in via wgpu-hal but never called: src/gpu.rs hands it a static
+  # vkGetInstanceProcAddr, and shell/dl_stubs.c answers the dl* names a title does not have.)
 ]
