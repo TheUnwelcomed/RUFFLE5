@@ -1,27 +1,59 @@
 #!/usr/bin/env bash
-# build-radv-server.sh — build the static RADV archive on the Bytesized server (no root).
+# build-radv-server.sh (v2) — build the static RADV archive on the Bytesized server (no root).
 #
-# It only does what SETUP-RADV.md describes, by hand would: install meson+ninja for your user,
-# clone Mihawk's three public repos as siblings, and run THEIR OWN setup + build scripts (which pin
-# their own revisions). Output: libvulkan_radeon.ps5.a, which the Ruffle title links.
+# It does what SETUP-RADV.md describes by hand would: make a host clang available, install
+# meson+ninja for your user, clone Mihawk's three public repos as siblings, and run THEIR OWN
+# setup + build scripts (which pin their own revisions). Output: libvulkan_radeon.ps5.a.
 #
 # Usage:   bash build-radv-server.sh [BASE_DIR]
-#   BASE_DIR defaults to ~/ps5gpu. Safe to re-run: existing clones are reused.
+#   BASE_DIR defaults to ~/ps5gpu. Safe to re-run: existing clones and tools are reused.
+#   If clang isn't found, set it:  CLANG=/path/to/clang bash build-radv-server.sh
 set -euo pipefail
 
 BASE="${1:-$HOME/ps5gpu}"
-export PATH="$HOME/.local/bin:$PATH"
+SHIM="$HOME/.ruffle-build-bin"
+export PATH="$HOME/.local/bin:$SHIM:$PATH"
 
 log() { printf '\n=== %s ===\n' "$*"; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
-# ---- 0. tools -------------------------------------------------------------------------------
-log "0. checking tools"
-for c in git clang-18 make wget rsync python3; do
-    command -v "$c" >/dev/null || command -v "${c%-18}" >/dev/null \
-        || die "missing '$c'. git/make/wget/python3 should be on the server; clang-18 you used for milestone 1. rsync: ask the host if absent."
-done
+# ---- 0. a host C/C++ compiler --------------------------------------------------------------
+# PS5_Vulkan's dep setup insists on `clang` by name (for host-side zlib / Mesa tools). The server
+# has no bare clang on PATH, but your payload SDK ships a real clang 18. Find one and expose it as
+# `clang`/`clang++` in a shim dir on PATH, so the sub-scripts' `command -v clang` succeeds.
+log "0. finding a host clang"
+find_clang() {
+    # explicit override
+    if [[ -n "${CLANG:-}" && -x "${CLANG}" ]]; then echo "${CLANG}"; return; fi
+    # on PATH, any reasonable version
+    local c
+    for c in clang clang-18 clang-17 clang-19 clang-16 clang-15 clang-14; do
+        command -v "$c" >/dev/null && { command -v "$c"; return; }
+    done
+    # inside a payload SDK you already have (pacbrew or plain); bin/clang is a full host clang
+    for c in "${PS5_PAYLOAD_SDK:-}/bin/clang" "${PS5_PACBREW_SDK:-}/bin/clang" \
+             "$HOME"/ps5-payload-sdk/bin/clang "$HOME"/pacbrew/opt/ps5-payload-sdk/bin/clang; do
+        [[ -n "$c" && -x "$c" ]] && { echo "$c"; return; }
+    done
+    # last resort: search your home for an SDK's clang (bounded)
+    find "$HOME" -maxdepth 5 -type f -path '*/bin/clang' -perm -u+x 2>/dev/null | head -1
+}
+HOSTCLANG="$(find_clang || true)"
+[[ -n "$HOSTCLANG" && -x "$HOSTCLANG" ]] || die "no clang found. Point me at the one from milestone 1, e.g.:
+    CLANG=\$HOME/ps5-payload-sdk/bin/clang bash build-radv-server.sh
+(it's the 'clang 18.1.8' your earlier builds used; look under your payload SDK's bin/)."
+HOSTCXX="${HOSTCLANG}++"; [[ -x "$HOSTCXX" ]] || HOSTCXX="$HOSTCLANG"
+mkdir -p "$SHIM"
+ln -sf "$HOSTCLANG" "$SHIM/clang"
+ln -sf "$HOSTCXX"  "$SHIM/clang++"
+hash -r
+printf 'using clang: %s\n  %s\n' "$HOSTCLANG" "$("$HOSTCLANG" --version | head -1)"
+export CC="$SHIM/clang" CXX="$SHIM/clang++"
 
+# ---- the rest of the tools -----------------------------------------------------------------
+for c in git make wget rsync python3; do
+    command -v "$c" >/dev/null || die "missing '$c' (git/make/wget/python3 should be on the server; rsync: ask the host if absent)."
+done
 if ! command -v meson >/dev/null; then
     log "installing meson + ninja for your user (pip --user; no root)"
     python3 -m pip install --user --upgrade meson ninja \
@@ -38,10 +70,8 @@ for repo in PS5_Vulkan PS5_Mesa PS5_PayloadSDK; do
     if [[ -d "$BASE/$repo/.git" ]]; then
         echo "  $repo already cloned — leaving it as is"
     else
-        # full clone (not shallow): the setup scripts git-archive from pinned commits that a
-        # shallow clone might not contain.
         git clone "https://github.com/mihawk-99/$repo.git" "$BASE/$repo" \
-            || die "git clone $repo failed (network/allowlist?). Clone it by hand and re-run."
+            || die "git clone $repo failed (network/allowlist?). Clone it by hand into $BASE and re-run."
     fi
 done
 
@@ -61,6 +91,7 @@ ls -la "$ARCHIVE"
 sha256sum "$ARCHIVE" 2>/dev/null | cut -c1-16 | sed 's/^/  sha256: /'
 cat > "$HOME/.ruffle-radv-env" <<ENV
 # source this before ./build-title.sh
+export PATH="\$HOME/.local/bin:$SHIM:\$PATH"
 export PS5_PAYLOAD_SDK=$BASE/PS5_Vulkan/.deps/native/ps5-payload-sdk
 export PS5_VULKAN_DIR=$BASE/PS5_Vulkan
 ENV
