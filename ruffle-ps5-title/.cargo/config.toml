@@ -15,6 +15,9 @@ json-target-spec = true
 linker = "./tools/ps5-rust-linker.sh"
 rustflags = [
   "--cfg", "libc_unstable_freebsd_version=\"11\"",
+  # The getrandom crate (rand, ahash) would call getrandom(2), a FreeBSD 12 call the console does
+  # not have; src/random.rs is its custom backend, over the platform layer's arc4random_buf.
+  "--cfg", "getrandom_backend=\"custom\"",
   # (ash's dlopen loader is compiled in via wgpu-hal but never called: src/gpu.rs hands it a static
   # vkGetInstanceProcAddr, and shell/dl_stubs.c answers the dl* names a title does not have.)
 ]

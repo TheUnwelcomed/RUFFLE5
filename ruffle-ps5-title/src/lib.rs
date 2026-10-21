@@ -14,6 +14,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 mod gpu;
+mod random;
 
 extern "C" {
     fn ps5_notify(msg: *const c_char);
