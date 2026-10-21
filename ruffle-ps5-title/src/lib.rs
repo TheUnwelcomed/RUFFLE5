@@ -25,6 +25,26 @@ fn say(s: &str) {
         unsafe { ps5_log(c.as_ptr()) };
     }
 }
+
+/// wgpu-hal says why it declines an adapter, which extensions it lacks, what the swapchain does —
+/// all through `log`, at debug level. Into ruffle.log, so the console tells us instead of us guessing.
+struct Ps5Logger;
+impl log::Log for Ps5Logger {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        if m.target().starts_with("wgpu_hal") {
+            m.level() <= log::Level::Debug
+        } else {
+            m.level() <= log::Level::Info
+        }
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            say(&format!("[{} {}] {}", r.level(), r.target(), r.args()));
+        }
+    }
+    fn flush(&self) {}
+}
+static LOGGER: Ps5Logger = Ps5Logger;
 fn toast(s: &str) {
     if let Ok(c) = std::ffi::CString::new(s) {
         unsafe { ps5_notify(c.as_ptr()) };
@@ -41,6 +61,9 @@ pub extern "C" fn ruffle_ps5_main(data_dir: *const c_char) -> c_int {
     say(&format!(
         "ruffle-ps5 (PS5_RUFFLE_V2) starting; data dir {data_dir}"
     ));
+    if log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Debug);
+    }
     toast("ruffle-ps5: bringing up RADV");
 
     let t_start = Instant::now();

@@ -47,6 +47,13 @@ pub struct Gpu {
     pub report: String,
 }
 
+/// wgpu-hal hides a physical device whose driver reports conformance version 0 unless told
+/// otherwise. The Mesa fork does exactly that on the PS5 — "No CTS release has passed on the PS5
+/// yet: the version stays 0.0.0.0 until one does" (radv_physical_device.c, RADV_PS5) — so the
+/// first run on the console stopped at "would not expose the RADV physical device as an adapter".
+const INSTANCE_FLAGS: wgpu::InstanceFlags =
+    wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
+
 /// The display size to ask for. VideoOut scales any of its sizes to the screen; 1080p is plenty for
 /// Flash content and a quarter of the fill of 2160p. The first mode (3840x2160) is the fallback.
 const PREFERRED_MODE: (u32, u32) = (1920, 1080);
@@ -69,12 +76,9 @@ unsafe fn instance_extensions(
     entry: &ash::Entry,
     api_version: u32,
 ) -> Result<Vec<&'static CStr>, String> {
-    let mut exts = wgpu_hal::vulkan::Instance::desired_extensions(
-        entry,
-        api_version,
-        wgpu::InstanceFlags::empty(),
-    )
-    .map_err(|e| format!("desired_extensions: {e:?}"))?;
+    let mut exts =
+        wgpu_hal::vulkan::Instance::desired_extensions(entry, api_version, INSTANCE_FLAGS)
+            .map_err(|e| format!("desired_extensions: {e:?}"))?;
     let available = entry
         .enumerate_instance_extension_properties(None)
         .map_err(|e| format!("vkEnumerateInstanceExtensionProperties: {e}"))?;
@@ -237,7 +241,7 @@ pub fn create() -> Result<Gpu, String> {
             0,    // android_sdk_version
             None, // debug utils: none (no validation layer in a title)
             exts,
-            wgpu::InstanceFlags::empty(),
+            INSTANCE_FLAGS,
             wgpu::MemoryBudgetThresholds::default(),
             false, // has_nv_optimus
             None,  // drop_callback: wgpu-hal takes ownership of raw_instance
