@@ -17,37 +17,46 @@ export PATH="$HOME/.local/bin:$SHIM:$PATH"
 log() { printf '\n=== %s ===\n' "$*"; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
-# ---- 0. a host C/C++ compiler --------------------------------------------------------------
-# PS5_Vulkan's dep setup insists on `clang` by name (for host-side zlib / Mesa tools). The server
-# has no bare clang on PATH, but your payload SDK ships a real clang 18. Find one and expose it as
-# `clang`/`clang++` in a shim dir on PATH, so the sub-scripts' `command -v clang` succeeds.
-log "0. finding a host clang"
-find_clang() {
-    # explicit override
-    if [[ -n "${CLANG:-}" && -x "${CLANG}" ]]; then echo "${CLANG}"; return; fi
-    # on PATH, any reasonable version
-    local c
-    for c in clang clang-18 clang-17 clang-19 clang-16 clang-15 clang-14; do
-        command -v "$c" >/dev/null && { command -v "$c"; return; }
-    done
-    # inside a payload SDK you already have (pacbrew or plain); bin/clang is a full host clang
-    for c in "${PS5_PAYLOAD_SDK:-}/bin/clang" "${PS5_PACBREW_SDK:-}/bin/clang" \
-             "$HOME"/ps5-payload-sdk/bin/clang "$HOME"/pacbrew/opt/ps5-payload-sdk/bin/clang; do
-        [[ -n "$c" && -x "$c" ]] && { echo "$c"; return; }
-    done
-    # last resort: search your home for an SDK's clang (bounded)
-    find "$HOME" -maxdepth 5 -type f -path '*/bin/clang' -perm -u+x 2>/dev/null | head -1
+# ---- 0. a working host C/C++ compiler ------------------------------------------------------
+# PS5_Vulkan's dep setup insists on `clang` by name, only for HOST-side helper compiles (zlib, the
+# mesa-clc host tool). The PS5 target itself is built by the fork SDK's own clang, not this one. So
+# any working host compiler does; we expose it as `clang`/`clang++` in a shim dir on PATH. We TEST
+# that a candidate actually runs — your ~/ps5-payload-sdk/bin/clang is a wrapper pointing at a
+# missing /llvm-clang, so it is skipped — and fall back to the server's gcc, which builds those
+# host helpers fine.
+log "0. finding a working host compiler"
+works() { "$1" --version >/dev/null 2>&1; }         # true only if it actually runs
+HOSTCLANG=""; HOSTCXX=""; USING="gcc"
+try_clang() {
+    local c="$1" cxx="${1}++"
+    [[ -x "$c" ]] || c="$(command -v "$c" 2>/dev/null || true)"
+    [[ -n "$c" ]] || return 1
+    works "$c" && "$c" --version 2>/dev/null | grep -qi clang || return 1
+    [[ -x "${cxx}" ]] || cxx="$(command -v "${1}++" 2>/dev/null || true)"
+    [[ -n "$cxx" ]] && works "$cxx" || cxx="$c"      # clang can act as the C++ driver if clang++ is absent
+    HOSTCLANG="$c"; HOSTCXX="$cxx"; USING="clang"; return 0
 }
-HOSTCLANG="$(find_clang || true)"
-[[ -n "$HOSTCLANG" && -x "$HOSTCLANG" ]] || die "no clang found. Point me at the one from milestone 1, e.g.:
-    CLANG=\$HOME/ps5-payload-sdk/bin/clang bash build-radv-server.sh
-(it's the 'clang 18.1.8' your earlier builds used; look under your payload SDK's bin/)."
-HOSTCXX="${HOSTCLANG}++"; [[ -x "$HOSTCXX" ]] || HOSTCXX="$HOSTCLANG"
+# a real clang, in order of preference: explicit override, PATH, then any SDK's bin/clang that works
+if [[ -n "${CLANG:-}" ]]; then try_clang "$CLANG" || true; fi
+if [[ -z "$HOSTCLANG" ]]; then
+    for c in clang clang-18 clang-17 clang-19 clang-16 clang-15 clang-14; do try_clang "$c" && break; done
+fi
+if [[ -z "$HOSTCLANG" ]]; then
+    for c in "${PS5_PAYLOAD_SDK:-}/bin/clang" "$HOME"/ps5-payload-sdk/bin/clang \
+             "$HOME"/pacbrew/opt/ps5-payload-sdk/bin/clang; do
+        [[ -n "$c" ]] && try_clang "$c" && break
+    done
+fi
+# fall back to gcc (fine for the host helper compiles)
+if [[ -z "$HOSTCLANG" ]]; then
+    command -v gcc >/dev/null && works gcc || die "no working clang and no gcc. Install one, or set CLANG=/path/to/a/working/clang."
+    HOSTCLANG="$(command -v gcc)"; HOSTCXX="$(command -v g++ || command -v gcc)"; USING="gcc"
+fi
 mkdir -p "$SHIM"
 ln -sf "$HOSTCLANG" "$SHIM/clang"
 ln -sf "$HOSTCXX"  "$SHIM/clang++"
 hash -r
-printf 'using clang: %s\n  %s\n' "$HOSTCLANG" "$("$HOSTCLANG" --version | head -1)"
+printf 'host compiler (%s): %s\n  %s\n' "$USING" "$HOSTCLANG" "$("$HOSTCLANG" --version 2>/dev/null | head -1)"
 export CC="$SHIM/clang" CXX="$SHIM/clang++"
 
 # ---- the rest of the tools -----------------------------------------------------------------
@@ -70,7 +79,9 @@ for repo in PS5_Vulkan PS5_Mesa PS5_PayloadSDK; do
     if [[ -d "$BASE/$repo/.git" ]]; then
         echo "  $repo already cloned — leaving it as is"
     else
-        git clone "https://github.com/mihawk-99/$repo.git" "$BASE/$repo" \
+        # blobless: full commit/tree history (the setup scripts git-archive a pinned commit) but
+        # blobs fetched on demand, so the big Mesa fork comes down fast instead of in full.
+        git clone --filter=blob:none "https://github.com/mihawk-99/$repo.git" "$BASE/$repo" \
             || die "git clone $repo failed (network/allowlist?). Clone it by hand into $BASE and re-run."
     fi
 done
