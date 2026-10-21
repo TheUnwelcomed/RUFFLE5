@@ -67,49 +67,46 @@ pub extern "C" fn ruffle_ps5_main(data_dir: *const c_char) -> c_int {
     };
 
     #[cfg(not(feature = "ruffle"))]
-    {
-        // 3a: animate a clear colour for 8 seconds, proving present works end to end. The first
-        // frame is logged on its own: it is the one that creates the swapchain.
-        let t0 = Instant::now();
-        let mut frames = 0u64;
-        while t0.elapsed() < Duration::from_secs(8) {
-            let t = t0.elapsed().as_secs_f64();
-            let r = 0.5 + 0.5 * (t * 1.1).sin();
-            let g = 0.15;
-            let b = 0.5 + 0.5 * (t * 0.7).cos();
-            if let Err(e) = gpu::present_clear(&gpu, r, g, b) {
-                say(&format!("FAIL present at frame {frames}: {e}"));
-                toast("ruffle-ps5: present failed (see ruffle.log)");
-                return 1;
-            }
-            if frames == 0 {
-                say(&format!(
-                    "ok   first frame presented after {:.3} s",
-                    t0.elapsed().as_secs_f64()
-                ));
-            }
-            frames += 1;
-        }
-        let fps = frames as f64 / t0.elapsed().as_secs_f64();
-        say(&format!(
-            "ok   {frames} frames presented in {:.1} s, {fps:.1} fps",
-            t0.elapsed().as_secs_f64()
-        ));
-        toast(&format!("ruffle-ps5: RADV present OK, {fps:.0} fps"));
-        0
-    }
-
+    let result = run_clear(&gpu);
     #[cfg(feature = "ruffle")]
-    {
-        match run_ruffle(gpu, &data_dir) {
-            Ok(()) => 0,
-            Err(e) => {
-                say(&format!("FAIL ruffle: {e}"));
-                toast("ruffle-ps5: playback failed (see ruffle.log)");
-                1
-            }
+    let result = run_ruffle(gpu, &data_dir);
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            say(&format!("FAIL {e}"));
+            toast("ruffle-ps5: failed (see ruffle.log)");
+            1
         }
     }
+}
+
+/// 3a: animate a clear colour for 8 seconds, proving present works end to end. The first frame
+/// is logged on its own: it is the one that creates the swapchain.
+#[cfg(not(feature = "ruffle"))]
+fn run_clear(gpu: &gpu::Gpu) -> Result<(), String> {
+    let t0 = Instant::now();
+    let mut frames = 0u64;
+    while t0.elapsed() < Duration::from_secs(8) {
+        let t = t0.elapsed().as_secs_f64();
+        let r = 0.5 + 0.5 * (t * 1.1).sin();
+        let g = 0.15;
+        let b = 0.5 + 0.5 * (t * 0.7).cos();
+        gpu::present_clear(gpu, r, g, b).map_err(|e| format!("present at frame {frames}: {e}"))?;
+        if frames == 0 {
+            say(&format!(
+                "ok   first frame presented after {:.3} s",
+                t0.elapsed().as_secs_f64()
+            ));
+        }
+        frames += 1;
+    }
+    let fps = frames as f64 / t0.elapsed().as_secs_f64();
+    say(&format!(
+        "ok   {frames} frames presented in {:.1} s, {fps:.1} fps",
+        t0.elapsed().as_secs_f64()
+    ));
+    toast(&format!("ruffle-ps5: RADV present OK, {fps:.0} fps"));
+    Ok(())
 }
 
 /// 3b: play /data/ruffle/movie.swf. Written against the pinned Ruffle revision's API
