@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-radv-server.sh (v9) — build the static RADV archive on the Bytesized server (no root).
+# build-radv-server.sh (v10) — build the static RADV archive on the Bytesized server (no root).
 #
 # It does what SETUP-RADV.md describes by hand would: make a host clang available, install
 # meson+ninja for your user, clone Mihawk's three public repos as siblings, and run THEIR OWN
@@ -126,7 +126,8 @@ bash tools/setup-native-dependencies.sh || die "setup-native-dependencies.sh fai
 # (Ubuntu 22.04 ships 2022.1); a SPIRV-LLVM-Translator matching LLVM 18.1; and LLVM+clang libraries.
 # The LLVM 18 tarball ships only STATIC libLLVM*.a/libclang*.a (no libLLVM.so), while Mihawk's script
 # hardcodes -Dshared-llvm=enabled — so we configure that one build directory ourselves with static
-# LLVM, and build-radv.sh, seeing build.ninja already there, only runs ninja in it.
+# LLVM, and build-radv.sh, seeing build.ninja already there, only runs ninja in it. The tarball's LLVM
+# is built without RTTI, so Mesa must be too (cpp_rtti=false; Mesa checks and says so).
 log "2b0. host tools for mesa_clc (python modules, SPIRV-Tools, SPIRV-LLVM-Translator; one-time)"
 HOST="$BASE/host"; HOSTLIB="$HOST/lib"; HOSTSRC="$BASE/host-src"
 mkdir -p "$HOSTLIB/pkgconfig" "$HOSTSRC"
@@ -239,7 +240,7 @@ if [[ ! -f "$CLC_BUILD/build.ninja" ]]; then
         -Dgallium-drivers= -Dvulkan-drivers= -Dplatforms= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
         -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dllvm=enabled -Dshared-llvm=disabled \
         -Dbuild-tests=false -Dvalgrind=disabled -Dlibunwind=disabled -Dzstd=disabled -Dxmlconfig=disabled \
-        -Dtools= > "$CLC_BUILD.setup.log" 2>&1 \
+        -Dtools= -Dcpp_rtti=false > "$CLC_BUILD.setup.log" 2>&1 \
         || { tail -30 "$CLC_BUILD.setup.log"; die "mesa_clc meson setup failed — send me $CLC_BUILD.setup.log"; }
 fi
 
