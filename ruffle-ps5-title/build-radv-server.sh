@@ -25,39 +25,33 @@ die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 # missing /llvm-clang, so it is skipped — and fall back to the server's gcc, which builds those
 # host helpers fine.
 log "0. finding a working host compiler"
-works() { "$1" --version >/dev/null 2>&1; }         # true only if it actually runs
-HOSTCLANG=""; HOSTCXX=""; USING="gcc"
-try_clang() {
-    local c="$1" cxx="${1}++"
-    [[ -x "$c" ]] || c="$(command -v "$c" 2>/dev/null || true)"
-    [[ -n "$c" ]] || return 1
-    works "$c" && "$c" --version 2>/dev/null | grep -qi clang || return 1
-    [[ -x "${cxx}" ]] || cxx="$(command -v "${1}++" 2>/dev/null || true)"
-    [[ -n "$cxx" ]] && works "$cxx" || cxx="$c"      # clang can act as the C++ driver if clang++ is absent
-    HOSTCLANG="$c"; HOSTCXX="$cxx"; USING="clang"; return 0
-}
-# a real clang, in order of preference: explicit override, PATH, then any SDK's bin/clang that works
-if [[ -n "${CLANG:-}" ]]; then try_clang "$CLANG" || true; fi
-if [[ -z "$HOSTCLANG" ]]; then
-    for c in clang clang-18 clang-17 clang-19 clang-16 clang-15 clang-14; do try_clang "$c" && break; done
-fi
-if [[ -z "$HOSTCLANG" ]]; then
-    for c in "${PS5_PAYLOAD_SDK:-}/bin/clang" "$HOME"/ps5-payload-sdk/bin/clang \
-             "$HOME"/pacbrew/opt/ps5-payload-sdk/bin/clang; do
-        [[ -n "$c" ]] && try_clang "$c" && break
-    done
-fi
-# fall back to gcc (fine for the host helper compiles)
-if [[ -z "$HOSTCLANG" ]]; then
-    command -v gcc >/dev/null && works gcc || die "no working clang and no gcc. Install one, or set CLANG=/path/to/a/working/clang."
-    HOSTCLANG="$(command -v gcc)"; HOSTCXX="$(command -v g++ || command -v gcc)"; USING="gcc"
-fi
+# Probe with no stdin and a timeout: a broken SDK clang wrapper (yours points at a missing
+# /llvm-clang) otherwise blocks forever when asked its version.
+works() { timeout 10 "$1" --version </dev/null >/dev/null 2>&1; }
 mkdir -p "$SHIM"
-ln -sf "$HOSTCLANG" "$SHIM/clang"
-ln -sf "$HOSTCXX"  "$SHIM/clang++"
+rm -f "$SHIM/clang" "$SHIM/clang++"        # clear any stale shim a previous run left pointing at a broken clang
 hash -r
-printf 'host compiler (%s): %s\n  %s\n' "$USING" "$HOSTCLANG" "$("$HOSTCLANG" --version 2>/dev/null | head -1)"
-export CC="$SHIM/clang" CXX="$SHIM/clang++"
+
+HOSTCC=""; HOSTCXX=""; USING=""
+# Only use a clang if YOU point at a working one (CLANG=...); otherwise gcc, which builds the
+# host-side helpers (zlib, the mesa-clc host tool) perfectly. The PS5 target is built by the fork
+# SDK's own clang, not this compiler, so gcc here changes nothing about the output.
+if [[ -n "${CLANG:-}" ]] && works "$CLANG"; then
+    HOSTCC="$CLANG"; HOSTCXX="${CLANG}++"; works "$HOSTCXX" || HOSTCXX="$CLANG"; USING="clang"
+elif command -v gcc >/dev/null && works "$(command -v gcc)"; then
+    HOSTCC="$(command -v gcc)"; HOSTCXX="$(command -v g++ || command -v gcc)"; USING="gcc"
+elif command -v cc >/dev/null && works "$(command -v cc)"; then
+    HOSTCC="$(command -v cc)"; HOSTCXX="$(command -v c++ || command -v cc)"; USING="cc"
+else
+    die "no working host compiler. Install gcc, or set CLANG=/path/to/a/working/clang and re-run."
+fi
+# mihawk's setup insists on a binary named `clang`; point that name at our working compiler.
+ln -sf "$HOSTCC"  "$SHIM/clang"
+ln -sf "$HOSTCXX" "$SHIM/clang++"
+hash -r
+# meson/make use the REAL compiler (so meson identifies it correctly), not the clang-named shim.
+export CC="$HOSTCC" CXX="$HOSTCXX"
+printf 'host compiler (%s): %s\n  %s\n' "$USING" "$HOSTCC" "$("$HOSTCC" --version 2>/dev/null | head -1)"
 
 # ---- the rest of the tools -----------------------------------------------------------------
 for c in git make wget rsync python3; do
