@@ -227,7 +227,14 @@ link_app() {
     # The kit's line (--allow-multiple-definition for evo_dns's resolver names; --wrap=ioctl for
     # std's set_nonblocking → SO_NBIO) with the RADV recipe's wraps/bindings and inputs spliced in:
     # the archive whole, then libc++/libc++abi/libunwind + builtins + the platform layer as a group.
+    # --no-dynamic-linker (+ -z nodynamic-undefined-weak, the name newer lld gives the same rule):
+    # Mesa's dispatch tables name every Vulkan entry point through a weak reference, hundreds of
+    # which nothing defines (vk_common_*, wsi_*); without this lld exports each as a dynamic import
+    # and the converter refuses them. With it they resolve to 0 at link time, as PS5_Vulkan's and
+    # PS5_RetroArch's titles link (tools/check-driver.sh, build-title.sh). std's weak references
+    # (posix_spawn_file_actions_addchdir_np) resolve the same way.
     "$LLD" -T "$NATIVE/ps5-pie.ld" --eh-frame-hdr --allow-multiple-definition \
+        --no-dynamic-linker -z nodynamic-undefined-weak \
         --wrap=ioctl "${radv_link_flags[@]}" \
         --version-script "$NATIVE/app-symbols.map" --exclude-libs=ALL --error-limit=0 \
         -L "$BUILD/obj" -e _start -o "$BUILD/llvm-pie.elf" \
@@ -247,9 +254,11 @@ if ! link_app "$BUILD/obj/import_check0.o"; then
     die "link failed — send me build/undefined-symbols.txt or the lines above"
 fi
 # Runtime import check: the loader binds an import the console does not export to NULL, silently.
-# Relink with a table of every import; the shell can toast the NULL ones at start.
+# Relink with a table of every import; the shell can toast the NULL ones at start. The imports are
+# what the converter sees: the undefined entries of the dynamic symbol table (not nm's static
+# table, where Mesa's unresolved weak entry points still appear as 'w').
 IMPORTS="$BUILD/imports.txt"
-"$NM" "$BUILD/llvm-pie.elf" | awk '$1=="U"||$1=="w"{print $2}' | sort -u > "$IMPORTS"
+"$READELF" --dyn-syms "$BUILD/llvm-pie.elf" | awk '$7=="UND" && $8!="" {print $8}' | sed 's/@.*//' | sort -u > "$IMPORTS"
 python3 - "$IMPORTS" "$BUILD/obj/import_check.c" <<'PY'
 import sys
 names = [n for n in open(sys.argv[1]).read().split() if n and not n.startswith("ps5_import")]
