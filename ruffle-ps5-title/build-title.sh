@@ -150,6 +150,7 @@ ok "$(du -h "$RUST_A" | cut -f1) ${RUST_A##*/} + the shim in title mode"
 log "compiling the shell and the native-app runtime"
 "$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$HERE/shell/main.c" -o "$BUILD/obj/main.o"
 "$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$HERE/shell/pad.c" -o "$BUILD/obj/pad.o"
+"$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$HERE/shell/libc_fixes.c" -o "$BUILD/obj/libc_fixes.o"
 "$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$KIT/shell/boot_log.c" -o "$BUILD/obj/boot_log.o"
 VKNATIVE="$VK/tooling/native"; [[ -f "$VKNATIVE/app_crt.cpp" ]] || VKNATIVE="$NATIVE"
 "$TCXX" -std=c++20 -O2 -fno-exceptions -fno-rtti "${TFLAGS[@]}" -c "$VKNATIVE/app_crt.cpp" -o "$BUILD/obj/app_crt.o"
@@ -162,7 +163,7 @@ VKNATIVE="$VK/tooling/native"; [[ -f "$VKNATIVE/app_crt.cpp" ]] || VKNATIVE="$NA
 # malloc_shim first as in the kit; with the platform's --wrap=malloc it is only the __real_ fallback
 RUNTIME_OBJS=("$BUILD/obj/malloc_shim.o" "$BUILD/obj/app_crt.o" "$BUILD/obj/app_cpp_runtime.o"
               "$BUILD/obj/libc_ext.o" "$BUILD/obj/evo_dns.o")
-OBJS=("$BUILD/obj/main.o" "$BUILD/obj/pad.o" "$BUILD/obj/boot_log.o")
+OBJS=("$BUILD/obj/main.o" "$BUILD/obj/pad.o" "$BUILD/obj/libc_fixes.o" "$BUILD/obj/boot_log.o")
 
 # --- 4. the RADV link recipe (PS5_Vulkan tools/radv-link.sh) ----------------------------------------
 export PS5_CLANG="$LLVM_BIN/clang"        # for Clang's builtins archive (__emutls_get_address)
