@@ -4,8 +4,9 @@
 //! A/S/D or the mouse. So the mapping is data, layered, generic first and the game's own last:
 //! the built-in defaults (`Controls::default`), `/app0/controls.txt` (shipped with the title),
 //! `/data/ruffle/controls.txt` (yours, all games), `/app0/<movie>.controls.txt` (a preset shipped
-//! for that game — `presets/` in the repo), `/data/ruffle/<movie>.controls.txt` (yours, that
-//! game). Every line a file sets, and every line it gets wrong, is written to ruffle.log.
+//! for that game — `presets/` in the repo), `/data/ruffle/<movie>.controls.txt` and
+//! `<movie>.controls.txt` beside the SWF in the games folder (yours, that game). Every line a
+//! file sets, and every line it gets wrong, is written to ruffle.log.
 //!
 //! File format, one setting per line, `#` starts a comment:
 //!
@@ -218,12 +219,15 @@ impl Controls {
             Some((p, ext)) if ext.eq_ignore_ascii_case("swf") => format!("{p}.controls.txt"),
             _ => format!("{movie_path}.controls.txt"),
         };
-        let layers = [
+        let mut layers = vec![
             "/app0/controls.txt".to_string(),
             format!("{data_dir}/controls.txt"),
             format!("/app0/{stem}.controls.txt"),
-            per_game,
+            format!("{data_dir}/{stem}.controls.txt"),
         ];
+        if !layers.contains(&per_game) {
+            layers.push(per_game); // beside the movie itself (the games folder)
+        }
         for path in layers {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {

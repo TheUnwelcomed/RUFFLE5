@@ -429,3 +429,10 @@ See `docs/findings-2026-10-21.md` §7–8. Ruffle plays on the console; the firs
 the left stick and took touchpad clicks, but showed no pointer and did not get its action key. V3 of
 the title draws the pointer over Ruffle's frame, makes the mapping a per-game file (`controls.txt`),
 and gives the audio thread a 1024-frame grain plus a 10-second score line in the log.
+
+## 5q. 2026-10-21: Ruffle5 — the menu
+
+See `docs/findings-2026-10-21.md` §9–10. The mixer's i16 wrap explained the "garbled" effects
+(now f32 + clamp). The title is now Ruffle5: it opens on a menu of `/data/homebrew/PPSA99620/games`
+whose design follows ProsperoStore's home screen (its fonts bundled, OFL), with a Settings tab;
+one shared display, a fresh Ruffle player per game, OPTIONS held returns to the menu.

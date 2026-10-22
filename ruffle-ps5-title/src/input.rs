@@ -1,4 +1,4 @@
-//! PS5_RUFFLE_INPUT_V2 — the DualSense as Ruffle's keyboard and mouse.
+//! PS5_RUFFLE_INPUT_V3 — the DualSense as Ruffle's keyboard and mouse (and the menu's pad).
 //!
 //! The pad is read through shell/pad.c (scePad, the hardware-verified sample layout). Each pad
 //! button does what the controls say (src/controls.rs: the defaults, `/data/ruffle/controls.txt`,
@@ -9,6 +9,8 @@
 //! src/cursor.rs from the state this module keeps up to date.
 //!
 //! A key held by two buttons at once is pressed once and released when the last button lets go.
+//! `raw_down` / `raw_pressed` carry the plain button bits of the last poll for the shell's own
+//! screens (src/menu.rs), which read the pad directly rather than through a game's mapping.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::controls::{Action, Button, Controls, CursorMode, Key, StickRole};
@@ -40,26 +42,26 @@ extern "C" {
 }
 
 // The console's button bits (input_ps5.cpp, verified on hardware).
-const BTN_L3: u32 = 0x000002;
-const BTN_R3: u32 = 0x000004;
-const BTN_OPTIONS: u32 = 0x000008;
-const BTN_UP: u32 = 0x000010;
-const BTN_RIGHT: u32 = 0x000020;
-const BTN_DOWN: u32 = 0x000040;
-const BTN_LEFT: u32 = 0x000080;
-const BTN_L1: u32 = 0x000400;
-const BTN_R1: u32 = 0x000800;
-const BTN_TRIANGLE: u32 = 0x001000;
-const BTN_CIRCLE: u32 = 0x002000;
-const BTN_CROSS: u32 = 0x004000;
-const BTN_SQUARE: u32 = 0x008000;
-const BTN_TOUCHPAD: u32 = 0x100000;
+pub const BTN_L3: u32 = 0x000002;
+pub const BTN_R3: u32 = 0x000004;
+pub const BTN_OPTIONS: u32 = 0x000008;
+pub const BTN_UP: u32 = 0x000010;
+pub const BTN_RIGHT: u32 = 0x000020;
+pub const BTN_DOWN: u32 = 0x000040;
+pub const BTN_LEFT: u32 = 0x000080;
+pub const BTN_L1: u32 = 0x000400;
+pub const BTN_R1: u32 = 0x000800;
+pub const BTN_TRIANGLE: u32 = 0x001000;
+pub const BTN_CIRCLE: u32 = 0x002000;
+pub const BTN_CROSS: u32 = 0x004000;
+pub const BTN_SQUARE: u32 = 0x008000;
+pub const BTN_TOUCHPAD: u32 = 0x100000;
 /// Set while the system has the pad (the PS button overlay); nothing means anything then.
 const BTN_INTERCEPTED: u32 = 0x8000_0000;
 // Our own bits for the triggers, from their analog values (the layout's trigger bytes are the
 // verified ones; the digital L2/R2 bits are not relied on).
-const BTN_L2: u32 = 0x0100;
-const BTN_R2: u32 = 0x0200;
+pub const BTN_L2: u32 = 0x0100;
+pub const BTN_R2: u32 = 0x0200;
 
 const STICK_CENTRE: i32 = 128;
 const STICK_DEADZONE: i32 = 40;
@@ -105,6 +107,10 @@ pub struct Input {
     /// Seconds since the pointer last moved (for hiding the cursor).
     idle: f64,
     pub report: String,
+    /// The last poll's buttons (BTN_ bits; the sticks as d-pad and the triggers merged in).
+    pub raw_down: u32,
+    /// The buttons that went down in the last poll.
+    pub raw_pressed: u32,
 }
 
 impl Input {
@@ -142,6 +148,31 @@ impl Input {
             touch_id: 0,
             idle: 0.0,
             report,
+            raw_down: 0,
+            raw_pressed: 0,
+        }
+    }
+
+    /// A new game's mapping. Nothing is held any more: the player the holds were for is gone.
+    pub fn set_controls(&mut self, controls: Controls) {
+        self.keys_held.clear();
+        self.left_held = 0;
+        self.right_held = 0;
+        if let Ok(mut c) = self.cursor.lock() {
+            c.scale = controls.cursor_scale;
+            c.visible = controls.cursor == CursorMode::On;
+        }
+        self.idle = 0.0;
+        self.controls = controls;
+    }
+
+    /// Hide the pointer (the menu draws none) and forget the holds.
+    pub fn reset(&mut self) {
+        self.keys_held.clear();
+        self.left_held = 0;
+        self.right_held = 0;
+        if let Ok(mut c) = self.cursor.lock() {
+            c.visible = false;
         }
     }
 
@@ -163,6 +194,7 @@ impl Input {
     /// appearing) come back too.
     pub fn poll(&mut self, dt: f64, events: &mut Vec<PlayerEvent>) -> Option<String> {
         let note = self.try_open();
+        self.raw_pressed = 0;
         if !self.open {
             return note;
         }
@@ -266,6 +298,8 @@ impl Input {
             held |= BTN_R2;
         }
         let changed = held ^ self.down;
+        self.raw_down = held;
+        self.raw_pressed = changed & held;
         if changed != 0 {
             // Releases first, then presses: a button swapped for another holding the same key
             // keeps the key down throughout.

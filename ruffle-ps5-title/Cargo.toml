@@ -3,7 +3,7 @@ name = "ruffle-ps5"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-description = "Ruffle (Flash emulator) as a native PlayStation 5 title, rendering through RADV (Vulkan) with wgpu"
+description = "Ruffle5: Ruffle (Flash emulator) as a native PlayStation 5 title, rendering through RADV (Vulkan) with wgpu"
 
 # A staticlib: cargo produces target/x86_64-sie-ps5/release/libruffle_ps5.a, build-title.sh links it with
 # the RADV archive and the title runtime. An rlib too, so `cargo check`/tests work on the host.
@@ -44,6 +44,12 @@ ash = "=0.38.0"
 raw-window-handle = "0.6"
 
 log = "0.4"
+
+# The shell's own screens (src/ui.rs, src/menu.rs): text from the bundled TTFs, pictures from PNGs,
+# a SWF's header read without inflating the movie. png and flate2 are already in Ruffle's tree.
+ab_glyph = "0.2"
+png = "0.18"
+flate2 = "1"
 
 # wgpu 30 has no public way to adopt a VkSurfaceKHR the application created itself (the only
 # display-less route, VK_KHR_display, is reachable only through a Linux DRM fd). build-title.sh

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PS5_RUFFLE_TITLE_BUILD_V3 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
+# PS5_RUFFLE_TITLE_BUILD_V4 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
 # under Games. Phase 3a by default (wgpu on the static RADV clears the display); 3b with --ruffle.
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
@@ -313,16 +313,24 @@ for asset in icon0.png pic0.png pic1.png pic0.dds pic1.dds; do
 done
 cp "$HERE/controls.txt" "$APPDIR/controls.txt"   # the example mapping file (all comments: no effect until edited)
 cp "$HERE"/presets/*.controls.txt "$APPDIR/"     # per-game presets: /app0/<movie>.controls.txt (src/controls.rs)
+mkdir -p "$APPDIR/games"                          # where the menu looks (shell/main.c GAMES_DIR); yours on the console
+cp "$HERE/games-README.txt" "$APPDIR/games/README.txt"
+grep -q "\"titleId\": \"$TITLE_ID\"" "$PARAM" || die "param.json titleId is not $TITLE_ID"
+grep -q "/data/homebrew/$TITLE_ID/games" "$HERE/shell/main.c" || die "shell/main.c GAMES_DIR is not /data/homebrew/$TITLE_ID/games"
 "$TOOL" self --inspect --file "$APPDIR/eboot.bin" | grep -E "integrity|digest" | sed 's/^/   /' || true
-ZIP="$BUILD/app/Ruffle-$TITLE_ID.zip"; rm -f "$ZIP"
+ZIP="$BUILD/app/Ruffle5-$TITLE_ID.zip"; rm -f "$ZIP"
 (cd "$BUILD/app" && zip -qr "$ZIP" "$TITLE_ID")
 log "done: $APPDIR"
 echo "   $(du -sh "$APPDIR/eboot.bin" | cut -f1) eboot.bin · zip: $ZIP"
 echo "   install: copy the $TITLE_ID folder to /data/homebrew/ on the console (FTP), so that"
-echo "   /data/homebrew/$TITLE_ID/eboot.bin exists; a 'Ruffle' tile appears under Games."
+echo "   /data/homebrew/$TITLE_ID/eboot.bin exists; a 'Ruffle5' tile appears under Games."
+echo "   UPDATING: copy eboot.bin (and sce_sys/, controls.txt, *.controls.txt) over the old ones --"
+echo "   do not delete the folder first: /data/homebrew/$TITLE_ID/games/ is where your games live."
 if [[ $RUFFLE == 1 ]]; then
-    echo "   3b: a .swf in /data/ruffle/ (movie.swf first) or next to eboot.bin in the title folder;"
-    echo "       test-swf/bounce.swf is a known-good one. Default controls: d-pad/left stick = arrows,"
+    echo "   3b: Ruffle5 opens on a menu of /data/homebrew/$TITLE_ID/games/ (*.swf, or one game per"
+    echo "       sub-folder with a cover.png); Cross plays, hold OPTIONS in a game to come back, hold"
+    echo "       Circle in the menu to close. test-swf/bounce.swf is a known-good game. Default controls:"
+    echo "       d-pad/left stick = arrows,"
     echo "       Cross = Space, Square = Z, Triangle = X, Circle = C, L1 = Shift, R1 = Ctrl, L3/R3 = A/S,"
     echo "       Options = Enter; touchpad = mouse (touch to point, click to click; a pointer is drawn),"
     echo "       right stick moves the pointer, R2/L2 = left/right button. Change any of it per game:"

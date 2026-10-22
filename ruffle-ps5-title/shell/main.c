@@ -1,4 +1,4 @@
-/* PS5_RUFFLE_SHELL_V2 — the C shell of the Ruffle PS5 title.
+/* PS5_RUFFLE_SHELL_V3 — the C shell of the Ruffle PS5 title.
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Small on purpose: it does the few things that must happen from the title executable itself,
@@ -47,6 +47,9 @@ void ps5_notify(const char *msg)
 
 /* ---- a growing log in the title's data folder (FTP: /data/ruffle/ruffle.log) ---- */
 #define DATA_DIR "/data/ruffle"
+/* Where the menu looks for games: the title's own folder (PPSA99620 is sce_sys/param.json's
+ * titleId; build-title.sh checks the two agree). The log and the controls stay in DATA_DIR. */
+#define GAMES_DIR "/data/homebrew/PPSA99620/games"
 static FILE *g_log;
 void ps5_log(const char *msg)
 {
@@ -55,7 +58,7 @@ void ps5_log(const char *msg)
 }
 
 /* Rust entry (src/lib.rs). */
-int ruffle_ps5_main(const char *data_dir);
+int ruffle_ps5_main(const char *data_dir, const char *games_dir);
 
 int main(int argc, char **argv)
 {
@@ -63,7 +66,7 @@ int main(int argc, char **argv)
     ps5_fp_ieee();
     mkdir(DATA_DIR, 0777);
     g_log = fopen(DATA_DIR "/ruffle.log", "w");
-    ps5_log("ruffle-ps5 shell (PS5_RUFFLE_SHELL_V2) up");
+    ps5_log("ruffle-ps5 shell (PS5_RUFFLE_SHELL_V3) up");
 
     char line[160];
     int32_t agc = sceAgcInit(8);
@@ -79,7 +82,8 @@ int main(int argc, char **argv)
     snprintf(line, sizeof line, "sceSystemServiceHideSplashScreen = 0x%08x", (unsigned)hidden);
     ps5_log(line);
 
-    int failures = ruffle_ps5_main(DATA_DIR);
+    mkdir(GAMES_DIR, 0777);
+    int failures = ruffle_ps5_main(DATA_DIR, GAMES_DIR);
     snprintf(line, sizeof line, "ruffle-ps5 returned %d", failures);
     ps5_log(line);
     if (g_log) fclose(g_log);

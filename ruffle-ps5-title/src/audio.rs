@@ -1,4 +1,4 @@
-//! PS5_RUFFLE_AUDIO_V3 — Ruffle's mixer on the console's speaker.
+//! PS5_RUFFLE_AUDIO_V4 — Ruffle's mixer on the console's speaker.
 //!
 //! Ruffle mixes every sound into whatever buffer the platform asks for; this backend asks on a
 //! thread that feeds AudioOut grains of 48 kHz s16 stereo (shell/pad.c: the port PS5_RetroArch's
@@ -18,6 +18,10 @@
 //! sounds great, some sound effects sound like garbled noise"). Ruffle's desktop and web
 //! frontends mix in f32 and let the device clip, which is what Flash did. The score line also
 //! counts samples that had to be clamped.
+//!
+//! V4: a backend ends with its player (one per game, src/lib.rs): dropping it stops the thread,
+//! joins it (at most one grain) and closes the port, so the next game's `sceAudioOutOpen` finds
+//! the main output free.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use ruffle_core::backend::audio::{
@@ -32,6 +36,7 @@ use std::time::{Duration, Instant};
 extern "C" {
     fn ps5_audio_open(frames: u32, detail: *mut i32) -> i32;
     fn ps5_audio_output(port: i32, frames: *const i16) -> i32;
+    fn ps5_audio_close(port: i32) -> i32;
 }
 
 const RATE: u32 = 48_000;
@@ -42,6 +47,8 @@ const REPORT_EVERY: Duration = Duration::from_secs(10);
 pub struct Ps5AudioBackend {
     mixer: AudioMixer,
     paused: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
     pub grain: u32,
 }
 
@@ -70,9 +77,11 @@ impl Ps5AudioBackend {
         let proxy = mixer.proxy();
         let paused = Arc::new(AtomicBool::new(false));
         let paused_t = Arc::clone(&paused);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = Arc::clone(&stop);
         let frames = grain as usize;
         let budget = Duration::from_micros(frames as u64 * 1_000_000 / RATE as u64);
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
                 let mut mixed = vec![0f32; frames * 2];
@@ -83,7 +92,7 @@ impl Ps5AudioBackend {
                 let mut clipped = 0u64;
                 let mut max_mix = Duration::ZERO;
                 let mut since = Instant::now();
-                loop {
+                while !stop_t.load(Ordering::Relaxed) {
                     let t0 = Instant::now();
                     if paused_t.load(Ordering::Relaxed) {
                         buf.fill(0);
@@ -122,13 +131,26 @@ impl Ps5AudioBackend {
                         since = Instant::now();
                     }
                 }
+                let rc = unsafe { ps5_audio_close(port) };
+                log(&format!("audio: port {port} closed ({rc:#x})"));
             })
             .map_err(|e| format!("audio thread: {e}"))?;
         Ok(Self {
             mixer,
             paused,
+            stop,
+            thread: Some(thread),
             grain,
         })
+    }
+}
+
+impl Drop for Ps5AudioBackend {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
 

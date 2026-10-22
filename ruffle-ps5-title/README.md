@@ -1,4 +1,4 @@
-# ruffle-ps5-title — Ruffle as a native PS5 title (milestone 3)
+# ruffle-ps5-title — Ruffle5: Ruffle as a native PS5 title
 
 Flash content on the TV, rendered on the console's GPU, as a Games-row title — the real goal.
 
@@ -65,7 +65,11 @@ building for you, that is step one, before any of this links.
 | file | what |
 |---|---|
 | `src/gpu.rs` | the static-RADV → wgpu bring-up (the novel piece) |
-| `src/lib.rs` | `ruffle_ps5_main`: 3a clear-screen, 3b Ruffle player |
+| `src/lib.rs` | `ruffle_ps5_main`: 3a clear-screen; 3b the app — the menu, a Ruffle player per game, back |
+| `src/menu.rs` | the menu: Games (stage + shelf of tiles) and Settings; design after ProsperoStore's home screen |
+| `src/ui.rs` | the 2D renderer the menu draws with: one instanced SDF-quad pipeline, text from the bundled fonts |
+| `src/shell.rs` | the shared display: the swapchain every player's `RenderTarget` points at; the menu presents to it directly |
+| `src/swfinfo.rs` | a SWF's header (version, size, fps, frames) without inflating the movie |
 | `src/input.rs` | the DualSense as keyboard and mouse: buttons → keys/clicks per the controls, touchpad and right stick → pointer |
 | `src/controls.rs` | the mapping as data: defaults, `/data/ruffle/controls.txt`, `/data/ruffle/<movie>.controls.txt` |
 | `src/cursor.rs` | the pointer drawn over Ruffle's frame (a `RenderTarget` wrapping `SwapChainTarget`) |
@@ -73,10 +77,32 @@ building for you, that is step one, before any of this links.
 | `shell/pad.c` | scePad / AudioOut calls, the hardware-verified sample layout |
 | `shell/libc_fixes.c` | a lexical `realpath` (the console's is EPERM in a title) |
 | `controls.txt` | the mapping file's format and the defaults, shipped in the title folder as a commented example |
+| `fonts/` | Inter Regular/SemiBold, Montserrat Medium (SIL OFL 1.1), embedded in the title |
+| `games-README.txt` | shipped as `games/README.txt`: what goes in the games folder |
+| `THIRD_PARTY.md` | what the title is built from, and the menu's design credit |
 | `presets/*.controls.txt` | per-game mappings shipped in the title folder (`dadnme` so far) |
 | `shell/main.c` | the C title shell: `sceAgcInit(8)`, exports the ICD entry, toasts + log |
 | `Cargo.toml` | ruffle_core / ruffle_render_wgpu / wgpu 30 / ash 0.38, Ruffle rev pinned |
 | `build-title.sh` | links the Rust staticlib + RADV archive + runtime into a PPSA title (needs PS5_Vulkan) |
+
+## The menu
+
+Ruffle5 opens on a menu of **`/data/homebrew/PPSA99620/games/`**: every `.swf` there, and the
+first `.swf` in each sub-folder (a game with its own files). A `<name>.png` beside a file, or a
+`cover.png` / `icon.png` in a folder, is its picture; without one a tile gets a colour from its
+name and its initials. The focused game is shown big on the stage with what its header says (SWF
+version, size, frame rate, frames) and whether a controls preset ships for it.
+
+| pad | in the menu |
+|---|---|
+| d-pad / left stick ← → | focus a game (↑ ↓ jump by four) |
+| Cross | play it |
+| L1 / R1 | Games ↔ Settings |
+| Circle, held | close Ruffle5 |
+| **OPTIONS, held (in a game)** | back to the menu |
+
+Settings shows the version (1.000.020) and the author. The layout, type and motion follow
+ProsperoStore's home screen (see `THIRD_PARTY.md`).
 
 ## Controls
 
@@ -96,8 +122,9 @@ The pad does what `src/controls.rs` says, by default:
 Every game wants different keys, so the mapping is layered, generic first: the defaults, then
 `controls.txt` in the title folder (shipped, all comments), `/data/ruffle/controls.txt` (yours, all
 games), `<movie>.controls.txt` in the title folder (a shipped preset — `presets/` here, e.g.
-`dadnme.controls.txt` for Dad 'n Me: Cross/Triangle = A, Square/Circle = S, R1 = Q), and
-`/data/ruffle/<movie>.controls.txt` (yours, that movie). A button may press several keys at once
+`dadnme.controls.txt` for Dad 'n Me: Cross/Triangle = A, Square/Circle = S, R1 = Q), then yours
+for that movie: `/data/ruffle/<movie>.controls.txt` or `<movie>.controls.txt` beside it in the
+games folder. A button may press several keys at once
 (`cross = space, enter`) or click (`cross = click`); sticks can be `dpad`, `mouse` or `off`.
 `ruffle.log` lists every file read, every line applied and the mapping in effect.
 

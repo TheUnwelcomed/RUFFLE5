@@ -1,4 +1,4 @@
-/* PS5_RUFFLE_PAD_V2 — the controller and the speaker, for the Ruffle title.
+/* PS5_RUFFLE_PAD_V3 — the controller and the speaker, for the Ruffle title.
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Thin C over the system modules, as PS5_RetroArch's src/input_ps5.cpp and src/audio_ps5.cpp drive
@@ -24,6 +24,7 @@ int32_t scePadRead(int32_t handle, void *samples, int32_t capacity);
 int32_t sceAudioOutInit(void);
 int32_t sceAudioOutOpen(int32_t user_id, int32_t type, int32_t index, uint32_t len, uint32_t freq, uint32_t param);
 int32_t sceAudioOutOutput(int32_t handle, const void *data);
+int32_t sceAudioOutClose(int32_t handle);
 
 /* One sample, as the console writes it (input_ps5.cpp: static_asserts on every offset). */
 struct pad_sample {
@@ -118,4 +119,9 @@ int32_t ps5_audio_open(uint32_t frames, int32_t *detail)
 int32_t ps5_audio_output(int32_t port, const int16_t *frames)
 {
     return sceAudioOutOutput(port, frames);
+}
+
+int32_t ps5_audio_close(int32_t port)
+{
+    return sceAudioOutClose(port);
 }

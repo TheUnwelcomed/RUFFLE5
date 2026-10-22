@@ -1,15 +1,13 @@
-//! PS5_RUFFLE_CURSOR_V1 — a mouse pointer drawn over Ruffle's frame.
+//! PS5_RUFFLE_CURSOR_V2 — a mouse pointer drawn over Ruffle's frame.
 //!
 //! Ruffle draws no cursor (a desktop's window system does that), so on the TV there was nothing to
-//! show where the touchpad had put the mouse. `CursorTarget` wraps Ruffle's `SwapChainTarget`: it
-//! hands out the same frames, and at submit time appends one more command buffer — a render pass
-//! that loads what Ruffle drew and paints an arrow at the pointer — before the frame is presented.
-//! The arrow is 15 vertices in the shader (no vertex buffer), drawn five times by instancing:
-//! four black copies offset by two pixels make the outline, the fifth, white, is the pointer.
-//! `Cursor` is the shared state the input side updates (position, visible).
+//! show where the touchpad had put the mouse. `CursorPainter` paints an arrow at the pointer in one
+//! render pass that loads what Ruffle drew; src/shell.rs runs it at submit time, before the frame
+//! is presented. The arrow is 15 vertices in the shader (no vertex buffer), drawn five times by
+//! instancing: four black copies offset by two pixels make the outline, the fifth, white, is the
+//! pointer. `Cursor` is the shared state the input side updates (position, visible).
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use ruffle_render_wgpu::target::{RenderTarget, SwapChainTarget, SwapChainTargetFrame};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy)]
@@ -81,16 +79,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 #[derive(Debug)]
-pub struct CursorTarget {
-    inner: SwapChainTarget,
-    cursor: SharedCursor,
+pub struct CursorPainter {
     pipeline: wgpu::RenderPipeline,
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
 }
 
-impl CursorTarget {
-    pub fn new(inner: SwapChainTarget, device: &wgpu::Device, cursor: SharedCursor) -> Self {
+impl CursorPainter {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cursor"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -140,7 +138,7 @@ impl CursorTarget {
                 module: &module,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: inner.format(),
+                    format,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -165,25 +163,24 @@ impl CursorTarget {
             cache: None,
         });
         Self {
-            inner,
-            cursor,
             pipeline,
             uniform,
             bind_group,
+            width,
+            height,
         }
     }
 
     /// The pass that paints the arrow over `view`, or None when the cursor is hidden.
-    fn paint(&self, device: &wgpu::Device, queue: &wgpu::Queue, view: &wgpu::TextureView) -> Option<wgpu::CommandBuffer> {
-        let c = *self.cursor.lock().ok()?;
+    pub fn paint(&self, device: &wgpu::Device, queue: &wgpu::Queue, view: &wgpu::TextureView, c: Cursor) -> Option<wgpu::CommandBuffer> {
         if !c.visible {
             return None;
         }
         let params: [f32; 8] = [
             c.x.round(),
             c.y.round(),
-            self.inner.width() as f32,
-            self.inner.height() as f32,
+            self.width as f32,
+            self.height as f32,
             c.scale,
             0.0,
             0.0,
@@ -216,42 +213,5 @@ impl CursorTarget {
             pass.draw(0..15, 0..5);
         }
         Some(enc.finish())
-    }
-}
-
-impl RenderTarget for CursorTarget {
-    type Frame = SwapChainTargetFrame;
-
-    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        self.inner.resize(device, width, height);
-    }
-
-    fn format(&self) -> wgpu::TextureFormat {
-        self.inner.format()
-    }
-
-    fn width(&self) -> u32 {
-        self.inner.width()
-    }
-
-    fn height(&self) -> u32 {
-        self.inner.height()
-    }
-
-    fn get_next_texture(&mut self) -> Option<Self::Frame> {
-        self.inner.get_next_texture()
-    }
-
-    fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        command_buffers: I,
-        frame: Self::Frame,
-    ) -> wgpu::SubmissionIndex {
-        use ruffle_render_wgpu::target::RenderTargetFrame;
-        let overlay = self.paint(device, queue, frame.view());
-        let buffers: Vec<wgpu::CommandBuffer> = command_buffers.into_iter().chain(overlay).collect();
-        self.inner.submit(device, queue, buffers, frame)
     }
 }
