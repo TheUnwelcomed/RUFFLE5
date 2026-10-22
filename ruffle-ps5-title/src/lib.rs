@@ -1,4 +1,4 @@
-//! PS5_RUFFLE_V3 — Ruffle as a PlayStation 5 title (milestone 3, with milestone 4's controls).
+//! PS5_RUFFLE_V4 — Ruffle as a PlayStation 5 title (milestone 3, with milestone 4's controls).
 //!
 //! The C shell (shell/main.c) calls `sceAgcInit(8)` from the executable, then `ruffle_ps5_main`.
 //! Two phases, so the novel GPU seam is proven before Ruffle rides on it:
@@ -49,6 +49,12 @@ impl log::Log for Ps5Logger {
     fn enabled(&self, m: &log::Metadata) -> bool {
         if m.target().starts_with("wgpu_hal") {
             m.level() <= log::Level::Debug
+        } else if m.target().starts_with("symphonia") {
+            // Every MP3 event sound starts with "invalid main_data_begin, underflow by N bytes":
+            // its first frame references bit-reservoir bytes from before the cut, and symphonia
+            // zeroes that granule (layer3/mod.rs, read_main_data) — a few ms of silence Flash's
+            // SeekSamples skip anyway, the same on every Ruffle frontend. Not worth a line per hit.
+            m.level() <= log::Level::Error
         } else {
             m.level() <= log::Level::Info
         }
@@ -75,7 +81,7 @@ pub extern "C" fn ruffle_ps5_main(data_dir: *const c_char) -> c_int {
         .to_string_lossy()
         .into_owned();
     say(&format!(
-        "ruffle-ps5 (PS5_RUFFLE_V3) starting; data dir {data_dir}"
+        "ruffle-ps5 (PS5_RUFFLE_V4) starting; data dir {data_dir}"
     ));
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(log::LevelFilter::Debug);

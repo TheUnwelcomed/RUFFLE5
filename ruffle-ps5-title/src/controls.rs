@@ -1,8 +1,10 @@
-//! PS5_RUFFLE_CONTROLS_V1 — what each pad button does, from a text file.
+//! PS5_RUFFLE_CONTROLS_V2 — what each pad button does, from a text file.
 //!
 //! Flash games have no common control scheme: one wants Space to jump, the next wants Z, a third
-//! A/S/D or the mouse. So the mapping is data, layered: the built-in defaults (`Controls::default`),
-//! then `/data/ruffle/controls.txt` (all games), then `<movie>.controls.txt` beside the SWF (that
+//! A/S/D or the mouse. So the mapping is data, layered, generic first and the game's own last:
+//! the built-in defaults (`Controls::default`), `/app0/controls.txt` (shipped with the title),
+//! `/data/ruffle/controls.txt` (yours, all games), `/app0/<movie>.controls.txt` (a preset shipped
+//! for that game — `presets/` in the repo), `/data/ruffle/<movie>.controls.txt` (yours, that
 //! game). Every line a file sets, and every line it gets wrong, is written to ruffle.log.
 //!
 //! File format, one setting per line, `#` starts a comment:
@@ -202,23 +204,34 @@ impl Default for Controls {
 }
 
 impl Controls {
-    /// Defaults, then the global file, then the movie's own file (`<movie>.controls.txt`, the
-    /// `.swf` replaced), each layered over the previous.
+    /// Defaults, then the generic files, then the movie's own (`<movie>.controls.txt`, the `.swf`
+    /// replaced; the shipped preset is looked up by the movie's file name in the title folder),
+    /// each layered over the previous.
     pub fn load(data_dir: &str, movie_path: &str) -> Self {
         let mut c = Controls::default();
-        let global = format!("{data_dir}/controls.txt");
+        let file_name = movie_path.rsplit('/').next().unwrap_or(movie_path);
+        let stem = match file_name.rsplit_once('.') {
+            Some((stem, ext)) if ext.eq_ignore_ascii_case("swf") => stem,
+            _ => file_name,
+        };
         let per_game = match movie_path.rsplit_once('.') {
-            Some((stem, ext)) if ext.eq_ignore_ascii_case("swf") => format!("{stem}.controls.txt"),
+            Some((p, ext)) if ext.eq_ignore_ascii_case("swf") => format!("{p}.controls.txt"),
             _ => format!("{movie_path}.controls.txt"),
         };
-        for path in [global, per_game] {
+        let layers = [
+            "/app0/controls.txt".to_string(),
+            format!("{data_dir}/controls.txt"),
+            format!("/app0/{stem}.controls.txt"),
+            per_game,
+        ];
+        for path in layers {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
                     c.report.push(format!("controls: reading {path}"));
                     c.apply(&text, &path);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    c.report.push(format!("controls: no {path} (fine, using the defaults)"));
+                    c.report.push(format!("controls: no {path}"));
                 }
                 Err(e) => c.report.push(format!("controls: cannot read {path}: {e}")),
             }

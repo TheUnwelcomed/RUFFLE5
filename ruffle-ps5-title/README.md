@@ -69,10 +69,11 @@ building for you, that is step one, before any of this links.
 | `src/input.rs` | the DualSense as keyboard and mouse: buttons → keys/clicks per the controls, touchpad and right stick → pointer |
 | `src/controls.rs` | the mapping as data: defaults, `/data/ruffle/controls.txt`, `/data/ruffle/<movie>.controls.txt` |
 | `src/cursor.rs` | the pointer drawn over Ruffle's frame (a `RenderTarget` wrapping `SwapChainTarget`) |
-| `src/audio.rs` | Ruffle's mixer → AudioOut (1024-frame grains, a 10-second score line in the log) |
+| `src/audio.rs` | Ruffle's mixer → AudioOut: mixed in f32, clamped to s16 (mixing into i16 wraps), 1024-frame grains, a 10-second score line in the log |
 | `shell/pad.c` | scePad / AudioOut calls, the hardware-verified sample layout |
 | `shell/libc_fixes.c` | a lexical `realpath` (the console's is EPERM in a title) |
 | `controls.txt` | the mapping file's format and the defaults, shipped in the title folder as a commented example |
+| `presets/*.controls.txt` | per-game mappings shipped in the title folder (`dadnme` so far) |
 | `shell/main.c` | the C title shell: `sceAgcInit(8)`, exports the ICD entry, toasts + log |
 | `Cargo.toml` | ruffle_core / ruffle_render_wgpu / wgpu 30 / ash 0.38, Ruffle rev pinned |
 | `build-title.sh` | links the Rust staticlib + RADV archive + runtime into a PPSA title (needs PS5_Vulkan) |
@@ -92,11 +93,13 @@ The pad does what `src/controls.rs` says, by default:
 | right stick | moves the pointer |
 | R2 / L2 | left / right mouse button |
 
-Every game wants different keys, so change it per game: copy `controls.txt` (also in the title
-folder) to `/data/ruffle/controls.txt` (all games) or `/data/ruffle/<movie>.controls.txt` (that
-movie), uncomment lines. A button may press several keys at once (`cross = space, enter`) or click
-(`cross = click`); sticks can be `dpad`, `mouse` or `off`. `ruffle.log` lists every line applied
-and the mapping in effect.
+Every game wants different keys, so the mapping is layered, generic first: the defaults, then
+`controls.txt` in the title folder (shipped, all comments), `/data/ruffle/controls.txt` (yours, all
+games), `<movie>.controls.txt` in the title folder (a shipped preset — `presets/` here, e.g.
+`dadnme.controls.txt` for Dad 'n Me: Cross/Triangle = A, Square/Circle = S, R1 = Q), and
+`/data/ruffle/<movie>.controls.txt` (yours, that movie). A button may press several keys at once
+(`cross = space, enter`) or click (`cross = click`); sticks can be `dpad`, `mouse` or `off`.
+`ruffle.log` lists every file read, every line applied and the mapping in effect.
 
 ## Progress
 

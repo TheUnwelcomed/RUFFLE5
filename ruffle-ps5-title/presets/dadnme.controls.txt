@@ -1,0 +1,9 @@
+# Dad 'n Me (Newgrounds, 2005; dadnme.swf) — shipped preset, applies when the movie is dadnme.swf.
+# The game's own instructions: arrows = walk, A = light jab (hold A to pick things up),
+# S = heavy attack, keys combine for combos, Q toggles quality. The title screen is clicked
+# (touchpad: touch to point, press to click).
+cross = a
+square = s
+triangle = a
+circle = s
+r1 = q

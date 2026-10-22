@@ -312,6 +312,7 @@ for asset in icon0.png pic0.png pic1.png pic0.dds pic1.dds; do
     [[ -f "$HERE/sce_sys/$asset" ]] && cp "$HERE/sce_sys/$asset" "$APPDIR/sce_sys/"
 done
 cp "$HERE/controls.txt" "$APPDIR/controls.txt"   # the example mapping file (all comments: no effect until edited)
+cp "$HERE"/presets/*.controls.txt "$APPDIR/"     # per-game presets: /app0/<movie>.controls.txt (src/controls.rs)
 "$TOOL" self --inspect --file "$APPDIR/eboot.bin" | grep -E "integrity|digest" | sed 's/^/   /' || true
 ZIP="$BUILD/app/Ruffle-$TITLE_ID.zip"; rm -f "$ZIP"
 (cd "$BUILD/app" && zip -qr "$ZIP" "$TITLE_ID")
@@ -326,7 +327,8 @@ if [[ $RUFFLE == 1 ]]; then
     echo "       Options = Enter; touchpad = mouse (touch to point, click to click; a pointer is drawn),"
     echo "       right stick moves the pointer, R2/L2 = left/right button. Change any of it per game:"
     echo "       controls.txt (a commented example is in the title folder) -> /data/ruffle/controls.txt"
-    echo "       or /data/ruffle/<movie>.controls.txt. Log: /data/ruffle/ruffle.log"
+    echo "       or /data/ruffle/<movie>.controls.txt; presets for known games ship in the title folder"
+    echo "       ($(ls "$HERE"/presets/*.controls.txt | xargs -n1 basename | sed 's/.controls.txt//' | tr '\n' ' ')). Log: /data/ruffle/ruffle.log"
 else
     echo "   3a: the screen should cycle through colours for 8 s, with toasts. Log: /data/ruffle/ruffle.log"
 fi

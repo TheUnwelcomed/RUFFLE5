@@ -1,4 +1,4 @@
-//! PS5_RUFFLE_AUDIO_V2 — Ruffle's mixer on the console's speaker.
+//! PS5_RUFFLE_AUDIO_V3 — Ruffle's mixer on the console's speaker.
 //!
 //! Ruffle mixes every sound into whatever buffer the platform asks for; this backend asks on a
 //! thread that feeds AudioOut grains of 48 kHz s16 stereo (shell/pad.c: the port PS5_RetroArch's
@@ -10,6 +10,14 @@
 //! MP3 frame to decode on a thread competing with the renderer. And the thread keeps score —
 //! every 10 s it logs how many grains it mixed, the longest mix, how many mixes overran the grain
 //! and how many outputs the port refused — so the next ruffle.log says whether sound starved.
+//!
+//! V3: the mixer mixes in f32 and this thread converts to s16 with a clamp. Mixed straight into
+//! i16 (V1/V2), Ruffle sums the playing sounds with dasp's `Sample::add_amp`, which for i16 is a
+//! plain `+` — and in a release build that wraps on overflow: a loud effect over the music turned
+//! into full-scale noise for as long as the sum exceeded 16 bits (dad 'n me, 2026-10-21: "music
+//! sounds great, some sound effects sound like garbled noise"). Ruffle's desktop and web
+//! frontends mix in f32 and let the device clip, which is what Flash did. The score line also
+//! counts samples that had to be clamped.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use ruffle_core::backend::audio::{
@@ -67,10 +75,12 @@ impl Ps5AudioBackend {
         std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
+                let mut mixed = vec![0f32; frames * 2];
                 let mut buf = vec![0i16; frames * 2];
                 let mut grains = 0u64;
                 let mut overruns = 0u64;
                 let mut refused = 0u64;
+                let mut clipped = 0u64;
                 let mut max_mix = Duration::ZERO;
                 let mut since = Instant::now();
                 loop {
@@ -78,7 +88,14 @@ impl Ps5AudioBackend {
                     if paused_t.load(Ordering::Relaxed) {
                         buf.fill(0);
                     } else {
-                        proxy.mix::<i16>(&mut buf);
+                        proxy.mix::<f32>(&mut mixed);
+                        for (out, &s) in buf.iter_mut().zip(mixed.iter()) {
+                            let c = s.clamp(-1.0, 1.0);
+                            if c != s {
+                                clipped += 1;
+                            }
+                            *out = (c * 32767.0) as i16;
+                        }
                     }
                     let took = t0.elapsed();
                     max_mix = max_mix.max(took);
@@ -92,7 +109,7 @@ impl Ps5AudioBackend {
                     grains += 1;
                     if since.elapsed() >= REPORT_EVERY {
                         log(&format!(
-                            "audio: {grains} grains of {frames} in {:.1} s; longest mix {:.2} ms (budget {:.2} ms), {overruns} over budget, {refused} refused",
+                            "audio: {grains} grains of {frames} in {:.1} s; longest mix {:.2} ms (budget {:.2} ms), {overruns} over budget, {refused} refused, {clipped} samples clamped",
                             since.elapsed().as_secs_f64(),
                             max_mix.as_secs_f64() * 1000.0,
                             budget.as_secs_f64() * 1000.0
@@ -100,6 +117,7 @@ impl Ps5AudioBackend {
                         grains = 0;
                         overruns = 0;
                         refused = 0;
+                        clipped = 0;
                         max_mix = Duration::ZERO;
                         since = Instant::now();
                     }

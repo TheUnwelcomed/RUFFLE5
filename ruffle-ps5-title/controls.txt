@@ -1,9 +1,10 @@
 # ruffle-ps5 controls — what each DualSense button does in a Flash game.
 #
-# Where this file goes:
-#   /data/ruffle/controls.txt               applies to every game
-#   /data/ruffle/<game>.controls.txt        applies to <game>.swf only (wins over the global file)
-# Each layer only changes the lines it sets; everything else keeps the previous value.
+# Where this file goes (read in this order, each layer only changing the lines it sets):
+#   <title folder>/controls.txt             shipped: this file
+#   /data/ruffle/controls.txt               yours, every game
+#   <title folder>/<game>.controls.txt      shipped preset for <game>.swf (presets/ in the repo)
+#   /data/ruffle/<game>.controls.txt        yours, <game>.swf only (wins over everything)
 # What was read and applied is written to /data/ruffle/ruffle.log ("controls:" lines).
 #
 # One setting per line: button = key[, key...]   (several keys = pressed together)
