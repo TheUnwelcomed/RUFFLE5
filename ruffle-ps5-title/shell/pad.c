@@ -1,4 +1,4 @@
-/* PS5_RUFFLE_PAD_V1 — the controller and the speaker, for the Ruffle title.
+/* PS5_RUFFLE_PAD_V2 — the controller and the speaker, for the Ruffle title.
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Thin C over the system modules, as PS5_RetroArch's src/input_ps5.cpp and src/audio_ps5.cpp drive
@@ -7,8 +7,9 @@
  *   pad:   sceUserServiceInitialize, sceUserServiceGetInitialUser, scePadInit,
  *          scePadOpen(user, 0, 0, NULL) (retried: the pad is not always published when a title
  *          started from the shell asks), scePadRead(handle, samples, 64) → the newest sample.
- *   audio: sceAudioOutInit, sceAudioOutOpen(0xff, MAIN=0, 0, 256 frames, 48000 Hz, S16 stereo=1),
- *          sceAudioOutOutput(port, 256 interleaved s16 stereo frames) — blocks until queued.
+ *   audio: sceAudioOutInit, sceAudioOutOpen(0xff, MAIN=0, 0, N frames, 48000 Hz, S16 stereo=1),
+ *          sceAudioOutOutput(port, N interleaved s16 stereo frames) — blocks until queued.
+ *          N is the caller's (src/audio.rs asks for 1024 and falls back to 512, 256).
  * The Rust side (src/input.rs, src/audio.rs) does the mapping and the mixing.
  */
 #include <stddef.h>
@@ -104,12 +105,12 @@ int ps5_pad_read(struct ps5_pad_state *out)
     return 1;
 }
 
-/* The main output: 256-frame grains of interleaved s16 stereo at 48 kHz. Returns the port (>= 0). */
-int32_t ps5_audio_open(int32_t *detail)
+/* The main output: `frames`-frame grains of interleaved s16 stereo at 48 kHz. Returns the port (>= 0). */
+int32_t ps5_audio_open(uint32_t frames, int32_t *detail)
 {
     int32_t r = sceAudioOutInit();
     if (r != 0 && (uint32_t)r != 0x8026000eu /* already initialised (audio_ps5.cpp) */) { *detail = r; return -1; }
-    int32_t port = sceAudioOutOpen(0xff, 0, 0, 256, 48000, 1);
+    int32_t port = sceAudioOutOpen(0xff, 0, 0, frames, 48000, 1);
     *detail = port;
     return port < 0 ? -2 : port;
 }

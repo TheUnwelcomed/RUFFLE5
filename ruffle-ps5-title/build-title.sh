@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PS5_RUFFLE_TITLE_BUILD_V2 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
+# PS5_RUFFLE_TITLE_BUILD_V3 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
 # under Games. Phase 3a by default (wgpu on the static RADV clears the display); 3b with --ruffle.
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
@@ -311,6 +311,7 @@ cp "$LIBC_PRX" "$APPDIR/sce_module/libc.prx"
 for asset in icon0.png pic0.png pic1.png pic0.dds pic1.dds; do
     [[ -f "$HERE/sce_sys/$asset" ]] && cp "$HERE/sce_sys/$asset" "$APPDIR/sce_sys/"
 done
+cp "$HERE/controls.txt" "$APPDIR/controls.txt"   # the example mapping file (all comments: no effect until edited)
 "$TOOL" self --inspect --file "$APPDIR/eboot.bin" | grep -E "integrity|digest" | sed 's/^/   /' || true
 ZIP="$BUILD/app/Ruffle-$TITLE_ID.zip"; rm -f "$ZIP"
 (cd "$BUILD/app" && zip -qr "$ZIP" "$TITLE_ID")
@@ -320,10 +321,12 @@ echo "   install: copy the $TITLE_ID folder to /data/homebrew/ on the console (F
 echo "   /data/homebrew/$TITLE_ID/eboot.bin exists; a 'Ruffle' tile appears under Games."
 if [[ $RUFFLE == 1 ]]; then
     echo "   3b: a .swf in /data/ruffle/ (movie.swf first) or next to eboot.bin in the title folder;"
-    echo "       test-swf/bounce.swf is a known-good one. Controls: d-pad/left stick = arrows, Cross = Space,"
-    echo "       Circle = Esc, Square = Z, Triangle = X, L1/R1 = Shift/Ctrl, Options = Enter; touchpad = mouse"
-    echo "       (touch to point, click to click), right stick moves the pointer, R2/L2 = left/right button."
-    echo "       Log: /data/ruffle/ruffle.log"
+    echo "       test-swf/bounce.swf is a known-good one. Default controls: d-pad/left stick = arrows,"
+    echo "       Cross = Space, Square = Z, Triangle = X, Circle = C, L1 = Shift, R1 = Ctrl, L3/R3 = A/S,"
+    echo "       Options = Enter; touchpad = mouse (touch to point, click to click; a pointer is drawn),"
+    echo "       right stick moves the pointer, R2/L2 = left/right button. Change any of it per game:"
+    echo "       controls.txt (a commented example is in the title folder) -> /data/ruffle/controls.txt"
+    echo "       or /data/ruffle/<movie>.controls.txt. Log: /data/ruffle/ruffle.log"
 else
     echo "   3a: the screen should cycle through colours for 8 s, with toasts. Log: /data/ruffle/ruffle.log"
 fi

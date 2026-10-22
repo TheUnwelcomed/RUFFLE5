@@ -1,4 +1,4 @@
-//! PS5_RUFFLE_V2 — Ruffle as a PlayStation 5 title (milestone 3).
+//! PS5_RUFFLE_V3 — Ruffle as a PlayStation 5 title (milestone 3, with milestone 4's controls).
 //!
 //! The C shell (shell/main.c) calls `sceAgcInit(8)` from the executable, then `ruffle_ps5_main`.
 //! Two phases, so the novel GPU seam is proven before Ruffle rides on it:
@@ -6,6 +6,9 @@
 //!     animated colour for a few seconds. Colour on the TV means the static-RADV + VK_KHR_display +
 //!     wgpu path works in a title — the thing the payload route could never get.
 //!   * 3b (feature `ruffle`): load a SWF from /data/ruffle and play it through ruffle_render_wgpu.
+//!
+//! 3b plays with the DualSense as keyboard and mouse (src/input.rs, mapping from
+//! src/controls.rs's files), a drawn pointer (src/cursor.rs) and sound (src/audio.rs).
 //!
 //! Progress is toasted on the TV and written to /data/ruffle/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -15,6 +18,10 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "ruffle")]
 mod audio;
+#[cfg(feature = "ruffle")]
+mod controls;
+#[cfg(feature = "ruffle")]
+mod cursor;
 mod gpu;
 #[cfg(feature = "ruffle")]
 mod input;
@@ -25,8 +32,12 @@ extern "C" {
     fn ps5_log(msg: *const c_char);
 }
 
+/// One line to ruffle.log. Serialised: the audio thread logs too, and the shell's `ps5_log` is
+/// plain fprintf.
+static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn say(s: &str) {
     if let Ok(c) = std::ffi::CString::new(s) {
+        let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { ps5_log(c.as_ptr()) };
     }
 }
@@ -64,7 +75,7 @@ pub extern "C" fn ruffle_ps5_main(data_dir: *const c_char) -> c_int {
         .to_string_lossy()
         .into_owned();
     say(&format!(
-        "ruffle-ps5 (PS5_RUFFLE_V2) starting; data dir {data_dir}"
+        "ruffle-ps5 (PS5_RUFFLE_V3) starting; data dir {data_dir}"
     ));
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(log::LevelFilter::Debug);
@@ -194,6 +205,15 @@ fn run_ruffle(gpu: gpu::Gpu, data_dir: &str) -> Result<(), String> {
 
     let swf_path = find_movie(data_dir)?;
     say(&format!("loading {swf_path}"));
+    // What the pad does for this movie: defaults, then controls.txt, then <movie>.controls.txt.
+    let controls = controls::Controls::load(data_dir, &swf_path);
+    for line in &controls.report {
+        say(&format!("     {line}"));
+    }
+    say("     controls in effect:");
+    for line in controls.summary() {
+        say(&format!("       {line}"));
+    }
     let data = std::fs::read(&swf_path).map_err(|e| format!("read {swf_path}: {e}"))?;
     let movie = SwfMovieData::from_data(&data, format!("file://{swf_path}"), None, None)
         .map_err(|e| format!("parse swf: {e}"))?;
@@ -209,14 +229,21 @@ fn run_ruffle(gpu: gpu::Gpu, data_dir: &str) -> Result<(), String> {
         height,
         ..
     } = gpu;
-    let target = SwapChainTarget::new(surface, &adapter, (width, height), &device);
+    let swap_chain = SwapChainTarget::new(surface, &adapter, (width, height), &device);
+    // The pointer is painted over every frame by CursorTarget (src/cursor.rs); the input side
+    // moves it through the shared state.
+    let cursor = cursor::shared(width as f32 / 2.0, height as f32 / 2.0, controls.cursor_scale);
+    let target = cursor::CursorTarget::new(swap_chain, &device, std::sync::Arc::clone(&cursor));
     let renderer =
         WgpuRenderBackend::new(descriptors, target).map_err(|e| format!("renderer: {e}"))?;
 
     // Sound through AudioOut; without it (the port refused) the movie still plays, silently.
-    let audio: Box<dyn AudioBackend> = match audio::Ps5AudioBackend::new() {
+    let audio: Box<dyn AudioBackend> = match audio::Ps5AudioBackend::new(say) {
         Ok(a) => {
-            say("ok   AudioOut open: 48 kHz s16 stereo, 256-frame grains");
+            say(&format!(
+                "ok   AudioOut open: 48 kHz s16 stereo, {}-frame grains",
+                a.grain
+            ));
             Box::new(a)
         }
         Err(e) => {
@@ -224,16 +251,15 @@ fn run_ruffle(gpu: gpu::Gpu, data_dir: &str) -> Result<(), String> {
             Box::new(NullAudioBackend::new())
         }
     };
-    // The controller: buttons as Flash keys through Ruffle's gamepad mapping, the touchpad and
-    // the right stick as the mouse (src/input.rs).
-    let mut input = input::Input::new(width, height);
+    // The controller: buttons as Flash keys and clicks per the controls, the touchpad and the
+    // right stick as the mouse (src/input.rs).
+    let mut input = input::Input::new(width, height, controls, cursor);
     say(&format!("     {}", input.report));
 
     let mut executor = NullExecutor::new();
     let player = PlayerBuilder::new()
         .with_renderer(renderer)
         .with_boxed_audio(audio)
-        .with_gamepad_button_mapping(input::mapping())
         .with_letterbox(ruffle_core::config::Letterbox::On)
         .with_navigator(
             NullNavigatorBackend::with_base_path(std::path::Path::new(data_dir), &executor)

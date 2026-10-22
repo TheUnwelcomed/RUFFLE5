@@ -66,9 +66,37 @@ building for you, that is step one, before any of this links.
 |---|---|
 | `src/gpu.rs` | the static-RADV → wgpu bring-up (the novel piece) |
 | `src/lib.rs` | `ruffle_ps5_main`: 3a clear-screen, 3b Ruffle player |
+| `src/input.rs` | the DualSense as keyboard and mouse: buttons → keys/clicks per the controls, touchpad and right stick → pointer |
+| `src/controls.rs` | the mapping as data: defaults, `/data/ruffle/controls.txt`, `/data/ruffle/<movie>.controls.txt` |
+| `src/cursor.rs` | the pointer drawn over Ruffle's frame (a `RenderTarget` wrapping `SwapChainTarget`) |
+| `src/audio.rs` | Ruffle's mixer → AudioOut (1024-frame grains, a 10-second score line in the log) |
+| `shell/pad.c` | scePad / AudioOut calls, the hardware-verified sample layout |
+| `shell/libc_fixes.c` | a lexical `realpath` (the console's is EPERM in a title) |
+| `controls.txt` | the mapping file's format and the defaults, shipped in the title folder as a commented example |
 | `shell/main.c` | the C title shell: `sceAgcInit(8)`, exports the ICD entry, toasts + log |
 | `Cargo.toml` | ruffle_core / ruffle_render_wgpu / wgpu 30 / ash 0.38, Ruffle rev pinned |
 | `build-title.sh` | links the Rust staticlib + RADV archive + runtime into a PPSA title (needs PS5_Vulkan) |
+
+## Controls
+
+The pad does what `src/controls.rs` says, by default:
+
+| pad | Flash |
+|---|---|
+| d-pad, left stick | arrow keys |
+| Cross / Square / Triangle / Circle | Space / Z / X / C |
+| L1 / R1 | Shift / Control |
+| L3 / R3 | A / S |
+| Options | Enter |
+| touchpad | the mouse: touch to point (the pad's surface is the screen), press to click; a pointer is drawn, hidden 3 s after it stops |
+| right stick | moves the pointer |
+| R2 / L2 | left / right mouse button |
+
+Every game wants different keys, so change it per game: copy `controls.txt` (also in the title
+folder) to `/data/ruffle/controls.txt` (all games) or `/data/ruffle/<movie>.controls.txt` (that
+movie), uncomment lines. A button may press several keys at once (`cross = space, enter`) or click
+(`cross = click`); sticks can be `dpad`, `mouse` or `off`. `ruffle.log` lists every line applied
+and the mapping in effect.
 
 ## Progress
 

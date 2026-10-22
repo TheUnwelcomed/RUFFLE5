@@ -422,3 +422,10 @@ down), the phase-3a title pipeline (`ruffle-ps5-title/build-title.sh`: m1 target
 PS5_Vulkan's `radv-link.sh`; wgpu 30 patched to adopt an application-made `VkSurfaceKHR`), its first
 build (four one-line fixes; Mesa's weak entry points need `--no-dynamic-linker`), and its first run on
 the console (RADV_PS5 reports conformance 0.0.0.0; wgpu-hal needs the non-compliant-adapter opt-in).
+
+## 5p. 2026-10-21: first real game; a drawn pointer, per-game controls, a 21 ms audio grain
+
+See `docs/findings-2026-10-21.md` §7–8. Ruffle plays on the console; the first real game moved with
+the left stick and took touchpad clicks, but showed no pointer and did not get its action key. V3 of
+the title draws the pointer over Ruffle's frame, makes the mapping a per-game file (`controls.txt`),
+and gives the audio thread a 1024-frame grain plus a 10-second score line in the log.

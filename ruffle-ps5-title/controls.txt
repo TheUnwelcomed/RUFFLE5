@@ -1,0 +1,38 @@
+# ruffle-ps5 controls — what each DualSense button does in a Flash game.
+#
+# Where this file goes:
+#   /data/ruffle/controls.txt               applies to every game
+#   /data/ruffle/<game>.controls.txt        applies to <game>.swf only (wins over the global file)
+# Each layer only changes the lines it sets; everything else keeps the previous value.
+# What was read and applied is written to /data/ruffle/ruffle.log ("controls:" lines).
+#
+# One setting per line: button = key[, key...]   (several keys = pressed together)
+#   buttons: cross circle square triangle l1 r1 l2 r2 l3 r3 options touchpad up down left right
+#            (up/down/left/right are the d-pad, and the left stick while left_stick = dpad)
+#   keys:    a..z 0..9 - = [ ] \ ; ' , . / `   space enter escape shift control alt tab backspace
+#            up down left right pageup pagedown home end insert delete f1..f12 numpad0..numpad9
+#   mouse:   click (left button at the pointer), rightclick, none (the button does nothing)
+#
+# The defaults built in (this file, as shipped, changes nothing — every line is a comment):
+#   up = up          down = down      left = left      right = right
+#   cross = space    circle = c       square = z       triangle = x
+#   l1 = shift       r1 = control     l2 = rightclick  r2 = click
+#   l3 = a           r3 = s           options = enter  touchpad = click
+#   left_stick = dpad      right_stick = mouse      pointer_speed = 1100
+#   cursor = auto          cursor_hide = 3          cursor_scale = 1.75
+#
+# Examples — uncomment what the game needs:
+#cross = space, enter       # Cross presses Space and Enter at once (menus that want Enter, games that want Space)
+#square = a                 # an A/S/D game: attack on Square...
+#triangle = s               # ...and S on Triangle
+#circle = d
+#up = up, w                 # arrows and WASD both, for a game that takes either
+#down = down, s
+#left = left, a
+#right = right, d
+#cross = click              # a mouse game: Cross clicks where the pointer is
+#left_stick = mouse         # ...and the left stick moves the pointer
+#right_stick = off
+#pointer_speed = 1600       # faster stick pointer
+#cursor = on                # pointer always drawn (auto = drawn while it moves, hidden after cursor_hide seconds)
+#cursor_scale = 2.5         # a bigger pointer
