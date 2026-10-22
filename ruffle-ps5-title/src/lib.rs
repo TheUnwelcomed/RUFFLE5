@@ -133,7 +133,47 @@ fn run_clear(gpu: &gpu::Gpu) -> Result<(), String> {
     Ok(())
 }
 
-/// 3b: play /data/ruffle/movie.swf. Written against the pinned Ruffle revision's API
+/// The movie to play: `<data_dir>/movie.swf` if it exists, else the first `.swf` (by name) in the
+/// data folder or in the title's own folder (`/app0` = `/data/homebrew/PPSA99620`), so a file can
+/// just be dropped next to eboot.bin. Every folder searched and every candidate is logged.
+#[cfg(feature = "ruffle")]
+fn find_movie(data_dir: &str) -> Result<String, String> {
+    let fixed = format!("{data_dir}/movie.swf");
+    if std::path::Path::new(&fixed).is_file() {
+        return Ok(fixed);
+    }
+    let mut found = Vec::new();
+    for dir in [data_dir, "/app0"] {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                let mut names: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.sort();
+                say(&format!(
+                    "{dir}: {} entries: {}",
+                    names.len(),
+                    names.join(" ")
+                ));
+                for n in names {
+                    if n.to_ascii_lowercase().ends_with(".swf") {
+                        found.push(format!("{dir}/{n}"));
+                    }
+                }
+            }
+            Err(e) => say(&format!("{dir}: cannot list: {e}")),
+        }
+    }
+    match found.first() {
+        Some(p) => Ok(p.clone()),
+        None => Err(format!(
+            "no movie: put a .swf at {fixed}, or any .swf in {data_dir}/ or in the title folder"
+        )),
+    }
+}
+
+/// 3b: play the movie find_movie() picks. Written against the pinned Ruffle revision's API
 /// (core/src/player.rs, render/wgpu/src/target.rs); compiled only with --features ruffle.
 #[cfg(feature = "ruffle")]
 fn run_ruffle(gpu: gpu::Gpu, data_dir: &str) -> Result<(), String> {
@@ -147,7 +187,7 @@ fn run_ruffle(gpu: gpu::Gpu, data_dir: &str) -> Result<(), String> {
     use ruffle_render_wgpu::backend::WgpuRenderBackend;
     use ruffle_render_wgpu::target::SwapChainTarget;
 
-    let swf_path = format!("{data_dir}/movie.swf");
+    let swf_path = find_movie(data_dir)?;
     say(&format!("loading {swf_path}"));
     let data = std::fs::read(&swf_path).map_err(|e| format!("read {swf_path}: {e}"))?;
     let movie = SwfMovieData::from_data(&data, format!("file://{swf_path}"), None, None)
