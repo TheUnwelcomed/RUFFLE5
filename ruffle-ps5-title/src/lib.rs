@@ -13,7 +13,11 @@
 use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "ruffle")]
+mod audio;
 mod gpu;
+#[cfg(feature = "ruffle")]
+mod input;
 mod random;
 
 extern "C" {
@@ -177,6 +181,7 @@ fn find_movie(data_dir: &str) -> Result<String, String> {
 /// (core/src/player.rs, render/wgpu/src/target.rs); compiled only with --features ruffle.
 #[cfg(feature = "ruffle")]
 fn run_ruffle(gpu: gpu::Gpu, data_dir: &str) -> Result<(), String> {
+    use ruffle_core::backend::audio::AudioBackend;
     use ruffle_core::backend::audio::NullAudioBackend;
     use ruffle_core::backend::log::NullLogBackend;
     use ruffle_core::backend::navigator::{NullExecutor, NullNavigatorBackend};
@@ -208,10 +213,28 @@ fn run_ruffle(gpu: gpu::Gpu, data_dir: &str) -> Result<(), String> {
     let renderer =
         WgpuRenderBackend::new(descriptors, target).map_err(|e| format!("renderer: {e}"))?;
 
+    // Sound through AudioOut; without it (the port refused) the movie still plays, silently.
+    let audio: Box<dyn AudioBackend> = match audio::Ps5AudioBackend::new() {
+        Ok(a) => {
+            say("ok   AudioOut open: 48 kHz s16 stereo, 256-frame grains");
+            Box::new(a)
+        }
+        Err(e) => {
+            say(&format!("warn no sound: {e}"));
+            Box::new(NullAudioBackend::new())
+        }
+    };
+    // The controller: buttons as Flash keys through Ruffle's gamepad mapping, the touchpad and
+    // the right stick as the mouse (src/input.rs).
+    let mut input = input::Input::new(width, height);
+    say(&format!("     {}", input.report));
+
     let mut executor = NullExecutor::new();
     let player = PlayerBuilder::new()
         .with_renderer(renderer)
-        .with_audio(NullAudioBackend::new())
+        .with_boxed_audio(audio)
+        .with_gamepad_button_mapping(input::mapping())
+        .with_letterbox(ruffle_core::config::Letterbox::On)
         .with_navigator(
             NullNavigatorBackend::with_base_path(std::path::Path::new(data_dir), &executor)
                 .map_err(|e| format!("navigator base path: {e}"))?,
@@ -227,12 +250,20 @@ fn run_ruffle(gpu: gpu::Gpu, data_dir: &str) -> Result<(), String> {
     say("player built; entering frame loop");
     toast("ruffle-ps5: playing");
     let mut last = Instant::now();
+    let mut events = Vec::new();
     loop {
         let now = Instant::now();
         let dt = now.duration_since(last);
         last = now;
+        events.clear();
+        if let Some(note) = input.poll(dt.as_secs_f64(), &mut events) {
+            say(&format!("ok   {note}"));
+        }
         {
             let mut p = player.lock().unwrap();
+            for event in events.drain(..) {
+                p.handle_event(event);
+            }
             p.tick(ruffle_core::FloatDuration::from_millis(
                 dt.as_secs_f64() * 1000.0,
             ));

@@ -149,6 +149,7 @@ ok "$(du -h "$RUST_A" | cut -f1) ${RUST_A##*/} + the shim in title mode"
 # the kit's (the same BlackBearReloaded tail, hardware-validated with Rust std).
 log "compiling the shell and the native-app runtime"
 "$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$HERE/shell/main.c" -o "$BUILD/obj/main.o"
+"$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$HERE/shell/pad.c" -o "$BUILD/obj/pad.o"
 "$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$KIT/shell/boot_log.c" -o "$BUILD/obj/boot_log.o"
 VKNATIVE="$VK/tooling/native"; [[ -f "$VKNATIVE/app_crt.cpp" ]] || VKNATIVE="$NATIVE"
 "$TCXX" -std=c++20 -O2 -fno-exceptions -fno-rtti "${TFLAGS[@]}" -c "$VKNATIVE/app_crt.cpp" -o "$BUILD/obj/app_crt.o"
@@ -161,7 +162,7 @@ VKNATIVE="$VK/tooling/native"; [[ -f "$VKNATIVE/app_crt.cpp" ]] || VKNATIVE="$NA
 # malloc_shim first as in the kit; with the platform's --wrap=malloc it is only the __real_ fallback
 RUNTIME_OBJS=("$BUILD/obj/malloc_shim.o" "$BUILD/obj/app_crt.o" "$BUILD/obj/app_cpp_runtime.o"
               "$BUILD/obj/libc_ext.o" "$BUILD/obj/evo_dns.o")
-OBJS=("$BUILD/obj/main.o" "$BUILD/obj/boot_log.o")
+OBJS=("$BUILD/obj/main.o" "$BUILD/obj/pad.o" "$BUILD/obj/boot_log.o")
 
 # --- 4. the RADV link recipe (PS5_Vulkan tools/radv-link.sh) ----------------------------------------
 export PS5_CLANG="$LLVM_BIN/clang"        # for Clang's builtins archive (__emutls_get_address)
@@ -317,8 +318,11 @@ echo "   $(du -sh "$APPDIR/eboot.bin" | cut -f1) eboot.bin · zip: $ZIP"
 echo "   install: copy the $TITLE_ID folder to /data/homebrew/ on the console (FTP), so that"
 echo "   /data/homebrew/$TITLE_ID/eboot.bin exists; a 'Ruffle' tile appears under Games."
 if [[ $RUFFLE == 1 ]]; then
-    echo "   3b: put a movie at /data/ruffle/movie.swf first (test-swf/bounce.swf is a known-good one:"
-    echo "       two squares, one sliding, one spinning, 90 frames at 30 fps). Log: /data/ruffle/ruffle.log"
+    echo "   3b: a .swf in /data/ruffle/ (movie.swf first) or next to eboot.bin in the title folder;"
+    echo "       test-swf/bounce.swf is a known-good one. Controls: d-pad/left stick = arrows, Cross = Space,"
+    echo "       Circle = Esc, Square = Z, Triangle = X, L1/R1 = Shift/Ctrl, Options = Enter; touchpad = mouse"
+    echo "       (touch to point, click to click), right stick moves the pointer, R2/L2 = left/right button."
+    echo "       Log: /data/ruffle/ruffle.log"
 else
     echo "   3a: the screen should cycle through colours for 8 s, with toasts. Log: /data/ruffle/ruffle.log"
 fi
