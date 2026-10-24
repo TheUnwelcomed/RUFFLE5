@@ -12,7 +12,12 @@
 //!   15 key Enter         a key press (down, one frame, up)
 //!   16 down Right        hold a key ...      20 up Right   ... and let go
 //!   18 snap name         save the stage as name.png
+//!   19 eval EXPR         print a Lingo expression's value (`the frameLabel`, `castLib(3).fileName`)
 //! Keys: Enter Space Left Right Up Down Escape Shift Control Tab Backspace, a..z, 0..9.
+//!
+//! At the end (and when the score stays on one frame for 10 s) the probe prints the movie's state:
+//! its name and path, the frame and its label, the labels, every cast library with its file and
+//! member count, and what each sprite channel shows.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::path::{Path, PathBuf};
@@ -29,6 +34,7 @@ enum Act {
     Down(String),
     Up(String),
     Snap(String),
+    Eval(String),
 }
 
 /// A key name as the browser front end would hand it to DirPlayer: (KeyboardEvent.key, keyCode).
@@ -74,6 +80,10 @@ fn parse_script(text: &str) -> Vec<(f64, Act)> {
             (Some("down"), Some(k)) => Some(Act::Down(k.to_string())),
             (Some("up"), Some(k)) => Some(Act::Up(k.to_string())),
             (Some("snap"), Some(n)) => Some(Act::Snap(n.to_string())),
+            (Some("eval"), Some(_)) => {
+                let rest = item.splitn(3, char::is_whitespace).nth(2).unwrap_or("").trim().to_string();
+                Some(Act::Eval(rest))
+            }
             _ => None,
         };
         match act {
@@ -92,6 +102,44 @@ fn save(player: &TestPlayer, out: &Path, name: &str) {
         Ok(()) => println!("[probe] saved {} ({}x{})", path.display(), snap.width, snap.height),
         Err(e) => eprintln!("[probe] cannot write {}: {e}", path.display()),
     }
+}
+
+async fn show(player: &TestPlayer, expr: &str) {
+    match player.eval_datum(expr).await {
+        Ok(v) => println!("[eval] {expr} = {v:?}"),
+        Err(e) => println!("[eval] {expr} -> error {e:?}"),
+    }
+}
+
+/// The movie's state, for telling where a game waits.
+async fn dump(player: &TestPlayer) {
+    println!("[probe] ---- state ----");
+    for e in ["the movieName", "the moviePath", "the frame", "the frameLabel", "the labelList", "the number of castLibs", "the lastChannel", "the stageRight - the stageLeft", "the runMode"] {
+        show(player, e).await;
+    }
+    let libs = match player.eval_datum("the number of castLibs").await {
+        Ok(vm_rust::director::static_datum::StaticDatum::Int(n)) => n.clamp(0, 64),
+        _ => 0,
+    };
+    for i in 1..=libs {
+        show(player, &format!("castLib({i}).name")).await;
+        show(player, &format!("castLib({i}).fileName")).await;
+        show(player, &format!("the number of members of castLib {i}")).await;
+    }
+    let last = match player.eval_datum("the lastChannel").await {
+        Ok(vm_rust::director::static_datum::StaticDatum::Int(n)) => n.clamp(0, 1000),
+        _ => 0,
+    };
+    for ch in 1..=last {
+        if let Ok(v) = player.eval_datum(&format!("sprite({ch}).member.name")).await {
+            if !matches!(v, vm_rust::director::static_datum::StaticDatum::Void) && v != vm_rust::director::static_datum::StaticDatum::String(String::new()) {
+                let loc = player.eval_datum(&format!("sprite({ch}).loc")).await.ok();
+                let vis = player.eval_datum(&format!("sprite({ch}).visible")).await.ok();
+                println!("[sprite] {ch}: {v:?} at {loc:?} visible {vis:?}");
+            }
+        }
+    }
+    println!("[probe] ---- end of state ----");
 }
 
 fn main() {
@@ -139,6 +187,7 @@ fn main() {
         save(&player, &out, "t0000");
 
         let mut next_pic = every;
+        let (mut last_frame, mut same_since, mut dumped_stall) = (0u32, 0.0f64, false);
         let mut next_status = 1.0;
         let mut steps = 0u64;
         let mut todo = script.into_iter().peekable();
@@ -171,6 +220,7 @@ fn main() {
                         player.key_up(&key, code).await;
                     }
                     Act::Snap(name) => save(&player, &out, &name),
+                    Act::Eval(expr) => show(&player, &expr).await,
                 }
             }
             let playing = player.step_frame().await;
@@ -184,12 +234,21 @@ fn main() {
                 save(&player, &out, &format!("t{:04}", now as u32));
                 next_pic += every;
             }
+            let frame = player.current_frame();
+            if frame != last_frame {
+                (last_frame, same_since, dumped_stall) = (frame, now, false);
+            } else if now - same_since >= 10.0 && !dumped_stall {
+                dumped_stall = true;
+                println!("[probe] the score has stayed on frame {frame} for 10 s");
+                dump(&player).await;
+            }
             if !playing {
                 println!("[probe] the movie stopped playing at {now:.1} s");
                 save(&player, &out, "stopped");
                 break;
             }
         }
+        dump(&player).await;
         println!("[probe] done: {steps} frames in {:.1} s", t0.elapsed().as_secs_f64());
     });
 }
