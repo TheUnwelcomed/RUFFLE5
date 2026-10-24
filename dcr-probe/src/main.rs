@@ -12,8 +12,12 @@
 //!   15 key Enter         a key press (down, one frame, up)
 //!   16 down Right        hold a key ...      20 up Right   ... and let go
 //!   18 snap name         save the stage as name.png
-//!   19 eval EXPR         print a Lingo expression's value (`the frameLabel`, `castLib(3).fileName`)
+//!   19 eval EXPR         print a Lingo expression's value (dot syntax: `_movie.frameLabel`)
+//!   20 lingo             write every loaded script's Lingo (decompiled) to <out>/lingo/
 //! Keys: Enter Space Left Right Up Down Escape Shift Control Tab Backspace, a..z, 0..9.
+//!
+//! Sound goes nowhere, but it is mixed as the console would (`native_audio::mix`, in step with the
+//! clock), so a sound's end reaches the movie as it would there; the status line counts the voices.
 //!
 //! At the end (and when the score stays on one frame for 10 s) the probe prints the movie's state:
 //! its name and path, the frame and its label, the labels, every cast library with its file and
@@ -35,6 +39,7 @@ enum Act {
     Up(String),
     Snap(String),
     Eval(String),
+    Lingo,
 }
 
 /// A key name as the browser front end would hand it to DirPlayer: (KeyboardEvent.key, keyCode).
@@ -80,6 +85,7 @@ fn parse_script(text: &str) -> Vec<(f64, Act)> {
             (Some("down"), Some(k)) => Some(Act::Down(k.to_string())),
             (Some("up"), Some(k)) => Some(Act::Up(k.to_string())),
             (Some("snap"), Some(n)) => Some(Act::Snap(n.to_string())),
+            (Some("lingo"), _) => Some(Act::Lingo),
             (Some("eval"), Some(_)) => {
                 let rest = item.splitn(3, char::is_whitespace).nth(2).unwrap_or("").trim().to_string();
                 Some(Act::Eval(rest))
@@ -114,21 +120,32 @@ async fn show(player: &TestPlayer, expr: &str) {
 /// The movie's state, for telling where a game waits.
 async fn dump(player: &TestPlayer) {
     println!("[probe] ---- state ----");
-    for e in ["the movieName", "the moviePath", "the frame", "the frameLabel", "the labelList", "the number of castLibs", "the lastChannel", "the stageRight - the stageLeft", "the runMode"] {
+    for e in ["_movie.name", "_movie.path", "_movie.frame", "_movie.frameLabel", "_player.productVersion", "_system.environmentPropList"] {
         show(player, e).await;
     }
-    let libs = match player.eval_datum("the number of castLibs").await {
+    let libs = match player.eval_datum("castLib(\"Lingo\").number").await {
+        // the number of cast libraries: probe upwards until castLib(n) fails
+        Ok(_) => {
+            let mut n = 0;
+            while n < 64 && matches!(player.eval_datum(&format!("castLib({}).name", n + 1)).await, Ok(vm_rust::director::static_datum::StaticDatum::String(_))) {
+                n += 1;
+            }
+            Ok(vm_rust::director::static_datum::StaticDatum::Int(n))
+        }
+        e => e,
+    };
+    let libs = match libs {
         Ok(vm_rust::director::static_datum::StaticDatum::Int(n)) => n.clamp(0, 64),
         _ => 0,
     };
     for i in 1..=libs {
         show(player, &format!("castLib({i}).name")).await;
         show(player, &format!("castLib({i}).fileName")).await;
-        show(player, &format!("the number of members of castLib {i}")).await;
+        show(player, &format!("castLib({i}).member.count")).await;
     }
-    let last = match player.eval_datum("the lastChannel").await {
+    let last = match player.eval_datum("_movie.lastChannel").await {
         Ok(vm_rust::director::static_datum::StaticDatum::Int(n)) => n.clamp(0, 1000),
-        _ => 0,
+        _ => 150,
     };
     for ch in 1..=last {
         if let Ok(v) = player.eval_datum(&format!("sprite({ch}).member.name")).await {
@@ -140,6 +157,46 @@ async fn dump(player: &TestPlayer) {
         }
     }
     println!("[probe] ---- end of state ----");
+}
+
+/// Every script the movie has loaded, decompiled by DirPlayer, one file per script.
+fn dump_lingo(dir: &Path) {
+    use vm_rust::player::mcp;
+    let _ = std::fs::create_dir_all(dir);
+    let list: serde_json::Value = vm_rust::player::reserve_player_ref(|p| {
+        serde_json::from_str(&mcp::mcp_list_scripts(p, None, None, None)).unwrap_or(serde_json::Value::Null)
+    });
+    let scripts = list["scripts"].as_array().cloned().unwrap_or_default();
+    let (mut files, mut handlers) = (0, 0);
+    for sc in scripts {
+        let lib = sc["cast_lib"].as_i64().unwrap_or(0) as i32;
+        let mem = sc["cast_member"].as_i64().unwrap_or(0) as i32;
+        let details: serde_json::Value = vm_rust::player::reserve_player_ref(|p| serde_json::from_str(&mcp::mcp_get_script(p, lib, mem)).unwrap_or(serde_json::Value::Null));
+        let name = details["name"].as_str().unwrap_or("").to_string();
+        let kind = details["script_type"].as_str().unwrap_or("").to_string();
+        let mut text = format!("-- castLib {lib} member {mem}: {name} ({kind})\n");
+        if let Some(props) = details["properties"].as_array() {
+            if !props.is_empty() {
+                let p: Vec<String> = props.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                text += &format!("property {}\n", p.join(", "));
+            }
+        }
+        for h in details["handlers"].as_array().cloned().unwrap_or_default() {
+            let hn = h["name"].as_str().unwrap_or("").to_string();
+            let out: serde_json::Value = vm_rust::player::reserve_player_ref(|p| serde_json::from_str(&mcp::mcp_decompile_handler(p, lib, mem, &hn)).unwrap_or(serde_json::Value::Null));
+            let args: Vec<String> = out["arguments"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+            text += &format!("\non {hn} {}\n", args.join(", "));
+            for line in out["source"].as_str().unwrap_or("-- (not decompiled)").lines() {
+                text += &format!("  {line}\n");
+            }
+            text += "end\n";
+            handlers += 1;
+        }
+        let safe: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+        let _ = std::fs::write(dir.join(format!("{lib:02}_{mem:04}_{safe}.ls")), text);
+        files += 1;
+    }
+    println!("[probe] lingo: {files} scripts, {handlers} handlers -> {}", dir.display());
 }
 
 fn main() {
@@ -188,6 +245,7 @@ fn main() {
 
         let mut next_pic = every;
         let (mut last_frame, mut same_since, mut dumped_stall) = (0u32, 0.0f64, false);
+        let (mut mixed_to, mut mix_buf, mut peak) = (t0.elapsed().as_secs_f64(), Vec::<f32>::new(), 0.0f32);
         let mut next_status = 1.0;
         let mut steps = 0u64;
         let mut todo = script.into_iter().peekable();
@@ -221,13 +279,29 @@ fn main() {
                     }
                     Act::Snap(name) => save(&player, &out, &name),
                     Act::Eval(expr) => show(&player, &expr).await,
+                    Act::Lingo => dump_lingo(&out.join("lingo")),
                 }
             }
             let playing = player.step_frame().await;
             steps += 1;
+            // the speaker the console would have: mix what has played since the last frame
+            let now_s = t0.elapsed().as_secs_f64();
+            let frames = ((now_s - mixed_to) * 48_000.0) as usize;
+            if frames > 0 {
+                mix_buf.resize(frames * 2, 0.0);
+                mix_buf.iter_mut().for_each(|x| *x = 0.0);
+                vm_rust::player::native_audio::mix(&mut mix_buf, 48_000);
+                peak = mix_buf.iter().fold(peak, |m, x| m.max(x.abs()));
+                mixed_to += frames as f64 / 48_000.0;
+            }
             let now = t0.elapsed().as_secs_f64();
             if now >= next_status {
-                println!("[probe] {now:>6.1} s: frame {}, playing {playing}, {steps} steps", player.current_frame());
+                println!(
+                    "[probe] {now:>6.1} s: frame {}, playing {playing}, {steps} steps, {} voices, peak {peak:.2}",
+                    player.current_frame(),
+                    vm_rust::player::native_audio::playing()
+                );
+                peak = 0.0;
                 next_status += 1.0;
             }
             if now >= next_pic {

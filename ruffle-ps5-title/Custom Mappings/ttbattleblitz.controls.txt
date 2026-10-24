@@ -1,0 +1,10 @@
+# Teen Titans: Battle Blitz (Cartoon Network, 2005; Shockwave, ttbattleblitz/) — shipped preset,
+# applies to the ttbattleblitz folder game. The game's own controls (its Lingo, Class_KeyAdapter
+# and Class_GameScreen): arrows = run left/right, up = jump, down = duck; Z = punch, X = kick;
+# P = pause (and the controls card). Specials and Titan summons are d-pad sequences ending in Z.
+# Menus are clicked (touchpad: touch to point, press to click; or R2 at the pointer).
+square = z
+cross = x
+circle = x
+triangle = up
+options = p

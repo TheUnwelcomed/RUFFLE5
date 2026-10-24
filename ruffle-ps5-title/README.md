@@ -143,12 +143,23 @@ player in Rust, built into the title (`src/shockwave.rs`):
   *Stretch* = the whole screen; Quality Low/Medium = sharp pixels, High and up = smooth;
 * keys and the mouse reach the movie as a browser's events would; sound is DirPlayer's, mixed
   without a browser (`native_audio`, MP3 through Symphonia);
-* quick menu, controls editor, on-screen keyboard, covers, FPS and play time work as for Flash.
+* quick menu, controls editor, on-screen keyboard, covers, FPS and play time work as for Flash;
+* a shipped preset for *Teen Titans: Battle Blitz* (`Custom Mappings/ttbattleblitz.controls.txt`,
+  for a `games/ttbattleblitz/` folder): Square punch (Z), Cross/Circle kick (X), Triangle jump,
+  d-pad run/duck, OPTIONS pause (P; hold it for the quick menu).
+
+DirPlayer's timers run on `async-io`, whose reactor on FreeBSD is a kqueue woken by an
+`EVFILT_USER` event. Before the first Shockwave game the title makes those same kqueue calls once
+(`event_queue_ok`, logged as `shockwave: kqueue EVFILT_USER check: ok`); if the console refuses
+them the game returns to the menu with the reason rather than aborting the title.
 
 `tools/fetch-dirplayer.sh` (run by `build-title.sh`) fetches DirPlayer at a pinned commit into
 `vendor/dirplayer` and applies `tools/dirplayer-native.patch`: an embedding API for a native
 program (`player/native.rs`), a sound mixer without Web Audio (`player/native_audio.rs`), local
-files instead of `fetch()`, and browser-console calls compiled out off the web.
+files instead of `fetch()`, browser-console calls compiled out off the web, `rect.intersect()`
+returning the overlap (DirPlayer returned the union, so every collision test in a fighting game
+hit), its `image` dependency cut to the formats movies use (no AV1 encoder in the build), and its
+wasm-bindgen pins relaxed to share Ruffle's versions.
 `dcr-probe/` (at the repository root) runs a movie in DirPlayer on a PC or server and saves the
 stage as PNGs — for checking a game before it goes on the console.
 

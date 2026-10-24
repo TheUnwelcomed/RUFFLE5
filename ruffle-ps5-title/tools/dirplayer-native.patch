@@ -1,8 +1,40 @@
 diff --git a/vm-rust/Cargo.toml b/vm-rust/Cargo.toml
-index f0a3b59..2f116d2 100644
+index f0a3b59..dba3283 100644
 --- a/vm-rust/Cargo.toml
 +++ b/vm-rust/Cargo.toml
-@@ -77,6 +77,10 @@ wasm-bindgen-test = "0.3.34"
+@@ -16,7 +16,7 @@ word_hard_break = []
+ alloc-debug-overlay = []
+ 
+ [dependencies]
+-wasm-bindgen = "=0.2.108"
++wasm-bindgen = "0.2.108"
+ 
+ # Insertion-ordered map. `externalParamName(n)` / `externalParamValue(n)` are
+ # INDEXED accessors in Director — the params keep the order the host handed
+@@ -34,8 +34,8 @@ xtra-sdk = { path = "../xtra-sdk" }
+ # all the `std::fmt` and `std::panicking` infrastructure, so isn't great for
+ # code size when deploying.
+ console_error_panic_hook = { version = "0.1.7", optional = true }
+-wasm-bindgen-futures = "=0.4.58"
+-js-sys = "=0.3.85"
++wasm-bindgen-futures = "0.4.58"
++js-sys = "0.3.85"
+ binary-reader = "0.4.5"
+ num = "0.4.1"
+ num-derive = "0.4.0"
+@@ -57,7 +57,10 @@ console_log = "1.0.0"
+ log = "0.4.22"
+ percent-encoding = "2"
+ xml = "1.0"
+-image = "0.25.8"
++# PS5_RUFFLE_DIRPLAYER_NATIVE: only the formats a movie's bitmaps use (load_from_memory sniffs PNG,
++# JPEG, GIF, BMP); the defaults also build an AV1 encoder (rav1e) and rayon, which a console build
++# compiles for nothing.
++image = { version = "0.25.8", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+ rand = { version = "0.9", features = ["small_rng"] }
+ getrandom = { version = "0.3", features = ["wasm_js"] }
+ base64 = "0.22"
+@@ -77,8 +80,14 @@ wasm-bindgen-test = "0.3.34"
  version = "1.12.0"
  features = ["unstable"]
  
@@ -10,9 +42,14 @@ index f0a3b59..2f116d2 100644
 +[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 +symphonia = { version = "0.5.5", default-features = false, features = ["mp3"] }
 +
++# PS5_RUFFLE_DIRPLAYER_NATIVE: the wasm-bindgen family as caret requirements, not exact pins, so
++# DirPlayer builds next to Ruffle (which needs newer 0.2/0.3/0.4 releases of the same crates).
  [dependencies.web-sys]
- version = "=0.3.85"
+-version = "=0.3.85"
++version = "0.3.85"
  features = [
+   'ImageData',
+   'ImageBitmap',
 diff --git a/vm-rust/src/director/file.rs b/vm-rust/src/director/file.rs
 index c71aa4f..4ba09d9 100644
 --- a/vm-rust/src/director/file.rs
@@ -359,6 +396,31 @@ index f0e7ac1..bed0bd6 100644
              return reserve_player_mut(|player| {
                  Ok(player.alloc_datum(crate::director::lingo::datum::Datum::PropList(VecDeque::new(), false)))
              });
+diff --git a/vm-rust/src/player/handlers/datum_handlers/rect.rs b/vm-rust/src/player/handlers/datum_handlers/rect.rs
+index dfbbfd7..ee57ed2 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/rect.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/rect.rs
+@@ -113,11 +113,15 @@ impl RectDatumHandlers {
+             let (r1, _f1) = player.get_datum(datum).to_rect_inline()?;
+             let (r2, _f2) = player.get_datum(&args[0]).to_rect_inline()?;
+ 
+-            // intersect uses min/max
+-            let l = r1[0].min(r2[0]);
+-            let t = r1[1].min(r2[1]);
+-            let r = r1[2].max(r2[2]);
+-            let b = r1[3].max(r2[3]);
++            // PS5_RUFFLE_DIRPLAYER_NATIVE: r1.intersect(r2) is the overlap (largest left/top,
++            // smallest right/bottom), rect(0,0,0,0) when there is none -- the same as the global
++            // intersect(r1, r2). It used to return the union, so every collision test
++            // (`attBox.intersect(defBox) <> rect(0,0,0,0)`) hit.
++            let (mut l, mut t, mut r, mut b) =
++                (r1[0].max(r2[0]), r1[1].max(r2[1]), r1[2].min(r2[2]), r1[3].min(r2[3]));
++            if l >= r || t >= b {
++                (l, t, r, b) = (0.0, 0.0, 0.0, 0.0);
++            }
+ 
+             // Use from_f64 logic for flags
+             let result = Datum::build_rect(
 diff --git a/vm-rust/src/player/handlers/datum_handlers/sound_channel.rs b/vm-rust/src/player/handlers/datum_handlers/sound_channel.rs
 index 9ae62c7..d1e3add 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/sound_channel.rs

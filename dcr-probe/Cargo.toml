@@ -13,6 +13,7 @@ publish = false
 # DirPlayer's VM at the commit ruffle-ps5-title/build-title.sh pins (vendor/dirplayer), with
 # ruffle-ps5-title/tools/dirplayer-native.patch applied.
 vm-rust = { path = "../ruffle-ps5-title/vendor/dirplayer/vm-rust", default-features = false }
+serde_json = "1"
 
 [profile.release]
 opt-level = 2

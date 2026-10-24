@@ -273,11 +273,18 @@ impl Default for Controls {
     }
 }
 
-/// The stem the mapping files of a movie are named after ("dadnme" for .../dadnme.swf).
+/// A movie's own extension: .swf, or a Director movie's (.dcr .dir .dxr). Its mapping files are
+/// named without it.
+fn is_movie_ext(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("swf") || crate::dirinfo::MOVIE_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e))
+}
+
+/// The stem the mapping files of a movie are named after ("dadnme" for .../dadnme.swf,
+/// "ttbattleblitz" for .../ttbattleblitz.dcr -- the menu's stem, which the editor writes under).
 pub fn movie_stem(movie_path: &str) -> String {
     let file_name = movie_path.rsplit('/').next().unwrap_or(movie_path);
     match file_name.rsplit_once('.') {
-        Some((stem, ext)) if ext.eq_ignore_ascii_case("swf") => stem.to_string(),
+        Some((stem, ext)) if is_movie_ext(ext) => stem.to_string(),
         _ => file_name.to_string(),
     }
 }
@@ -342,7 +349,7 @@ impl Controls {
             c.source = Some(preset);
         }
         let beside = match movie_path.rsplit_once('.') {
-            Some((p, ext)) if ext.eq_ignore_ascii_case("swf") => format!("{p}.controls.txt"),
+            Some((p, ext)) if is_movie_ext(ext) => format!("{p}.controls.txt"),
             _ => format!("{movie_path}.controls.txt"),
         };
         if beside != own && std::path::Path::new(&beside).is_file() && c.layer(&beside) {
@@ -806,6 +813,43 @@ mod tests {
         std::fs::write(format!("{}/Custom Mappings/other.controls.txt", paths.app), "square = q\n").unwrap();
         let e = Controls::load(&paths, &format!("{}/other.swf", paths.games));
         assert_eq!(describe_short(&e.actions(Button::Square)), "Q");
+    }
+
+    #[test]
+    fn director_movies_use_the_menu_stem() {
+        assert_eq!(movie_stem("/g/ttbattleblitz/ttbattleblitz.dcr"), "ttbattleblitz");
+        assert_eq!(movie_stem("/g/Movie.DIR"), "Movie");
+        assert_eq!(movie_stem("/g/dadnme.swf"), "dadnme");
+        assert_eq!(movie_stem("/g/odd.bin"), "odd.bin");
+        let paths = temp_paths("director");
+        std::fs::write(mapping_file(&paths, Some("blitz")), "cross = x\n").unwrap();
+        let c = Controls::load(&paths, &format!("{}/blitz/blitz.dcr", paths.games));
+        assert_eq!(describe_short(&c.actions(Button::Cross)), "X");
+    }
+
+    #[test]
+    fn shipped_presets_read_cleanly() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/Custom Mappings");
+        let mut n = 0;
+        for e in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+            let path = e.path().to_string_lossy().into_owned();
+            if !path.ends_with(".controls.txt") {
+                continue;
+            }
+            let mut c = Controls::default();
+            for raw in std::fs::read_to_string(&path).unwrap().lines() {
+                let line = raw.split('#').next().unwrap_or("").trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let (k, v) = line.split_once('=').unwrap_or_else(|| panic!("{path}: not `name = value`: {raw}"));
+                if let Err(e) = c.set(&k.trim().to_ascii_lowercase(), &v.trim().to_ascii_lowercase()) {
+                    panic!("{path}: {e}: {raw}");
+                }
+            }
+            n += 1;
+        }
+        assert!(n >= 2);
     }
 
     #[test]
