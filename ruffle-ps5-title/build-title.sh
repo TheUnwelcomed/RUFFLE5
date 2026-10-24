@@ -340,7 +340,7 @@ if [[ $RUFFLE == 1 ]]; then
     echo "       options. In a game: hold OPTIONS = quick menu (resume, restart, volume, controls, cover,"
     echo "       FPS, back to the menu), L2 = on-screen keyboard. test-swf/bounce.swf is a known-good game."
     echo "       Mappings: /data/homebrew/$TITLE_ID/Custom Mappings/ (presets shipped:"
-    echo "       $(ls "$HERE/Custom Mappings"/*.controls.txt | xargs -n1 basename | sed 's/.controls.txt//' | tr '\n' ' ')). Log: /data/ruffle5/ruffle.log"
+    echo "       $(for f in "$HERE/Custom Mappings"/*.controls.txt; do b="${f##*/}"; printf '%s ' "${b%.controls.txt}"; done)). Log: /data/ruffle5/ruffle.log"
     echo "       (a [Game] ms per loop line every 5 s while a game plays)"
 else
     echo "   3a: the screen should cycle through colours for 8 s, with toasts. Log: /data/ruffle5/ruffle.log"
