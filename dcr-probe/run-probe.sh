@@ -31,6 +31,15 @@ MOVIE="$GAME/gamewrapper.dir"
 bash "$TITLE/tools/fetch-dirplayer.sh"
 
 # --- 2. the probe (for this machine, not the PS5) ------------------------------------------------
+# rustup's cargo lives in ~/.cargo/bin, which a non-login shell may not have on PATH.
+for d in "${CARGO_HOME:-$HOME/.cargo}/bin" "$HOME/.cargo/bin"; do
+    [[ -x "$d/cargo" ]] && export PATH="$d:$PATH"
+done
+if ! command -v cargo >/dev/null; then
+    tc="$(ls -d "$HOME"/.rustup/toolchains/nightly-*/bin 2>/dev/null | head -1 || true)"
+    [[ -n "$tc" && -x "$tc/cargo" ]] && export PATH="$tc:$PATH"
+fi
+command -v cargo >/dev/null || die "cargo not found (looked in ~/.cargo/bin and ~/.rustup/toolchains): send me the output of  ls ~/.cargo/bin ~/.rustup/toolchains"
 CARGO=(cargo)
 if command -v rustup >/dev/null && rustup run nightly cargo --version >/dev/null 2>&1; then CARGO=(cargo +nightly); fi
 cd "$PROBE"
