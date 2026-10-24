@@ -48,14 +48,14 @@ pub enum GameEnd {
 }
 
 /// Hold OPTIONS this long for the quick menu (the bar shows after the delay).
-const QUICK_DELAY: f32 = 0.3;
-const QUICK_FILL: f32 = 0.5;
-const FADE_IN: f32 = 0.35;
-const FADE_OUT: f32 = 0.35;
-const AUTO_COVER_AFTER: Duration = Duration::from_secs(8);
+pub(crate) const QUICK_DELAY: f32 = 0.3;
+pub(crate) const QUICK_FILL: f32 = 0.5;
+pub(crate) const FADE_IN: f32 = 0.35;
+pub(crate) const FADE_OUT: f32 = 0.35;
+pub(crate) const AUTO_COVER_AFTER: Duration = Duration::from_secs(8);
 const SAVE_EVERY: Duration = Duration::from_secs(3);
-const PROGRESS_EVERY: Duration = Duration::from_secs(30);
-const STATS_EVERY: Duration = Duration::from_secs(5);
+pub(crate) const PROGRESS_EVERY: Duration = Duration::from_secs(30);
+pub(crate) const STATS_EVERY: Duration = Duration::from_secs(5);
 /// A text box asking for the keyboard opens it after its focus settled this long.
 const KEYBOARD_SETTLE: Duration = Duration::from_millis(400);
 
@@ -98,17 +98,17 @@ impl ExternalInterfaceProvider for DummyExternalInterface {
 
 /// What one run of a game did, for play time and badges.
 #[derive(Default, Clone, Copy)]
-struct Session {
-    covers: u64,
-    quick_menus: u64,
-    keyboard: bool,
-    mouse: bool,
-    osk: bool,
+pub(crate) struct Session {
+    pub(crate) covers: u64,
+    pub(crate) quick_menus: u64,
+    pub(crate) keyboard: bool,
+    pub(crate) mouse: bool,
+    pub(crate) osk: bool,
 }
 
 /// The loading screen: Ruffle blue, the game's picture glowing with ProsperoStore's breathing
 /// halo and a light running round its border, its name, and a spinner.
-fn loading_scene(app: &mut App, name: &str, thumb: Option<crate::ui::ImageId>, accent: crate::ui::Color, t: f32) -> Scene {
+pub(crate) fn loading_scene(app: &mut App, name: &str, thumb: Option<crate::ui::ImageId>, accent: crate::ui::Color, t: f32) -> Scene {
     let mut scene = Scene::new();
     if let Ok(mut ui) = app.display.ui.lock() {
         let ui = &mut *ui;

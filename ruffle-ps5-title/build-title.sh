@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PS5_RUFFLE_TITLE_BUILD_V5 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
+# PS5_RUFFLE_TITLE_BUILD_V6 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
 # under Games. Phase 3a by default (wgpu on the static RADV clears the display); 3b with --ruffle.
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
@@ -124,6 +124,9 @@ if ! grep -q PS5_RUFFLE_WGPU_HAL_PATCH_V1 "$HERE/vendor/wgpu/wgpu-hal/src/vulkan
 fi
 grep -q PS5_RUFFLE_WGPU_HAL_PATCH_V1 "$HERE/vendor/wgpu/wgpu-hal/src/vulkan/instance.rs" || die "the wgpu-hal patch is not in place"
 ok "wgpu-hal patched (PS5_RUFFLE_WGPU_HAL_PATCH_V1)"
+# 2b'. DirPlayer for Director / Shockwave games (src/shockwave.rs): its VM at a pinned commit plus
+# tools/dirplayer-native.patch. Cargo.toml names it as a path dependency, so it is fetched for 3a too.
+bash "$HERE/tools/fetch-dirplayer.sh" "$HERE/vendor/dirplayer" || die "DirPlayer could not be fetched or patched"
 
 # 2c. cargo: this crate to a staticlib. Same target and shim as milestone 1; std from source
 # (.cargo/config.toml). -Zgit=shallow-deps: the pinned Ruffle revision is fetched shallow, not with

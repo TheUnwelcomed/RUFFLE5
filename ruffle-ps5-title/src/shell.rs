@@ -1,4 +1,4 @@
-//! PS5_RUFFLE_SHELL_V2 — one display, shared by the menu and every game's player.
+//! PS5_RUFFLE_SHELL_V3 — one display, shared by the menu and every game's player.
 //!
 //! Ruffle's `WgpuRenderBackend` takes ownership of its render target, and a `Player` owns its
 //! renderer; to play one game after another each gets a fresh `Player`. So the swapchain lives here,
@@ -21,6 +21,12 @@
 //!
 //! The time spent acquiring, painting overlays and presenting is counted (`FrameStats`) for the
 //! frame-time log.
+//!
+//! V3 (Shockwave): a Director stage is rendered on the CPU (DirPlayer, src/shockwave.rs) and shown
+//! as a picture: `present_picture` uploads its pixels into a texture of the stage's size and the
+//! same scaling pass draws it into a rectangle of the display (`picture_rect`: whole multiples,
+//! fitted, or stretched), sharp (nearest) or smooth (bilinear), black around it, the pointer and
+//! the overlay over it.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::cursor::{Cursor, CursorPainter, SharedCursor};
@@ -129,6 +135,46 @@ struct Blit {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    nearest: wgpu::Sampler,
+}
+
+/// How a picture (a Director stage) fills the display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fit {
+    /// The largest whole multiple of its size that fits: every pixel the same size.
+    Whole,
+    /// As large as fits, its shape kept.
+    Fit,
+    /// The whole display, its shape not kept.
+    Stretch,
+}
+
+/// The picture's texture (a Director stage, uploaded each frame it changes).
+struct Picture {
+    texture: wgpu::Texture,
+    smooth: wgpu::BindGroup,
+    sharp: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+}
+
+/// Where a `width` x `height` picture goes on a `dw` x `dh` display: [x, y, w, h] in display pixels.
+pub fn picture_rect(width: u32, height: u32, dw: u32, dh: u32, fit: Fit) -> [f32; 4] {
+    let (w, h, dw, dh) = (width.max(1) as f32, height.max(1) as f32, dw as f32, dh as f32);
+    let (rw, rh) = match fit {
+        Fit::Stretch => (dw, dh),
+        Fit::Fit => {
+            let k = (dw / w).min(dh / h);
+            (w * k, h * k)
+        }
+        Fit::Whole => {
+            let k = (dw / w).min(dh / h);
+            let k = if k >= 1.0 { k.floor() } else { k };
+            (w * k, h * k)
+        }
+    };
+    let (rw, rh) = (rw.round().min(dw), rh.round().min(dh));
+    [((dw - rw) / 2.0).floor(), ((dh - rh) / 2.0).floor(), rw, rh]
 }
 
 impl Blit {
@@ -164,6 +210,16 @@ impl Blit {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let nearest = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit nearest"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
@@ -210,10 +266,33 @@ impl Blit {
             multiview_mask: None,
             cache: None,
         });
-        Blit { pipeline, layout, sampler }
+        Blit { pipeline, layout, sampler, nearest }
+    }
+
+    fn bind(&self, device: &wgpu::Device, view: &wgpu::TextureView, sampler: &wgpu::Sampler) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        })
     }
 
     fn encode(&self, device: &wgpu::Device, bind: &wgpu::BindGroup, target: &wgpu::TextureView) -> wgpu::CommandBuffer {
+        self.encode_into(device, bind, target, None)
+    }
+
+    /// The scaling pass, into `rect` ([x, y, w, h] in the target's pixels) or all of it; the rest
+    /// of the target is cleared to black.
+    fn encode_into(&self, device: &wgpu::Device, bind: &wgpu::BindGroup, target: &wgpu::TextureView, rect: Option<[f32; 4]>) -> wgpu::CommandBuffer {
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("blit") });
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -233,6 +312,11 @@ impl Blit {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
+            if let Some([x, y, w, h]) = rect {
+                if w >= 1.0 && h >= 1.0 {
+                    pass.set_viewport(x, y, w, h, 0.0, 1.0);
+                }
+            }
             pass.set_bind_group(0, bind, &[]);
             pass.draw(0..3, 0..1);
         }
@@ -254,6 +338,7 @@ pub struct Display {
     overlay: Mutex<Scene>,
     blit: Blit,
     offscreen: Mutex<Option<Offscreen>>,
+    picture: Mutex<Option<Picture>>,
     capture: Mutex<Capture>,
     pub stats: FrameStats,
     lost_logged: AtomicU8,
@@ -286,6 +371,7 @@ impl Display {
             overlay: Mutex::new(Scene::new()),
             blit,
             offscreen: Mutex::new(None),
+            picture: Mutex::new(None),
             capture: Mutex::new(Capture::Idle),
             stats: FrameStats::default(),
             lost_logged: AtomicU8::new(0),
@@ -377,6 +463,9 @@ impl Display {
     pub fn release_offscreen(&self) {
         if let Ok(mut o) = self.offscreen.lock() {
             *o = None;
+        }
+        if let Ok(mut p) = self.picture.lock() {
+            *p = None;
         }
         if let Ok(mut c) = self.capture.lock() {
             *c = Capture::Idle;
@@ -528,6 +617,88 @@ impl Display {
                 buffers.push(ui.render(device, queue, view, None, &overlay));
             }
         }
+    }
+
+    /// Show a picture (a Director stage): `upload` is its RGBA8 pixels when they changed (None
+    /// shows the last ones again), scaled into `picture_rect(.., fit)`, sharp or smooth, with black
+    /// around it, then the pointer and the overlay over it; presented.
+    pub fn present_picture(&self, upload: Option<(&[u8], u32, u32)>, fit: Fit, smooth: bool) -> Result<(), String> {
+        let t = Instant::now();
+        let mut slot = self.picture.lock().map_err(|_| "picture lock poisoned")?;
+        if let Some((rgba, width, height)) = upload {
+            let (width, height) = (width.max(1), height.max(1));
+            if rgba.len() < (width * height * 4) as usize {
+                return Err(format!("picture: {} bytes for {width}x{height}", rgba.len()));
+            }
+            let fits = slot.as_ref().is_some_and(|p| p.width == width && p.height == height);
+            if !fits {
+                let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("stage"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let smooth = self.blit.bind(&self.device, &view, &self.blit.sampler);
+                let sharp = self.blit.bind(&self.device, &view, &self.blit.nearest);
+                *slot = Some(Picture { texture, smooth, sharp, width, height });
+            }
+            if let Some(p) = slot.as_ref() {
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &p.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &rgba[..(width * height * 4) as usize],
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(width * 4),
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+        FrameStats::add(&self.stats.overlay_us, t);
+        let Some(st) = self.acquire() else {
+            return Ok(());
+        };
+        let t = Instant::now();
+        let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut buffers = Vec::new();
+        match slot.as_ref() {
+            Some(p) => {
+                let rect = picture_rect(p.width, p.height, self.width, self.height, fit);
+                buffers.push(self.blit.encode_into(&self.device, if smooth { &p.smooth } else { &p.sharp }, &view, Some(rect)));
+            }
+            None => {
+                let mut ui = self.ui.lock().map_err(|_| "ui lock poisoned")?;
+                buffers.push(ui.render(&self.device, &self.queue, &view, Some(Color::rgb(0)), &Scene::new()));
+            }
+        }
+        drop(slot);
+        self.paint_over(&self.device, &self.queue, &view, &mut buffers);
+        FrameStats::add(&self.stats.overlay_us, t);
+        let t = Instant::now();
+        self.queue.submit(buffers);
+        self.queue.present(st);
+        FrameStats::add(&self.stats.present_us, t);
+        self.stats.presents.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Draw `scene` on a frame cleared to `clear` and present it (the menu without a background

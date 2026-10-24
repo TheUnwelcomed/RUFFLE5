@@ -1,4 +1,4 @@
-//! PS5_RUFFLE_CURSOR_V3 — a mouse pointer drawn over Ruffle's frame.
+//! PS5_RUFFLE_CURSOR_V4 — a mouse pointer drawn over Ruffle's frame.
 //!
 //! Ruffle draws no cursor (a desktop's window system does that), so on the TV there was nothing to
 //! show where the touchpad had put the mouse. `CursorPainter` paints an arrow at the pointer in one
@@ -10,6 +10,9 @@
 //! V3: the pointer's position is in the game's own pixels (`space`: 1920x1080, or 3840x2160 when a
 //! game renders in 4K) and the painter maps it onto the display, whatever its size; the arrow is
 //! drawn at the display's scale, so it is as sharp in 4K as the rest.
+//!
+//! V4: `area` — the part of the display the coordinate space covers (a Director stage is shown in
+//! a rectangle of the display, src/shockwave.rs); empty means all of it.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::sync::{Arc, Mutex};
@@ -23,6 +26,8 @@ pub struct Cursor {
     /// The size of the coordinate space x and y are in (the game's viewport).
     pub space_w: f32,
     pub space_h: f32,
+    /// Where that space is on the display: [x, y, w, h] in display pixels; w == 0: everywhere.
+    pub area: [f32; 4],
 }
 
 pub type SharedCursor = Arc<Mutex<Cursor>>;
@@ -35,6 +40,7 @@ pub fn shared(x: f32, y: f32, scale: f32) -> SharedCursor {
         scale,
         space_w: crate::ui::W,
         space_h: crate::ui::H,
+        area: [0.0; 4],
     }))
 }
 
@@ -186,11 +192,12 @@ impl CursorPainter {
             return None;
         }
         // Game pixels to display pixels; the arrow's size follows the display (1920 wide = 1).
-        let sx = self.width as f32 / c.space_w.max(1.0);
-        let sy = self.height as f32 / c.space_h.max(1.0);
+        let [ax, ay, aw, ah] = if c.area[2] > 0.0 { c.area } else { [0.0, 0.0, self.width as f32, self.height as f32] };
+        let sx = aw / c.space_w.max(1.0);
+        let sy = ah / c.space_h.max(1.0);
         let params: [f32; 8] = [
-            (c.x * sx).round(),
-            (c.y * sy).round(),
+            (ax + c.x * sx).round(),
+            (ay + c.y * sy).round(),
             self.width as f32,
             self.height as f32,
             c.scale * self.width as f32 / crate::ui::W,

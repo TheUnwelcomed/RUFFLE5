@@ -42,6 +42,8 @@ mod cpu;
 #[cfg(feature = "ruffle")]
 mod cursor;
 #[cfg(feature = "ruffle")]
+mod dirinfo;
+#[cfg(feature = "ruffle")]
 mod editor;
 #[cfg(feature = "ruffle")]
 mod fsutil;
@@ -71,6 +73,8 @@ mod saves;
 mod settings;
 #[cfg(feature = "ruffle")]
 mod shell;
+#[cfg(feature = "ruffle")]
+mod shockwave;
 #[cfg(feature = "ruffle")]
 mod sounds;
 #[cfg(feature = "ruffle")]
@@ -356,7 +360,7 @@ fn run_app(gpu: gpu::Gpu, paths: paths::Paths) -> Result<(), String> {
                 Some(menu::Action::EditControls(i)) => {
                     if let Some(g) = app.menu.games.get(i) {
                         let target = editor::Target::Game { stem: g.stem.clone(), name: g.name.clone() };
-                        let path = g.path.clone();
+                        let path = g.controls_path.clone();
                         editor = Some(editor::Editor::open(&app.paths, target, Some(&path)));
                     }
                 }
@@ -410,7 +414,12 @@ fn run_app(gpu: gpu::Gpu, paths: paths::Paths) -> Result<(), String> {
         };
 
         // ---- a game (again, while the quick menu says restart) ----
-        while game::play(&mut app, gi) == game::GameEnd::Restart {
+        let shockwave = app.menu.games.get(gi).is_some_and(|g| g.kind == menu::Kind::Shockwave);
+        loop {
+            let end = if shockwave { shockwave::play(&mut app, gi) } else { game::play(&mut app, gi) };
+            if end != game::GameEnd::Restart {
+                break;
+            }
             say("game: restarting");
         }
     }

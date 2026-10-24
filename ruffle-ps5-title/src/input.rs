@@ -235,6 +235,14 @@ impl Input {
         }
     }
 
+    /// The part of the display the game's coordinates cover ([x, y, w, h] in display pixels), for
+    /// drawing the pointer; None: all of it.
+    pub fn set_area(&mut self, area: Option<[f32; 4]>) {
+        if let Ok(mut c) = self.cursor.lock() {
+            c.area = area.unwrap_or([0.0; 4]);
+        }
+    }
+
     /// Hide the pointer (the menu draws none) and forget the holds.
     pub fn reset(&mut self) {
         self.keys_held.clear();
@@ -246,6 +254,7 @@ impl Input {
         self.menu_request = false;
         if let Ok(mut c) = self.cursor.lock() {
             c.visible = false;
+            c.area = [0.0; 4];
         }
     }
 

@@ -1,8 +1,389 @@
+diff --git a/vm-rust/Cargo.toml b/vm-rust/Cargo.toml
+index f0a3b59..2f116d2 100644
+--- a/vm-rust/Cargo.toml
++++ b/vm-rust/Cargo.toml
+@@ -77,6 +77,10 @@ wasm-bindgen-test = "0.3.34"
+ version = "1.12.0"
+ features = ["unstable"]
+ 
++# PS5_RUFFLE_DIRPLAYER_NATIVE: MP3 sound without a browser to decode it (src/player/native_audio.rs).
++[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
++symphonia = { version = "0.5.5", default-features = false, features = ["mp3"] }
++
+ [dependencies.web-sys]
+ version = "=0.3.85"
+ features = [
+diff --git a/vm-rust/src/director/file.rs b/vm-rust/src/director/file.rs
+index c71aa4f..4ba09d9 100644
+--- a/vm-rust/src/director/file.rs
++++ b/vm-rust/src/director/file.rs
+@@ -65,7 +65,7 @@ pub struct DirectorFile {
+ // macro_rules! console_log {
+ //   // Note that this is using the `log` function imported above during
+ //   // `bare_bones`
+-//   ($($t:tt)*) => (web_sys::console::log_1(&JsValue::from_str(format_args!($($t)*).to_string().as_str())))
++//   ($($t:tt)*) => (crate::web_console!(log_1, &JsValue::from_str(format_args!($($t)*).to_string().as_str())))
+ // }
+ 
+ impl DirectorFile {
+diff --git a/vm-rust/src/director/static_datum.rs b/vm-rust/src/director/static_datum.rs
+index 1fa65d0..9ea7b25 100644
+--- a/vm-rust/src/director/static_datum.rs
++++ b/vm-rust/src/director/static_datum.rs
+@@ -182,7 +182,7 @@ pub fn static_datum_to_runtime(param: &StaticDatum, allocator: &mut DatumAllocat
+             match reader.read_media() {
+                 Ok(media) => allocator.alloc_datum(Datum::media(media)).unwrap(),
+                 Err(e) => {
+-                    web_sys::console::warn_1(&format!("Failed to parse media from StaticDatum: {}", e).into());
++                    crate::web_console!(warn_1, &format!("Failed to parse media from StaticDatum: {}", e).into());
+                     DatumRef::Void
+                 }
+             }
+diff --git a/vm-rust/src/lib.rs b/vm-rust/src/lib.rs
+index a5fd98f..3cdbdef 100644
+--- a/vm-rust/src/lib.rs
++++ b/vm-rust/src/lib.rs
+@@ -493,13 +493,13 @@ pub fn player_print_member_sound_hex(cast_lib: i32, cast_member: i32) {
+     reserve_player_ref(|player| {
+         let member_ref = CastMemberRef { cast_lib, cast_member };
+         let Some(member) = player.movie.cast_manager.find_member_by_ref(&member_ref) else {
+-            web_sys::console::warn_1(
++            crate::web_console!(warn_1, 
+                 &format!("[sound-preview] member {}:{} not found", cast_lib, cast_member).into(),
+             );
+             return;
+         };
+         let CastMemberType::Sound(snd) = &member.member_type else {
+-            web_sys::console::warn_1(
++            crate::web_console!(warn_1, 
+                 &format!(
+                     "[sound-preview] member {}:{} '{}' is not a sound member",
+                     cast_lib, cast_member, member.name
+@@ -523,7 +523,7 @@ pub fn player_print_member_sound_hex(cast_lib: i32, cast_member: i32) {
+         } else {
+             "raw / PCM?"
+         };
+-        web_sys::console::log_1(
++        crate::web_console!(log_1, 
+             &format!(
+                 "🎧 SOUND {}:{} '{}' — {} Hz, {} ch, {}-bit, samples={}, dur={}ms, loop={}, codec='{}', big_endian={} — data={} bytes — magic={}",
+                 cast_lib, cast_member, member.name,
+@@ -544,8 +544,8 @@ pub fn player_print_member_sound_hex(cast_lib: i32, cast_member: i32) {
+                 ascii.push('\n');
+             }
+         }
+-        web_sys::console::log_1(&format!("🎧 first {} bytes (hex):\n{}", n, hex).into());
+-        web_sys::console::log_1(&format!("🎧 first {} bytes (ascii):\n{}", n, ascii).into());
++        crate::web_console!(log_1, &format!("🎧 first {} bytes (hex):\n{}", n, hex).into());
++        crate::web_console!(log_1, &format!("🎧 first {} bytes (ascii):\n{}", n, ascii).into());
+     });
+ }
+ 
+@@ -574,13 +574,13 @@ pub fn player_print_filmloop_sprites(cast_lib: i32, cast_member: i32) {
+     reserve_player_ref(|player| {
+         let member_ref = CastMemberRef { cast_lib, cast_member };
+         let Some(member) = player.movie.cast_manager.find_member_by_ref(&member_ref) else {
+-            web_sys::console::warn_1(&format!(
++            crate::web_console!(warn_1, &format!(
+                 "[filmloop-dump] member {}:{} not found", cast_lib, cast_member
+             ).into());
+             return;
+         };
+         let CastMemberType::FilmLoop(film) = &member.member_type else {
+-            web_sys::console::warn_1(&format!(
++            crate::web_console!(warn_1, &format!(
+                 "[filmloop-dump] member {}:{} ('{}') is not a filmloop",
+                 cast_lib, cast_member, member.name
+             ).into());
+@@ -606,7 +606,7 @@ pub fn player_print_filmloop_sprites(cast_lib: i32, cast_member: i32) {
+         let mut entries: Vec<_> = latest.into_iter().collect();
+         entries.sort_by_key(|(ch, _)| *ch);
+ 
+-        web_sys::console::warn_1(&format!(
++        crate::web_console!(warn_1, &format!(
+             "[filmloop-dump] member {}:{} '{}' frame={} init_data_entries={} active_channels={}",
+             cast_lib, cast_member, member.name,
+             frame, init_data.len(), entries.len()
+@@ -622,7 +622,7 @@ pub fn player_print_filmloop_sprites(cast_lib: i32, cast_member: i32) {
+                 .find_filmloop_inner_member(&CastMemberRef { cast_lib: ilib, cast_member: d.cast_member as i32 })
+                 .map(|m| m.name.clone())
+                 .unwrap_or_else(|| "<no_member>".into());
+-            web_sys::console::warn_1(&format!(
++            crate::web_console!(warn_1, &format!(
+                 "[filmloop-raw]   f={} ch={} ink={} blend={} member=({},{}) '{}' size={}x{}",
+                 f, c, d.ink, d.blend, ilib, d.cast_member, nm, d.width, d.height
+             ).into());
+@@ -650,7 +650,7 @@ pub fn player_print_filmloop_sprites(cast_lib: i32, cast_member: i32) {
+                 }
+                 None => ("<not found>".into(), "<none>".into(), String::new()),
+             };
+-            web_sys::console::warn_1(&format!(
++            crate::web_console!(warn_1, &format!(
+                 "[filmloop-dump]   ch={} ink={} blend={} member=({},{}) '{}' [{}]{} pos=({},{}) size={}x{} flipH={} flipV={} fore/back=({}/{}) color_flag={} kf_frame={}",
+                 channel_num,
+                 data.ink,
+@@ -689,7 +689,7 @@ pub fn player_print_filmloop_sprites(cast_lib: i32, cast_member: i32) {
+                             Some(im) => (im.name.clone(), format!("{:?}", im.member_type.member_type_id())),
+                             None => ("<not found>".into(), "<none>".into()),
+                         };
+-                        web_sys::console::warn_1(&format!(
++                        crate::web_console!(warn_1, &format!(
+                             "[filmloop-dump]     >> nested ch={} ink={} member=({},{}) '{}' [{}] size={}x{} fore/back=({}/{}) color_flag={} kf_frame={}",
+                             icn, id.ink, ilib, id.cast_member, inn_name, inn_type,
+                             id.width, id.height, id.fore_color, id.back_color, id.color_flag, ifr
+@@ -2040,21 +2040,21 @@ pub fn export_w3d_obj(cast_lib: i32, cast_member: i32) {
+         let member = match player.movie.cast_manager.find_member_by_ref(&member_ref) {
+             Some(m) => m,
+             None => {
+-                web_sys::console::error_1(&format!("Member {}:{} not found", cast_lib, cast_member).into());
++                crate::web_console!(error_1, &format!("Member {}:{} not found", cast_lib, cast_member).into());
+                 return;
+             }
+         };
+         let w3d = match member.member_type.as_shockwave3d() {
+             Some(w) => w,
+             None => {
+-                web_sys::console::error_1(&"Not a Shockwave3D member".into());
++                crate::web_console!(error_1, &"Not a Shockwave3D member".into());
+                 return;
+             }
+         };
+         let scene = match &w3d.parsed_scene {
+             Some(s) => s,
+             None => {
+-                web_sys::console::error_1(&"No parsed 3D scene".into());
++                crate::web_console!(error_1, &"No parsed 3D scene".into());
+                 return;
+             }
+         };
+diff --git a/vm-rust/src/player/bitmap/bitmap.rs b/vm-rust/src/player/bitmap/bitmap.rs
+index f1191b9..7233759 100644
+--- a/vm-rust/src/player/bitmap/bitmap.rs
++++ b/vm-rust/src/player/bitmap/bitmap.rs
+@@ -46,7 +46,7 @@ impl PaletteRef {
+             match BuiltInPalette::from_i16(i) {
+                 Some(palette) => PaletteRef::BuiltIn(palette),
+                 None => {
+-                    web_sys::console::warn_1(
++                    crate::web_console!(warn_1, 
+                         &format!("Unknown built-in palette ID: {}, defaulting to SystemWin", i).into()
+                     );
+                     PaletteRef::BuiltIn(BuiltInPalette::SystemWin)
+@@ -902,7 +902,7 @@ pub fn decompress_bitmap(
+                         // Check bounds
+                         if line_offset + x + 3 * scan_width as usize >= result.len() {
+                             if !oob_warned {
+-                                web_sys::console::warn_1(&format!(
++                                crate::web_console!(warn_1, &format!(
+                                     "32-bit decode: Out of bounds at y={}, x={}. line_offset={}, result.len()={} (further warnings suppressed)",
+                                     y, x, line_offset, result.len()
+                                 ).into());
+diff --git a/vm-rust/src/player/bytecode/string.rs b/vm-rust/src/player/bytecode/string.rs
+index 7b6a277..70b2b65 100644
+--- a/vm-rust/src/player/bytecode/string.rs
++++ b/vm-rust/src/player/bytecode/string.rs
+@@ -585,7 +585,7 @@ impl StringBytecodeHandler {
+                 Ok(r) => r,
+                 Err(err) => {
+                     if var_type == 0x6 {
+-                        web_sys::console::warn_1(&format!(
++                        crate::web_console!(warn_1, &format!(
+                             "putchunk: field lookup failed (ignored): {}", err.message
+                         ).into());
+                         return Ok(HandlerExecutionResult::Advance);
+@@ -625,7 +625,7 @@ impl StringBytecodeHandler {
+             // For field variables, silently ignore set failures too
+             if let Err(err) = set_result {
+                 if var_type == 0x6 {
+-                    web_sys::console::warn_1(&format!(
++                    crate::web_console!(warn_1, &format!(
+                         "putchunk: field set failed (ignored): {}", err.message
+                     ).into());
+                     return Ok(HandlerExecutionResult::Advance);
+diff --git a/vm-rust/src/player/cast_member.rs b/vm-rust/src/player/cast_member.rs
+index 5364456..868786e 100644
+--- a/vm-rust/src/player/cast_member.rs
++++ b/vm-rust/src/player/cast_member.rs
+@@ -4421,7 +4421,7 @@ impl CastMember {
+         let payload = &raw[flsh_start + 8..];
+         let vector_member = Self::parse_flsh_payload(payload);
+ 
+-        web_sys::console::log_1(
++        crate::web_console!(log_1, 
+             &format!(
+                 "OLE member #{} identified as vectorShape: {} vertices, strokeWidth={}, fillMode={}, closed={}, bbox=({},{},{},{})",
+                 number,
+@@ -5646,7 +5646,7 @@ impl CastMember {
+                         name: member_info.name.clone(),
+                     })
+                 } else {
+-                    web_sys::console::warn_1(&format!("Script member {}: script_id {} not found in Lctx, skipping", number, script_id).into());
++                    crate::web_console!(warn_1, &format!("Script member {}: script_id {} not found in Lctx, skipping", number, script_id).into());
+                     CastMemberType::Unknown
+                 }
+             }
+@@ -5846,7 +5846,7 @@ impl CastMember {
+                                 Some(std::rc::Rc::new(scene))
+                             }
+                             Err(e) => {
+-                                web_sys::console::error_1(&format!("W3D parse error: {}", e).into());
++                                crate::web_console!(error_1, &format!("W3D parse error: {}", e).into());
+                                 Some(std::rc::Rc::new(Self::create_empty_w3d_scene()))
+                             }
+                         }
+diff --git a/vm-rust/src/player/eval.rs b/vm-rust/src/player/eval.rs
+index 9d1fa62..596427a 100644
+--- a/vm-rust/src/player/eval.rs
++++ b/vm-rust/src/player/eval.rs
+@@ -2592,7 +2592,7 @@ pub fn eval_lingo_expr_static(expr: String) -> Result<DatumRef, ScriptError> {
+         Err(e) => {
+             let error_msg = format!("eval_lingo_expr_static parse error: {}", ascii_safe(&e.to_string()));
+             error!("{}", error_msg);
+-            web_sys::console::error_1(&error_msg.clone().into());
++            crate::web_console!(error_1, &error_msg.clone().into());
+             Err(ScriptError::new(error_msg))
+         }
+     }
+diff --git a/vm-rust/src/player/events.rs b/vm-rust/src/player/events.rs
+index 5acf223..ad40455 100644
+--- a/vm-rust/src/player/events.rs
++++ b/vm-rust/src/player/events.rs
+@@ -243,7 +243,7 @@ pub async fn player_invoke_event_to_instances(
+                     // Dump bytecode execution history before the error
+                     crate::player::bytecode::handler_manager::dump_execution_history_on_error(&err.message);
+                     // Log the error to console
+-                    web_sys::console::error_1(
++                    crate::web_console!(error_1, 
+                         &format!("⚠ Error in handler '{}': {}", handler_name, err.message).into()
+                     );
+                     // Report to player's error handler
+@@ -1628,7 +1628,7 @@ pub async fn player_dispatch_event_beginsprite(
+                 });
+                 return Ok(vec![]);
+             }
+-            web_sys::console::error_1(
++            crate::web_console!(error_1, 
+                 &format!("Error in {} for sprite {}: {}", handler_name, sprite_number, err.message).into()
+             );
+             reserve_player_mut(|player| {
+@@ -1718,7 +1718,7 @@ pub async fn dispatch_event_endsprite_for_score(score_ref: ScoreRef, sprite_nums
+                 if err.code == ScriptErrorCode::Abort {
+                     break;
+                 }
+-                web_sys::console::error_1(
++                crate::web_console!(error_1, 
+                     &format!("Error in endSprite for sprite {}: {}", sprite_num, err.message).into()
+                 );
+                 reserve_player_mut(|player| {
+@@ -1975,7 +1975,7 @@ pub async fn dispatch_event_to_all_behaviors(
+                     });
+                     return;
+                 }
+-                web_sys::console::error_1(
++                crate::web_console!(error_1, 
+                     &format!(
+                         "Error in {} for sprite {} member script: {}",
+                         handler_name, sprite_number, err.message
+diff --git a/vm-rust/src/player/font/mod.rs b/vm-rust/src/player/font/mod.rs
+index 081e092..af35b42 100644
+--- a/vm-rust/src/player/font/mod.rs
++++ b/vm-rust/src/player/font/mod.rs
+@@ -539,7 +539,7 @@ impl FontManager {
+         // 2. Extract font metrics from FontInfo
+         // 3. Create or reference a BitmapFont
+ 
+-        web_sys::console::log_1(
++        crate::web_console!(log_1, 
+             &format!(
+                 "FontManager: Attempted to load font '{}' - not implemented yet",
+                 font_name
+@@ -585,7 +585,7 @@ impl FontManager {
+                     let style_matches = style.is_none() || style == Some(font_data.font_info.style);
+ 
+                     if name_matches && size_matches && style_matches {
+-                        web_sys::console::log_1(
++                        crate::web_console!(log_1, 
+                             &format!(
+                                 "Found matching font: member.name='{}', font_info.name='{}'",
+                                 member.name, font_data.font_info.name
+@@ -595,7 +595,7 @@ impl FontManager {
+ 
+                         // Check if this font has a bitmap_ref from PFR parsing
+                         if let Some(bitmap_ref) = font_data.bitmap_ref {
+-                            web_sys::console::log_1(
++                            crate::web_console!(log_1, 
+                                 &format!("Found PFR font with bitmap_ref: {}", bitmap_ref)
+                                     .into(),
+                             );
+@@ -621,7 +621,7 @@ impl FontManager {
+                             let rc_font = Rc::new(font);
+ 
+                             // Cache under ALL name variations
+-                            web_sys::console::log_1(
++                            crate::web_console!(log_1, 
+                                 &format!(
+                                     "Caching font as: '{}', '{}', '{}'",
+                                     cache_key, font_name, member.name
+diff --git a/vm-rust/src/player/handlers/datum_handlers/cast_member/font.rs b/vm-rust/src/player/handlers/datum_handlers/cast_member/font.rs
+index f9c56e3..ca3b3ac 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/cast_member/font.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/cast_member/font.rs
+@@ -2437,7 +2437,7 @@ impl FontMemberHandlers {
+                             })?
+                         };
+ 
+-                        web_sys::console::log_1(
++                        crate::web_console!(log_1, 
+                             &format!(
+                                 "Using font: '{}' (size: {}, char_width: {}, char_height: {})",
+                                 font.font_name, font.font_size, font.char_width, font.char_height
+diff --git a/vm-rust/src/player/handlers/datum_handlers/mod.rs b/vm-rust/src/player/handlers/datum_handlers/mod.rs
+index f0e7ac1..bed0bd6 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/mod.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/mod.rs
+@@ -75,7 +75,7 @@ pub async fn player_call_datum_handler(
+     if handler_name == BuiltInSymbol::GetPropertyDescriptionList {
+         let should_skip = reserve_player_mut(|player| {
+             if player.is_getting_property_descriptions {
+-                web_sys::console::warn_1(&"BLOCKED recursive getPropertyDescriptionList".into());
++                crate::web_console!(warn_1, &"BLOCKED recursive getPropertyDescriptionList".into());
+                 true
+             } else {
+                 player.is_getting_property_descriptions = true;
+@@ -90,7 +90,7 @@ pub async fn player_call_datum_handler(
+             });
+             
+             // Return empty property list
+-            web_sys::console::warn_1(&"Returning empty property list to prevent recursion".into());
++            crate::web_console!(warn_1, &"Returning empty property list to prevent recursion".into());
+             return reserve_player_mut(|player| {
+                 Ok(player.alloc_datum(crate::director::lingo::datum::Datum::PropList(VecDeque::new(), false)))
+             });
 diff --git a/vm-rust/src/player/handlers/datum_handlers/sound_channel.rs b/vm-rust/src/player/handlers/datum_handlers/sound_channel.rs
-index 9ae62c7..ca40a1b 100644
+index 9ae62c7..d1e3add 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/sound_channel.rs
 +++ b/vm-rust/src/player/handlers/datum_handlers/sound_channel.rs
-@@ -1613,6 +1613,10 @@ impl SoundChannel {
+@@ -1172,6 +1172,10 @@ pub struct SoundChannel {
+     /// fall before `start_time`, so a `[#startTime: N]` seek doesn't
+     /// re-fire cues already behind the playhead).
+     pub next_cue_index: usize,
++
++    /// PS5_RUFFLE_DIRPLAYER_NATIVE: what plays this channel off the web (no AudioContext).
++    #[cfg(not(target_arch = "wasm32"))]
++    pub native_voice: Option<std::sync::Arc<crate::player::native_audio::Voice>>,
+ }
+ 
+ impl SoundChannel {
+@@ -1447,6 +1451,8 @@ impl SoundChannel {
+             decode_generation: Rc::new(RefCell::new(0)),
+             playback_start_context_time: 0.0,
+             next_cue_index: 0,
++            #[cfg(not(target_arch = "wasm32"))]
++            native_voice: None,
+         }
+     }
+ 
+@@ -1613,6 +1619,10 @@ impl SoundChannel {
          member_ref: DatumRef,
          loop_count: i32,
      ) -> Result<(), JsValue> {
@@ -13,18 +394,111 @@ index 9ae62c7..ca40a1b 100644
          let player_opt = unsafe { crate::PLAYER_OPT.as_ref() };
          let player = player_opt.ok_or_else(|| JsValue::from_str("Player not initialized"))?;
  
-@@ -1822,6 +1826,10 @@ impl SoundChannel {
+@@ -1822,6 +1832,15 @@ impl SoundChannel {
      }
  
      pub fn start_sound(self_rc: Rc<RefCell<Self>>, member_ref: DatumRef) {
-+        // PS5_RUFFLE_DIRPLAYER_NATIVE: no AudioContext off the web (native build): stay silent.
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: no AudioContext off the web: the native mixer plays it.
++        #[cfg(not(target_arch = "wasm32"))]
++        if self_rc.borrow().audio_context.is_none() {
++            return Self::start_sound_native(self_rc, member_ref);
++        }
++        #[cfg(target_arch = "wasm32")]
 +        if self_rc.borrow().audio_context.is_none() {
 +            return;
 +        }
          let (channel_num, audio_context, loop_count) = {
              let mut this = self_rc.borrow_mut();
              
-@@ -2281,6 +2289,10 @@ impl SoundChannel {
+@@ -2217,6 +2236,87 @@ impl SoundChannel {
+         }
+     }
+ 
++    /// PS5_RUFFLE_DIRPLAYER_NATIVE — `start_sound` without Web Audio: the member's samples (MP3
++    /// decoded with Symphonia) go to a [`native_audio::Voice`]; `update` reports its end the way
++    /// the Web Audio `ended` callback does (status Idle, then `start_next_segment`).
++    #[cfg(not(target_arch = "wasm32"))]
++    fn start_sound_native(self_rc: Rc<RefCell<Self>>, member_ref: DatumRef) {
++        use crate::player::native_audio;
++        let loop_count = {
++            let mut this = self_rc.borrow_mut();
++            if let Some(voice) = this.native_voice.take() {
++                voice.stop();
++            }
++            this.status = SoundStatus::Idle;
++            this.loop_count
++        };
++        let player_opt = unsafe {
++            if crate::player::ACTIVE_PLAYER_ID == 0 {
++                crate::PLAYER_OPT.as_mut()
++            } else {
++                crate::player::NESTED_PLAYERS
++                    .get_mut(crate::player::ACTIVE_PLAYER_ID - 1)
++                    .and_then(|o| o.as_mut())
++            }
++        };
++        let Some(player) = player_opt else { return };
++        let datum = player.get_datum(&member_ref);
++        let Some(sound_member) = Self::resolve_sound_member(player, &datum) else {
++            error!("start_sound: no sound member to play (datum type: {})", datum.type_str());
++            return;
++        };
++        let audio = match Self::load_director_audio_data(
++            &sound_member.sound.data(),
++            sound_member.info.channels,
++            sound_member.info.sample_rate,
++            sound_member.info.sample_size,
++            &sound_member.sound.codec(),
++            Some(sound_member.info.sample_count),
++            sound_member.sound.big_endian_data(),
++        ) {
++            Ok(a) => a,
++            Err(e) => {
++                error!("start_sound: cannot load the sound: {}", e);
++                return;
++            }
++        };
++        let (samples, rate, channels) = match &audio.compressed_data {
++            Some(mp3) => match native_audio::decode_mp3_cached(mp3) {
++                Some(decoded) => decoded,
++                None => {
++                    error!("start_sound: MP3 data that does not decode ({} bytes)", mp3.len());
++                    return;
++                }
++            },
++            None => (std::sync::Arc::new(audio.samples), audio.sample_rate, audio.num_channels),
++        };
++        let mut this = self_rc.borrow_mut();
++        let voice = native_audio::Voice::new(
++            samples,
++            channels,
++            rate,
++            loop_count == 0,
++            (this.volume / 255.0) as f32,
++            (this.pan / 100.0) as f32,
++        );
++        native_audio::start(&voice);
++        this.native_voice = Some(voice);
++        this.expected_sample_rate = Some(sound_member.info.sample_rate);
++        this.sample_rate = sound_member.info.sample_rate;
++        this.sample_count = sound_member.info.sample_count;
++        this.channel_count = sound_member.info.channels;
++        this.status = SoundStatus::Playing;
++        this.playback_start_context_time = 0.0;
++        this.elapsed_time = 0.0;
++        let seek_ms = this.start_time as i64;
++        this.next_cue_index = sound_member
++            .cue_point_times
++            .iter()
++            .position(|t| (*t as i64) >= seek_ms)
++            .unwrap_or(sound_member.cue_point_times.len());
++        this.sound_member = Some(sound_member);
++    }
++
+     /// Helper: resample an AudioBuffer to `target_rate` using OfflineAudioContext.
+     /// Returns the rendered AudioBuffer at the new sample rate.
+     async fn resample_audio_buffer(
+@@ -2281,6 +2381,10 @@ impl SoundChannel {
          mp3_bytes: Vec<u8>,
          sound_member: SoundMember,
      ) -> Result<(), JsValue> {
@@ -35,7 +509,40 @@ index 9ae62c7..ca40a1b 100644
          // Guard: prevent re-entrant decode/play
          {
              let ch = self_rc.borrow();
-@@ -3333,6 +3345,10 @@ impl SoundChannel {
+@@ -2698,6 +2802,10 @@ impl SoundChannel {
+     }
+ 
+     pub fn stop(&mut self) {
++        #[cfg(not(target_arch = "wasm32"))]
++        if let Some(voice) = self.native_voice.take() {
++            voice.stop();
++        }
+         self.status = SoundStatus::Idle;
+         self.elapsed_time = 0.0;
+         self.loops_remaining = 0;
+@@ -2721,6 +2829,10 @@ impl SoundChannel {
+     pub fn pause(&mut self) {
+         if self.status == SoundStatus::Playing {
+             self.status = SoundStatus::Paused;
++            #[cfg(not(target_arch = "wasm32"))]
++            if let Some(ref voice) = self.native_voice {
++                voice.set_paused(true);
++            }
+ 
+             if let Some(ref source) = self.source_node {
+                 // Suspend the audio context — stops all nodes temporarily
+@@ -2735,6 +2847,10 @@ impl SoundChannel {
+     pub fn resume(&mut self) {
+         if self.status == SoundStatus::Paused {
+             self.status = SoundStatus::Playing;
++            #[cfg(not(target_arch = "wasm32"))]
++            if let Some(ref voice) = self.native_voice {
++                voice.set_paused(false);
++            }
+             // Don't reset playback_start_context_time on resume - original start is still valid
+ 
+             if let Some(ref source) = self.source_node {
+@@ -3333,6 +3449,10 @@ impl SoundChannel {
  
      /// Integrated MP3 playback in your sound channel
      pub async fn play_mp3_via_web_audio(&mut self, mp3_bytes: &[u8]) -> Result<(), JsValue> {
@@ -46,7 +553,56 @@ index 9ae62c7..ca40a1b 100644
          debug!("🎵 Starting MP3 playback via Web Audio");
  
          // Step 1: Decode MP3 to AudioBuffer
-@@ -3866,6 +3882,10 @@ impl SoundChannel {
+@@ -3769,6 +3889,22 @@ impl SoundChannel {
+     pub fn update(&mut self, delta_time: f64, player: &mut DirPlayer) -> Result<(), ScriptError> {
+         self.step_fade(delta_time);
+ 
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: a native voice that reached its end is what the Web Audio
++        // `ended` callback reports on the web.
++        #[cfg(not(target_arch = "wasm32"))]
++        if let Some(voice) = self.native_voice.clone() {
++            voice.set_paused(self.status == SoundStatus::Paused);
++            if voice.is_finished() && self.status == SoundStatus::Playing {
++                self.native_voice = None;
++                self.status = SoundStatus::Idle;
++                self.start_next_segment();
++                return Ok(());
++            }
++            if self.status == SoundStatus::Playing {
++                self.elapsed_time = voice.position_secs();
++            }
++        }
++
+         // ⭐ Remove the playback advancement logic - it's handled by onended callback now
+         // Audio plays asynchronously in Web Audio thread
+         // When it finishes, onended → handle_end_of_sound → start_next_segment
+@@ -3777,7 +3913,13 @@ impl SoundChannel {
+             return Ok(());
+         }
+ 
+-        self.elapsed_time += delta_time;
++        #[cfg(not(target_arch = "wasm32"))]
++        let native_clock = self.native_voice.is_some();
++        #[cfg(target_arch = "wasm32")]
++        let native_clock = false;
++        if !native_clock {
++            self.elapsed_time += delta_time;
++        }
+ 
+         // Fire any cue points the playhead has just crossed. Playhead is
+         // measured against the audio-context clock for accuracy (matches
+@@ -3830,6 +3972,10 @@ impl SoundChannel {
+         // Set status to Idle FIRST, before stopping the source
+         // This prevents the onended callback from calling start_next_segment
+         self.status = SoundStatus::Idle;
++        #[cfg(not(target_arch = "wasm32"))]
++        if let Some(voice) = self.native_voice.take() {
++            voice.stop();
++        }
+ 
+         // Bump the generation BEFORE we trigger source.stop_with_when —
+         // the resulting `ended` event will fire async, and by then a
+@@ -3866,6 +4012,10 @@ impl SoundChannel {
          sound_member: &SoundMember,
          _loop_count: i32,
      ) -> Result<(), ScriptError> {
@@ -57,7 +613,7 @@ index 9ae62c7..ca40a1b 100644
          self.sound_member = Some(sound_member.clone());
          self.sample_rate = sound_member.info.sample_rate;
          self.sample_count = sound_member.info.sample_count;
-@@ -4059,6 +4079,10 @@ impl SoundChannel {
+@@ -4059,6 +4209,10 @@ impl SoundChannel {
          num_channels: u32,
          sample_rate: f64,
      ) -> Result<(), JsValue> {
@@ -68,7 +624,7 @@ index 9ae62c7..ca40a1b 100644
          debug!(
                  "🎵 play_castmember: {} frames @ {}Hz",
                  samples.len() / num_channels as usize,
-@@ -4151,6 +4175,10 @@ impl SoundChannel {
+@@ -4151,6 +4305,10 @@ impl SoundChannel {
  
      pub async fn play_sound(&mut self, audio_data: &AudioData) -> Result<(), JsValue> {
          use web_sys::{Blob, HtmlAudioElement, Url};
@@ -79,3 +635,899 @@ index 9ae62c7..ca40a1b 100644
  
          debug!("🎵 play_sound() called");
  
+@@ -4205,6 +4363,10 @@ impl SoundChannel {
+ 
+     pub fn set_volume(&mut self, volume: f64) -> Result<(), JsValue> {
+         self.volume = volume.clamp(0.0, 255.0);
++        #[cfg(not(target_arch = "wasm32"))]
++        if let Some(ref voice) = self.native_voice {
++            voice.set_volume((self.volume / 255.0) as f32);
++        }
+         if let Some(ref gain) = self.gain_node {
+             gain.gain().set_value((self.volume / 255.0) as f32);
+         }
+@@ -4213,6 +4375,10 @@ impl SoundChannel {
+ 
+     pub fn set_pan(&mut self, pan: f64) -> Result<(), JsValue> {
+         let clamped = pan.clamp(-1.0, 1.0);
++        #[cfg(not(target_arch = "wasm32"))]
++        if let Some(ref voice) = self.native_voice {
++            voice.set_pan(clamped as f32);
++        }
+ 
+         if let Some(ref pan_node) = self.pan_node {
+             let _ = pan_node.pan().set_value(clamped as f32);
+diff --git a/vm-rust/src/player/handlers/datum_handlers/xml.rs b/vm-rust/src/player/handlers/datum_handlers/xml.rs
+index 7e0d99c..9c8b302 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/xml.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/xml.rs
+@@ -511,7 +511,7 @@ impl XmlDatumHandlers {
+                 }
+             };
+ 
+-            web_sys::console::log_1(
++            crate::web_console!(log_1, 
+                 &format!(
+                     "🔧 XML.parseXML called with {} characters",
+                     xml_string.len()
+@@ -524,7 +524,7 @@ impl XmlDatumHandlers {
+             let mut parser = XmlParser::new(player.next_xml_id);
+             let (root_id, nodes) = parser.parse_xml_content(&xml_string)?;
+ 
+-            web_sys::console::log_1(
++            crate::web_console!(log_1, 
+                 &format!(
+                     "🔧 Parsing complete. root_id={:?}, parsed {} nodes",
+                     root_id,
+@@ -545,7 +545,7 @@ impl XmlDatumHandlers {
+             if let Some(parser_doc) = player.xml_documents.get_mut(&parser_id) {
+                 parser_doc.root_element = root_id;
+                 parser_doc.content = xml_string;
+-                web_sys::console::log_1(
++                crate::web_console!(log_1, 
+                     &format!(
+                         "🔧 Updated parser object {} with root_element={:?}",
+                         parser_id, root_id
+@@ -561,7 +561,7 @@ impl XmlDatumHandlers {
+                     ignore_white: false,
+                 };
+                 player.xml_documents.insert(parser_id, xml_doc);
+-                web_sys::console::log_1(
++                crate::web_console!(log_1, 
+                     &format!(
+                         "🔧 Created document for parser object {} with root_element={:?}",
+                         parser_id, root_id
+@@ -606,7 +606,7 @@ impl XmlDatumHandlers {
+                 }
+             };
+ 
+-            web_sys::console::log_1(
++            crate::web_console!(log_1, 
+                 &format!(
+                     "🔧 createElement('{}') called on doc {}",
+                     element_name, doc_id
+@@ -630,7 +630,7 @@ impl XmlDatumHandlers {
+ 
+             player.xml_nodes.insert(element_id, element_node);
+ 
+-            web_sys::console::log_1(
++            crate::web_console!(log_1, 
+                 &format!(
+                     "🔧 Created element '{}' with ID {}",
+                     element_name, element_id
+@@ -676,7 +676,7 @@ impl XmlDatumHandlers {
+             if let Some(doc) = player.xml_documents.get_mut(&parent_id) {
+                 // Appending to document - set as root element
+                 doc.root_element = Some(child_id);
+-                web_sys::console::log_1(
++                crate::web_console!(log_1, 
+                     &format!(
+                         "🔧 Set child {} as root of document {}",
+                         child_id, parent_id
+@@ -720,7 +720,7 @@ impl XmlDatumHandlers {
+         let mut parser = XmlParser::new(player.next_xml_id);
+         let (root_id, nodes) = parser.parse_xml_content(&content)?;
+ 
+-        web_sys::console::log_1(
++        crate::web_console!(log_1, 
+             &format!(
+                 "🔧 Parsing complete. root_id={:?}, parsed {} nodes",
+                 root_id,
+@@ -745,7 +745,7 @@ impl XmlDatumHandlers {
+             ignore_white: false,
+         };
+ 
+-        web_sys::console::log_1(
++        crate::web_console!(log_1, 
+             &format!(
+                 "🔧 Storing document {} with root_element={:?}",
+                 doc_id, root_id
+@@ -906,18 +906,18 @@ impl XmlDatumHandlers {
+                         warn!("🔧 Node has no accessible children");
+                     }
+                 } else {
+-                    web_sys::console::log_1(
++                    crate::web_console!(log_1, 
+                         &format!("🔧 ⚠️ xml_id {} is neither a document nor a node!", xml_id)
+                             .into(),
+                     );
+-                    web_sys::console::log_1(
++                    crate::web_console!(log_1, 
+                         &format!(
+                             "🔧 Documents in storage: {:?}",
+                             player.xml_documents.keys().collect::<Vec<_>>()
+                         )
+                         .into(),
+                     );
+-                    web_sys::console::log_1(
++                    crate::web_console!(log_1, 
+                         &format!(
+                             "🔧 Nodes in storage: {:?}",
+                             player.xml_nodes.keys().collect::<Vec<_>>()
+@@ -970,7 +970,7 @@ impl XmlDatumHandlers {
+                 // If this is a document, return a list containing just the root element
+                 if let Some(doc) = player.xml_documents.get(&xml_id) {
+                     if let Some(root_id) = doc.root_element {
+-                        web_sys::console::log_1(
++                        crate::web_console!(log_1, 
+                             &format!(
+                                 "🔧 Document {}.childNodes returning root element {}",
+                                 xml_id, root_id
+diff --git a/vm-rust/src/player/handlers/movie.rs b/vm-rust/src/player/handlers/movie.rs
+index f5f820c..c1ed281 100644
+--- a/vm-rust/src/player/handlers/movie.rs
++++ b/vm-rust/src/player/handlers/movie.rs
+@@ -468,7 +468,7 @@ impl MovieHandlers {
+                 // Initialize behavior default properties
+                 for (behavior_ref, sprite_num) in &behaviors_to_init {
+                     if let Err(err) = Score::initialize_behavior_defaults_async(behavior_ref.clone(), *sprite_num).await {
+-                        web_sys::console::warn_1(
++                        crate::web_console!(warn_1, 
+                             &format!("Failed to initialize behavior defaults: {}", err.message).into()
+                         );
+                     }
+@@ -793,7 +793,7 @@ impl MovieHandlers {
+                     }
+                     Err(err) => {
+                         if err.code != ScriptErrorCode::Abort {
+-                            web_sys::console::warn_1(
++                            crate::web_console!(warn_1, 
+                                 &format!("⚠ sendSprite continuing after error in handler '{}': {}", message, err.message).into()
+                             );
+                         } else {
+@@ -860,7 +860,7 @@ impl MovieHandlers {
+                         }
+                     }
+                     Err(err) => {
+-                        web_sys::console::warn_1(
++                        crate::web_console!(warn_1, 
+                             &format!("⚠ sendAllSprites continuing after error in handler: {}", err.message).into()
+                         );
+                     }
+diff --git a/vm-rust/src/player/handlers/types.rs b/vm-rust/src/player/handlers/types.rs
+index ad5a8a0..98a5357 100644
+--- a/vm-rust/src/player/handlers/types.rs
++++ b/vm-rust/src/player/handlers/types.rs
+@@ -302,7 +302,7 @@ impl TypeUtils {
+             Datum::Void => player.alloc_datum(Datum::Void),
+             _ => {
+                 let formatted_key = format_datum(prop_key_ref, player);
+-                web_sys::console::log_1(
++                crate::web_console!(log_1, 
+                     &format!(
+                         "  ❌ Cannot get sub-prop '{}' from type {}",
+                         formatted_key,
+diff --git a/vm-rust/src/player/mod.rs b/vm-rust/src/player/mod.rs
+index 8fef74e..846ffb5 100644
+--- a/vm-rust/src/player/mod.rs
++++ b/vm-rust/src/player/mod.rs
+@@ -54,6 +54,11 @@ pub mod console;
+ pub mod testing_shared;
+ #[cfg(not(target_arch = "wasm32"))]
+ pub mod testing;
++// PS5_RUFFLE_DIRPLAYER_NATIVE: DirPlayer embedded in a native program (Ruffle5), and its sound.
++#[cfg(not(target_arch = "wasm32"))]
++pub mod native;
++#[cfg(not(target_arch = "wasm32"))]
++pub mod native_audio;
+ #[cfg(target_arch = "wasm32")]
+ pub mod testing_browser;
+ pub mod symbols;
+@@ -2847,7 +2852,7 @@ impl DirPlayer {
+         match builtin_prop {
+             BuiltInSymbol::DatumStats => {
+                 let stats = self.allocator.datum_type_stats();
+-                web_sys::console::log_1(&stats.clone().into());
++                crate::web_console!(log_1, &stats.clone().into());
+                 Ok(self.alloc_datum(Datum::String(stats)))
+             },
+             BuiltInSymbol::DatumSnapshot => {
+@@ -2857,7 +2862,7 @@ impl DirPlayer {
+             },
+             BuiltInSymbol::DatumLeakScan => {
+                 let stats = self.datum_leak_scan();
+-                web_sys::console::log_1(&stats.clone().into());
++                crate::web_console!(log_1, &stats.clone().into());
+                 Ok(self.alloc_datum(Datum::String(stats)))
+             },
+             BuiltInSymbol::SystemDate => {
+@@ -3783,7 +3788,7 @@ impl DirPlayer {
+             stack_trace.push_str(&self.format_scope_stack(5, 25));
+             stack_trace.push_str("\nThis usually indicates a bug in the Director movie's scripts (e.g., a handler calling itself infinitely).\n");
+             stack_trace.push_str("Note: If this is happening during frame events, it may be a re-entrant call issue.\n");
+-            web_sys::console::error_1(&stack_trace.into());
++            crate::web_console!(error_1, &stack_trace.into());
+             panic!("Stack overflow - infinite recursion in Lingo scripts");
+         }
+         let scope_ref = self.scope_count;
+@@ -5445,7 +5450,7 @@ async fn run_movie_init_sequence() {
+     dispatch_system_event_to_timeouts(BuiltInSymbol::PrepareMovie, &vec![]).await;
+ 
+     if let Err(err) = player_invoke_global_event(Symbol::builtin(BuiltInSymbol::PrepareMovie), &vec![]).await {
+-        web_sys::console::error_1(&format!("prepareMovie FAILED: {}", err.message).into());
++        crate::web_console!(error_1, &format!("prepareMovie FAILED: {}", err.message).into());
+         if err.code != ScriptErrorCode::Abort {
+             reserve_player_mut(|player| player.on_script_error(&err));
+         }
+diff --git a/vm-rust/src/player/native.rs b/vm-rust/src/player/native.rs
+new file mode 100644
+index 0000000..3af20f3
+--- /dev/null
++++ b/vm-rust/src/player/native.rs
+@@ -0,0 +1,182 @@
++//! PS5_RUFFLE_DIRPLAYER_NATIVE — DirPlayer inside another program, without a browser.
++//!
++//! The web front end drives the VM from JavaScript: it loads the movie, runs the frame loop on
++//! `requestAnimationFrame`, forwards DOM input events and draws the stage on a canvas. Off the web
++//! the same jobs fall to the host — Ruffle5 on the PS5 — through [`NativePlayer`]: load a movie
++//! from a file (its external casts and linked movies are read from beside it, as `file:` URLs),
++//! run one score frame at a time, send keys and the mouse, and render the stage into an RGBA
++//! buffer the host shows however it likes. Sound goes to [`super::native_audio`], which the host's
++//! audio thread drains.
++//!
++//! Built on the same pieces as the native test harness (`testing.rs`), without its test-only
++//! parts (the global test lock, panicking on a missing file, sleeping between frames).
++//!
++//! The VM is one global instance (`PLAYER_OPT`): one `NativePlayer` at a time, and every call —
++//! including the async ones, which must be driven by [`block_on`] on the thread that made it —
++//! from one thread.
++// SPDX-License-Identifier: GPL-3.0-only
++
++use std::path::Path;
++
++use async_std::channel;
++
++use crate::director::file::read_director_file_bytes;
++use crate::player::{
++    bitmap::bitmap::{get_system_default_palette, Bitmap, PaletteRef},
++    commands::{run_player_command, PlayerVMCommand},
++    events::run_event_loop,
++    fire_pending_timeouts, reserve_player_mut, reserve_player_ref, run_movie_init_sequence,
++    run_single_frame, DirPlayer, PlayerVMExecutionItem, PLAYER_OPT,
++};
++use crate::rendering::render_stage_to_bitmap;
++
++/// Runs `f` to completion on this thread, with DirPlayer's task executor (the VM spawns its
++/// helper tasks onto the calling thread; they only make progress while something here awaits).
++pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
++    async_std::task::block_on(f)
++}
++
++pub struct NativePlayer {
++    _tx: channel::Sender<PlayerVMExecutionItem>,
++    stage: Option<Bitmap>,
++}
++
++impl NativePlayer {
++    /// Sets up the global VM. Call inside [`block_on`].
++    pub fn new() -> NativePlayer {
++        let (tx, _rx) = channel::unbounded();
++        let (event_tx, event_rx) = channel::unbounded();
++        unsafe {
++            crate::player::PLAYER_TX = Some(tx.clone());
++            crate::player::PLAYER_EVENT_TX = Some(event_tx.clone());
++            crate::player::xtra::multiuser::MULTIUSER_XTRA_MANAGER_OPT =
++                Some(crate::player::xtra::multiuser::MultiuserXtraManager::new());
++            crate::player::xtra::xmlparser::XMLPARSER_XTRA_MANAGER_OPT =
++                Some(crate::player::xtra::xmlparser::XmlParserXtraManager::new());
++            crate::player::xtra::curl::CURL_XTRA_MANAGER_OPT = Some(crate::player::xtra::curl::CurlXtraManager::new());
++            PLAYER_OPT = Some(DirPlayer::new(tx.clone()));
++        }
++        crate::player::spawn_player_local(async move {
++            run_event_loop(event_rx).await;
++        });
++        NativePlayer { _tx: tx, stage: None }
++    }
++
++    /// Loads the movie at `path` (a .dir, .dxr or .dcr); its casts and the movies it goes to are
++    /// looked up in the same folder.
++    pub async fn load(&mut self, path: &str) -> Result<(), String> {
++        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
++        let path = Path::new(path);
++        let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
++        let dir = path.parent().ok_or_else(|| format!("{}: no folder", path.display()))?;
++        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
++        let base_url = url::Url::from_directory_path(&dir)
++            .map_err(|_| format!("{}: not a usable folder", dir.display()))?
++            .to_string();
++        let dir_file = read_director_file_bytes(&bytes, &file_name, &base_url)?;
++        reserve_player_mut(|player| {
++            player.is_playing = true;
++            player.is_script_paused = false;
++        });
++        unsafe {
++            let player = crate::player::player_mut();
++            player.load_movie_from_dir(dir_file).await;
++        }
++        Ok(())
++    }
++
++    /// `externalParamValue(name)` for the movie, as an embedding page's `<param>` would set it.
++    /// Call before [`Self::init`].
++    pub fn set_external_param(&mut self, name: &str, value: &str) {
++        reserve_player_mut(|player| {
++            player.external_params.insert(name.to_string(), value.to_string());
++        });
++    }
++
++    /// Starts the movie (prepareMovie, startMovie, the first frame's scripts).
++    pub async fn init(&mut self) {
++        run_movie_init_sequence().await;
++    }
++
++    /// One score frame: due timeouts, then the frame's scripts and events. False once the movie
++    /// has stopped playing.
++    pub async fn frame(&mut self) -> bool {
++        fire_pending_timeouts().await;
++        let (is_playing, _) = run_single_frame().await;
++        is_playing
++    }
++
++    /// Frames per second the score asks for now (puppetTempo or the tempo channel); 0 if none.
++    pub fn tempo(&self) -> u32 {
++        reserve_player_ref(|player| player.movie.get_effective_tempo())
++    }
++
++    pub fn stage_size(&self) -> (u32, u32) {
++        reserve_player_ref(|player| (player.movie.rect.width().max(1) as u32, player.movie.rect.height().max(1) as u32))
++    }
++
++    pub fn current_frame(&self) -> u32 {
++        reserve_player_ref(|player| player.movie.current_frame)
++    }
++
++    /// Renders the stage; returns its RGBA pixels (`width * height * 4` bytes) and size.
++    pub fn render(&mut self) -> (&[u8], u32, u32) {
++        let (w, h) = self.stage_size();
++        let fits = self.stage.as_ref().is_some_and(|b| b.width as u32 == w && b.height as u32 == h);
++        if !fits {
++            self.stage = Some(Bitmap::new(w as u16, h as u16, 32, 32, 0, PaletteRef::BuiltIn(get_system_default_palette())));
++        }
++        let bitmap = self.stage.as_mut().unwrap();
++        reserve_player_mut(|player| render_stage_to_bitmap(player, bitmap, None));
++        (&bitmap.data[..], w, h)
++    }
++
++    /// A key went down. `key` and `code` as a browser's `KeyboardEvent` has them (`"ArrowLeft"`,
++    /// 37; `"a"`, 65; `" "`, 32; `"Enter"`, 13): the VM maps them to Director's.
++    pub async fn key_down(&mut self, key: &str, code: u16) {
++        reserve_player_mut(|player| player.keyboard_manager.key_down(key.to_string(), code));
++        let _ = run_player_command(PlayerVMCommand::KeyDown(key.to_string(), code)).await;
++    }
++
++    pub async fn key_up(&mut self, key: &str, code: u16) {
++        reserve_player_mut(|player| player.keyboard_manager.key_up(key, code));
++        let _ = run_player_command(PlayerVMCommand::KeyUp(key.to_string(), code)).await;
++    }
++
++    /// The mouse moved to `(x, y)` in stage pixels.
++    pub async fn mouse_move(&mut self, x: i32, y: i32) {
++        reserve_player_mut(|player| player.mouse_loc = (x, y));
++        let _ = run_player_command(PlayerVMCommand::MouseMove((x, y))).await;
++    }
++
++    pub async fn mouse_down(&mut self, x: i32, y: i32) {
++        reserve_player_mut(|player| {
++            player.mouse_loc = (x, y);
++            player.movie.mouse_down = true;
++        });
++        let _ = run_player_command(PlayerVMCommand::MouseDown((x, y))).await;
++    }
++
++    pub async fn mouse_up(&mut self, x: i32, y: i32) {
++        reserve_player_mut(|player| {
++            player.mouse_loc = (x, y);
++            player.movie.mouse_down = false;
++        });
++        let _ = run_player_command(PlayerVMCommand::MouseUp((x, y))).await;
++    }
++}
++
++impl Drop for NativePlayer {
++    fn drop(&mut self) {
++        crate::player::native_audio::stop_all();
++        unsafe {
++            // As the test harness does: the VM's globals hold references into the player, so it
++            // is leaked rather than dropped.
++            if let Some(player) = PLAYER_OPT.take() {
++                std::mem::forget(player);
++            }
++            crate::player::PLAYER_TX = None;
++            crate::player::PLAYER_EVENT_TX = None;
++        }
++    }
++}
+diff --git a/vm-rust/src/player/native_audio.rs b/vm-rust/src/player/native_audio.rs
+new file mode 100644
+index 0000000..fbf3183
+--- /dev/null
++++ b/vm-rust/src/player/native_audio.rs
+@@ -0,0 +1,265 @@
++//! PS5_RUFFLE_DIRPLAYER_NATIVE — sound without a browser.
++//!
++//! On the web every sound channel plays through Web Audio (an `AudioContext`, buffer sources,
++//! gain and panner nodes). Off the web — Ruffle5 on the PS5, the native tests — there is no
++//! `AudioContext`, so a channel hands its decoded samples to this mixer instead: one [`Voice`] per
++//! playing sound, mixed on demand into whatever buffer the host's audio thread asks for
++//! ([`mix`]). The channel keeps owning the playback *state* (status, loops, playlists, fades,
++//! cues); a voice only knows its samples, where it is, its volume and pan, and whether it has
++//! reached the end — which `SoundChannel::update` turns into the same "ended" the Web Audio
++//! callback reports.
++//!
++//! MP3 (Shockwave Audio, and MP3 cast members) is decoded with Symphonia, the decoder Ruffle
++//! uses; the web build hands those bytes to the browser's `decodeAudioData` instead.
++// SPDX-License-Identifier: GPL-3.0-only
++
++use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
++use std::sync::{Arc, Mutex};
++
++/// One playing sound: its samples (interleaved, `channels` per frame) and where it is.
++pub struct Voice {
++    samples: Arc<Vec<f32>>,
++    channels: usize,
++    frames: usize,
++    rate: f64,
++    looping: bool,
++    /// Playback position in source frames (an `f64`, stored as bits).
++    pos: AtomicU64,
++    /// Linear gain 0..1 and pan -1..1 (`f32` bits).
++    volume: AtomicU32,
++    pan: AtomicU32,
++    paused: AtomicBool,
++    stopped: AtomicBool,
++    finished: AtomicBool,
++}
++
++impl Voice {
++    /// `samples` interleaved with `channels` per frame (1 or 2 are mixed; more use the first two).
++    pub fn new(samples: Arc<Vec<f32>>, channels: u16, rate: u32, looping: bool, volume: f32, pan: f32) -> Arc<Voice> {
++        let channels = (channels.max(1)) as usize;
++        let frames = samples.len() / channels;
++        Arc::new(Voice {
++            samples,
++            channels,
++            frames,
++            rate: rate.max(1) as f64,
++            looping,
++            pos: AtomicU64::new(0f64.to_bits()),
++            volume: AtomicU32::new(volume.clamp(0.0, 1.0).to_bits()),
++            pan: AtomicU32::new(pan.clamp(-1.0, 1.0).to_bits()),
++            paused: AtomicBool::new(false),
++            stopped: AtomicBool::new(false),
++            finished: AtomicBool::new(frames == 0),
++        })
++    }
++
++    pub fn set_volume(&self, volume: f32) {
++        self.volume.store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
++    }
++
++    pub fn set_pan(&self, pan: f32) {
++        self.pan.store(pan.clamp(-1.0, 1.0).to_bits(), Ordering::Relaxed);
++    }
++
++    pub fn set_paused(&self, paused: bool) {
++        self.paused.store(paused, Ordering::Relaxed);
++    }
++
++    /// Silences the voice at once; the mixer drops it.
++    pub fn stop(&self) {
++        self.stopped.store(true, Ordering::Relaxed);
++    }
++
++    /// Played to its end (a looping voice never is).
++    pub fn is_finished(&self) -> bool {
++        self.finished.load(Ordering::Relaxed)
++    }
++
++    /// Seconds into the sound.
++    pub fn position_secs(&self) -> f64 {
++        f64::from_bits(self.pos.load(Ordering::Relaxed)) / self.rate
++    }
++
++    pub fn duration_secs(&self) -> f64 {
++        self.frames as f64 / self.rate
++    }
++
++    #[inline]
++    fn frame(&self, i: usize) -> (f32, f32) {
++        let base = i * self.channels;
++        let l = self.samples[base];
++        let r = if self.channels > 1 { self.samples[base + 1] } else { l };
++        (l, r)
++    }
++
++    /// Adds this voice into `out` (interleaved stereo) at `out_rate`.
++    fn mix_into(&self, out: &mut [f32], out_rate: f64) {
++        if self.paused.load(Ordering::Relaxed) || self.stopped.load(Ordering::Relaxed) || self.is_finished() {
++            return;
++        }
++        let volume = f32::from_bits(self.volume.load(Ordering::Relaxed));
++        let pan = f32::from_bits(self.pan.load(Ordering::Relaxed));
++        // Web Audio's StereoPannerNode on a stereo source keeps the near side and moves part of
++        // the far side across; for the mix here a linear balance is close enough.
++        let gl = volume * (1.0 - pan.max(0.0));
++        let gr = volume * (1.0 + pan.min(0.0));
++        let step = self.rate / out_rate;
++        let mut pos = f64::from_bits(self.pos.load(Ordering::Relaxed));
++        let frames = self.frames;
++        for o in out.chunks_exact_mut(2) {
++            if pos >= frames as f64 {
++                if self.looping && frames > 0 {
++                    pos %= frames as f64;
++                } else {
++                    self.finished.store(true, Ordering::Relaxed);
++                    break;
++                }
++            }
++            let i = pos as usize;
++            let t = (pos - i as f64) as f32;
++            let (l0, r0) = self.frame(i);
++            let next = if i + 1 < frames { i + 1 } else if self.looping { 0 } else { i };
++            let (l1, r1) = self.frame(next);
++            o[0] += (l0 + (l1 - l0) * t) * gl;
++            o[1] += (r0 + (r1 - r0) * t) * gr;
++            pos += step;
++        }
++        self.pos.store(pos.to_bits(), Ordering::Relaxed);
++    }
++}
++
++static VOICES: Mutex<Vec<Arc<Voice>>> = Mutex::new(Vec::new());
++
++/// Starts mixing `voice`.
++pub fn start(voice: &Arc<Voice>) {
++    if let Ok(mut voices) = VOICES.lock() {
++        voices.push(voice.clone());
++    }
++}
++
++/// Silences every voice (a movie ends, or the host leaves it).
++pub fn stop_all() {
++    if let Ok(mut voices) = VOICES.lock() {
++        for v in voices.iter() {
++            v.stop();
++        }
++        voices.clear();
++    }
++}
++
++/// How many voices are playing.
++pub fn playing() -> usize {
++    VOICES.lock().map(|v| v.len()).unwrap_or(0)
++}
++
++/// Adds every playing voice into `out`, interleaved stereo `f32` at `out_rate` Hz (the caller
++/// zeroes it first, and clamps when converting to integers). Voices that ended or were stopped are
++/// dropped here.
++pub fn mix(out: &mut [f32], out_rate: u32) {
++    let Ok(mut voices) = VOICES.lock() else { return };
++    voices.retain(|v| !v.stopped.load(Ordering::Relaxed) && !v.is_finished());
++    for v in voices.iter() {
++        v.mix_into(out, out_rate as f64);
++    }
++}
++
++type Decoded = (Arc<Vec<f32>>, u32, u16);
++
++/// [`decode_mp3`], remembering the last few results: a game plays the same punch or jingle many
++/// times, and decoding it again each time would cost a frame's worth of CPU for longer sounds.
++pub fn decode_mp3_cached(bytes: &[u8]) -> Option<Decoded> {
++    const KEEP: usize = 64;
++    static CACHE: Mutex<Vec<(u64, usize, Decoded)>> = Mutex::new(Vec::new());
++    // FNV-1a over the bytes: cheap next to decoding them.
++    let mut h: u64 = 0xcbf29ce484222325;
++    for b in bytes {
++        h = (h ^ *b as u64).wrapping_mul(0x100000001b3);
++    }
++    if let Ok(cache) = CACHE.lock() {
++        if let Some((_, _, d)) = cache.iter().find(|(k, len, _)| *k == h && *len == bytes.len()) {
++            return Some(d.clone());
++        }
++    }
++    let (samples, rate, channels) = decode_mp3(bytes)?;
++    let decoded: Decoded = (Arc::new(samples), rate, channels);
++    if let Ok(mut cache) = CACHE.lock() {
++        if cache.len() >= KEEP {
++            cache.remove(0);
++        }
++        cache.push((h, bytes.len(), decoded.clone()));
++    }
++    Some(decoded)
++}
++
++/// An MP3 stream (MPEG-1/2 layer III, as Shockwave Audio and MP3 members hold it) to samples:
++/// (interleaved f32, sample rate, channels). `None` if Symphonia finds no stream in it.
++pub fn decode_mp3(bytes: &[u8]) -> Option<(Vec<f32>, u32, u16)> {
++    use symphonia::core::{audio::SampleBuffer, errors::Error, formats::FormatReader, io};
++    use symphonia::default::formats::MpaReader;
++
++    let cursor = std::io::Cursor::new(bytes.to_vec());
++    let source = io::MediaSourceStream::new(Box::new(cursor) as Box<dyn io::MediaSource>, Default::default());
++    let mut reader = MpaReader::try_new(source, &Default::default()).ok()?;
++    let track = reader.default_track()?;
++    let params = track.codec_params.clone();
++    let mut decoder = symphonia::default::get_codecs().make(&params, &Default::default()).ok()?;
++    let mut rate = params.sample_rate.unwrap_or(0);
++    let mut channels = params.channels.map(|c| c.count() as u16).unwrap_or(0);
++    let mut out: Vec<f32> = Vec::new();
++    let mut buf: Option<SampleBuffer<f32>> = None;
++    loop {
++        let packet = match reader.next_packet() {
++            Ok(p) => p,
++            Err(_) => break,
++        };
++        match decoder.decode(&packet) {
++            Ok(decoded) => {
++                let spec = *decoded.spec();
++                rate = spec.rate;
++                channels = spec.channels.count() as u16;
++                let needed = decoded.capacity() as u64;
++                if buf.as_ref().map_or(true, |b| (b.capacity() as u64) < needed * spec.channels.count() as u64) {
++                    buf = Some(SampleBuffer::new(needed, spec));
++                }
++                let b = buf.as_mut().unwrap();
++                b.copy_interleaved_ref(decoded);
++                out.extend_from_slice(b.samples());
++            }
++            Err(Error::DecodeError(_)) => continue,
++            Err(_) => break,
++        }
++    }
++    if out.is_empty() || rate == 0 || channels == 0 {
++        return None;
++    }
++    Some((out, rate, channels))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_voice_plays_to_its_end_and_loops_when_asked() {
++        let once = Voice::new(Arc::new(vec![0.5; 100]), 1, 100, false, 1.0, 0.0);
++        let mut out = vec![0.0f32; 2 * 150];
++        once.mix_into(&mut out, 100.0);
++        assert!(once.is_finished());
++        assert_eq!(out[0], 0.5);
++        assert_eq!(out[2 * 120], 0.0);
++
++        let looping = Voice::new(Arc::new(vec![0.25; 10]), 1, 100, true, 1.0, 0.0);
++        let mut out = vec![0.0f32; 2 * 50];
++        looping.mix_into(&mut out, 100.0);
++        assert!(!looping.is_finished());
++        assert_eq!(out[2 * 45], 0.25);
++    }
++
++    #[test]
++    fn volume_and_pan_reach_the_mix() {
++        let v = Voice::new(Arc::new(vec![1.0; 10]), 1, 100, false, 0.5, 1.0);
++        let mut out = vec![0.0f32; 2 * 4];
++        v.mix_into(&mut out, 100.0);
++        assert_eq!((out[0], out[1]), (0.0, 0.5));
++    }
++}
+diff --git a/vm-rust/src/player/net_task.rs b/vm-rust/src/player/net_task.rs
+index e684a93..203ce57 100644
+--- a/vm-rust/src/player/net_task.rs
++++ b/vm-rust/src/player/net_task.rs
+@@ -85,6 +85,17 @@ pub async fn fetch_net_task(
+         task.id, task.url, resolved_url_str
+     );
+ 
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: no browser to fetch with off the web. A local file is read;
++    // anything else (a tracker, an ad server, a high-score page) fails as an unreachable host does.
++    #[cfg(not(target_arch = "wasm32"))]
++    {
++        let _ = &shared_state;
++        return match task.resolved_url.to_file_path() {
++            Ok(path) => std::fs::read(path).map_err(|_| -1),
++            Err(_) => Err(-1),
++        };
++    }
++
+     // Normal HTTP(S) fetch
+     // Note: file:// URLs are handled in preload_net_thing and never reach this function
+     let window = web_sys::window().unwrap();
+diff --git a/vm-rust/src/player/score.rs b/vm-rust/src/player/score.rs
+index 25330f7..7b5ebec 100644
+--- a/vm-rust/src/player/score.rs
++++ b/vm-rust/src/player/score.rs
+@@ -398,7 +398,7 @@ impl Score {
+                 Ok(result) => result,
+ 
+                 Err(e) => {
+-                    web_sys::console::error_1(
++                    crate::web_console!(error_1, 
+                         &format!("Failed to create script instance: {}", e.message).into(),
+                     );
+                     return None;
+@@ -1162,7 +1162,7 @@ impl Score {
+                     }
+ 
+                     _ => {
+-                        web_sys::console::error_1(&JsValue::from_str(&format!(
++                        crate::web_console!(error_1, &JsValue::from_str(&format!(
+                             "Unexpected color flag: {}",
+                             data.color_flag
+                         )));
+@@ -2435,7 +2435,7 @@ impl Score {
+                     match player.get_datum(&datum_ref) {
+                         Datum::ScriptInstanceRef(inst) => inst.clone(),
+                         _ => {
+-                            web_sys::console::error_1(&"Expected ScriptInstanceRef".into());
++                            crate::web_console!(error_1, &"Expected ScriptInstanceRef".into());
+                             panic!("Expected ScriptInstanceRef");
+                         }
+                     }
+@@ -2763,7 +2763,7 @@ impl Score {
+                 }
+ 
+                 _ => {
+-                    web_sys::console::error_1(&JsValue::from_str(&format!(
++                    crate::web_console!(error_1, &JsValue::from_str(&format!(
+                         "Unexpected color flag: {}",
+                         data.color_flag
+                     )));
+diff --git a/vm-rust/src/player/xtra/external.rs b/vm-rust/src/player/xtra/external.rs
+index 0011447..03ae620 100644
+--- a/vm-rust/src/player/xtra/external.rs
++++ b/vm-rust/src/player/xtra/external.rs
+@@ -462,7 +462,7 @@ pub fn host_call_dispatch(op_id: u32, args_bytes: &[u8]) -> Vec<u8> {
+         HostOp::Log => {
+             if let Some(XDatum::String(msg)) = args.first() {
+                 #[cfg(target_arch = "wasm32")]
+-                web_sys::console::log_1(&format!("[xtra] {}", msg).into());
++                crate::web_console!(log_1, &format!("[xtra] {}", msg).into());
+                 #[cfg(not(target_arch = "wasm32"))]
+                 log::info!("[xtra] {}", msg);
+             }
+diff --git a/vm-rust/src/player/xtra/multiuser/mod.rs b/vm-rust/src/player/xtra/multiuser/mod.rs
+index 9bc0ebe..6280faa 100644
+--- a/vm-rust/src/player/xtra/multiuser/mod.rs
++++ b/vm-rust/src/player/xtra/multiuser/mod.rs
+@@ -16,7 +16,7 @@ use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
+ // Use console::warn_1 directly for debugging since log level is set to Error
+ macro_rules! multiuser_log {
+     ($($arg:tt)*) => {
+-        web_sys::console::warn_1(&format!($($arg)*).into())
++        crate::web_console!(warn_1, &format!($($arg)*).into())
+     };
+ }
+ 
+diff --git a/vm-rust/src/player/xtra/sysmenu/mod.rs b/vm-rust/src/player/xtra/sysmenu/mod.rs
+index cfef474..2435607 100644
+--- a/vm-rust/src/player/xtra/sysmenu/mod.rs
++++ b/vm-rust/src/player/xtra/sysmenu/mod.rs
+@@ -224,7 +224,7 @@ fn use_dark_mode(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+ fn print_msg(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+     let message = string_arg(args, 0, "sysMenuPrintMsg")?;
+     let _ints: Vec<i32> = (1..args.len()).filter_map(|i| optional_int(args, i)).collect();
+-    web_sys::console::log_1(&format!("[SysMenu] {}", message).into());
++    crate::web_console!(log_1, &format!("[SysMenu] {}", message).into());
+     ok_int(1)
+ }
+ 
+diff --git a/vm-rust/src/rendering_gpu/webgl2/mod.rs b/vm-rust/src/rendering_gpu/webgl2/mod.rs
+index dffbb65..15d5fd1 100644
+--- a/vm-rust/src/rendering_gpu/webgl2/mod.rs
++++ b/vm-rust/src/rendering_gpu/webgl2/mod.rs
+@@ -5755,7 +5755,7 @@ impl WebGL2Renderer {
+         // Validate data size
+         let expected_size = (width * height * 4) as usize;
+         if rgba_data.len() != expected_size {
+-            web_sys::console::warn_1(
++            crate::web_console!(warn_1, 
+                 &format!(
+                     "WebGL2: RGBA data size mismatch for member {:?}: expected {}, got {}",
+                     member_ref, expected_size, rgba_data.len()
+@@ -6009,7 +6009,7 @@ impl WebGL2Renderer {
+                 lookup_method = "system_fallback";
+ 
+                 if DEBUG_WEBGL2_TEXT {
+-                    web_sys::console::warn_1(
++                    crate::web_console!(warn_1, 
+                         &format!(
+                             "WebGL2 text: font '{}' (id={:?}) not found, using system font. Available fonts: {:?}",
+                             font_name, font_id,
+@@ -6023,7 +6023,7 @@ impl WebGL2Renderer {
+ 
+             if DEBUG_WEBGL2_TEXT {
+                 if let Some(ref f) = result {
+-                    web_sys::console::log_1(
++                    crate::web_console!(log_1, 
+                         &format!("WebGL2 text: using font '{}' (lookup={}, pfr={}, size={}x{})",
+                             f.font_name, lookup_method, f.char_widths.is_some(),
+                             f.char_width, f.char_height).into()
+@@ -6037,7 +6037,7 @@ impl WebGL2Renderer {
+             Some(f) => f,
+             None => {
+                 // No font available - log warning and return None
+-                web_sys::console::warn_1(
++                crate::web_console!(warn_1, 
+                     &format!("WebGL2 render_text_to_texture: No font found for '{}' size {}", font_name, font_size).into()
+                 );
+                 return None;
+@@ -6073,7 +6073,7 @@ impl WebGL2Renderer {
+             Some(b) => b.clone(),
+             None => {
+                 // Font bitmap not found - log warning and return None
+-                web_sys::console::warn_1(
++                crate::web_console!(warn_1, 
+                     &format!("WebGL2 render_text_to_texture: Font bitmap {} not found", font.bitmap_ref).into()
+                 );
+                 return None;
+@@ -6350,7 +6350,7 @@ impl WebGL2Renderer {
+                 par_runs_for_native,
+                 overlay,
+             ) {
+-                web_sys::console::warn_1(
++                crate::web_console!(warn_1, 
+                     &format!("WebGL2 render_text_to_texture: Native text render error: {:?}", e).into()
+                 );
+             }
+diff --git a/vm-rust/src/utils.rs b/vm-rust/src/utils.rs
+index 4f5724c..aa9df60 100644
+--- a/vm-rust/src/utils.rs
++++ b/vm-rust/src/utils.rs
+@@ -16,16 +16,28 @@ pub fn set_panic_hook() {
+ 
+ pub fn log_i(value: &str) {
+     #[cfg(target_arch = "wasm32")]
+-    web_sys::console::log_1(&safe_js_string(value));
++    crate::web_console!(log_1, &safe_js_string(value));
+     #[cfg(not(target_arch = "wasm32"))]
+     log::debug!("{}", value);
+ }
+ 
++#[macro_export]
++macro_rules! web_console {
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: `web_sys::console::<f>(...)` on the web; nothing (the
++    // arguments are not even evaluated) off it, where calling into the browser panics.
++    ($f:ident, $($t:tt)*) => {{
++        #[cfg(target_arch = "wasm32")]
++        {
++            web_sys::console::$f($($t)*);
++        }
++    }};
++}
++
+ #[macro_export]
+ macro_rules! console_warn {
+   ($($arg:tt)*) => {{
+     #[cfg(target_arch = "wasm32")]
+-    web_sys::console::warn_1(&crate::js_api::safe_js_string(&format_args!($($arg)*).to_string().as_str()));
++    crate::web_console!(warn_1, &crate::js_api::safe_js_string(&format_args!($($arg)*).to_string().as_str()));
+     #[cfg(not(target_arch = "wasm32"))]
+     log::warn!("{}", format_args!($($arg)*));
+   }}
+@@ -35,7 +47,7 @@ macro_rules! console_warn {
+ macro_rules! console_error {
+   ($($arg:tt)*) => {{
+     #[cfg(target_arch = "wasm32")]
+-    web_sys::console::error_1(&crate::js_api::safe_js_string(&format_args!($($arg)*).to_string().as_str()));
++    crate::web_console!(error_1, &crate::js_api::safe_js_string(&format_args!($($arg)*).to_string().as_str()));
+     #[cfg(not(target_arch = "wasm32"))]
+     log::error!("{}", format_args!($($arg)*));
+   }}

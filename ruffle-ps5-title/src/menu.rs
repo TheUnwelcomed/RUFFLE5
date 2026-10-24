@@ -1,4 +1,4 @@
-//! PS5_RUFFLE_MENU_V2 — the screen the title opens on: pick a game, set its controls, change
+//! PS5_RUFFLE_MENU_V3 — the screen the title opens on: pick a game, set its controls, change
 //! settings, look at badges.
 //!
 //! The layout follows ProsperoStore's home screen (darkxex/BlackBearReloaded, GPL-3.0-or-later:
@@ -18,6 +18,10 @@
 //! its `ruffle5` folder: every `.swf`, and the first `.swf` in each sub-folder. A `<name>.png` beside
 //! the file (or `cover.png` / `icon.png` in the folder) is the picture, else a cover Ruffle5 took
 //! (/data/ruffle5/covers); without one, a tile gets a colour from its name and its initials.
+//!
+//! V3: Director / Shockwave games too (src/shockwave.rs): a `.dcr`, `.dir` or `.dxr` file, or a
+//! folder holding one (with its casts and Xtras) — started by the movie its Projector.ini names, or
+//! its only .dcr (src/dirinfo.rs). A folder game's controls are named after the folder.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::badges::{self, Badges, Live, BADGES};
@@ -90,8 +94,25 @@ impl Tab {
     }
 }
 
+/// What plays a game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A .swf: Ruffle (src/game.rs).
+    Flash,
+    /// A Director movie: DirPlayer (src/shockwave.rs).
+    Shockwave,
+}
+
 pub struct Game {
+    pub kind: Kind,
+    /// The movie to open (for a Shockwave folder: the one its projector starts).
     pub path: String,
+    /// The path the controls files are looked up for: `path`, or for a Shockwave folder game
+    /// `<folder>/<folder name>.dcr` (no such file: its stem names the mapping, and the folder is
+    /// where a `.controls.txt` beside it would be).
+    pub controls_path: String,
+    /// "Director 8.0" for a Shockwave game.
+    pub director: Option<String>,
     pub file: String,
     /// The file's stem: what its controls files are named after.
     pub stem: String,
@@ -255,6 +276,10 @@ impl Menu {
                     let stem = &n[..n.len() - 4];
                     let thumb = [format!("{dir}/{stem}.png"), format!("{dir}/{stem}.PNG")].into_iter().find(|p| std::path::Path::new(p).is_file());
                     games.push(Self::game(paths, &full, &n, None, thumb, &mut self.report));
+                } else if crate::dirinfo::is_movie(&n) && std::path::Path::new(&full).is_file() {
+                    let stem = n.rsplit_once('.').map(|(s, _)| s).unwrap_or(&n);
+                    let thumb = [format!("{dir}/{stem}.png"), format!("{dir}/{stem}.PNG")].into_iter().find(|p| std::path::Path::new(p).is_file());
+                    games.push(Self::director_game(paths, &full, stem, &full, None, thumb));
                 } else if std::path::Path::new(&full).is_dir() {
                     // A game in its own folder: its first .swf, its cover.png / icon.png.
                     if let Ok(inner) = std::fs::read_dir(&full) {
@@ -264,6 +289,11 @@ impl Menu {
                             let stem = &swf[..swf.len() - 4];
                             let thumb = [format!("{full}/{stem}.png"), format!("{full}/cover.png"), format!("{full}/icon.png")].into_iter().find(|p| std::path::Path::new(p).is_file());
                             games.push(Self::game(paths, &format!("{full}/{swf}"), swf, Some(&n), thumb, &mut self.report));
+                        } else if let Some(movie) = crate::dirinfo::launcher(&full, &files) {
+                            // A Director game in its own folder: named and mapped after the folder.
+                            let thumb = [format!("{full}/{n}.png"), format!("{full}/cover.png"), format!("{full}/icon.png")].into_iter().find(|p| std::path::Path::new(p).is_file());
+                            let controls_path = format!("{full}/{n}.dcr");
+                            games.push(Self::director_game(paths, &format!("{full}/{movie}"), &n, &controls_path, Some(&n), thumb));
                         }
                     }
                 }
@@ -304,13 +334,63 @@ impl Menu {
         let accent = Color::hue(hash(&stem) as f32 / u32::MAX as f32, 0.55, 0.78);
         let mapping = std::path::Path::new(&crate::controls::mapping_file(paths, Some(&stem))).is_file();
         Game {
+            kind: Kind::Flash,
             path: path.to_string(),
+            controls_path: path.to_string(),
+            director: None,
             file: file.to_string(),
             name: pretty_name(folder.unwrap_or(&stem)),
             stem,
             key,
             size,
             info,
+            own_picture,
+            mapping,
+            thumb_png,
+            thumb: None,
+            accent,
+        }
+    }
+
+    /// A Director game: the movie at `path`, named (and its controls) after `stem` — the file's
+    /// stem, or its folder's name.
+    fn director_game(paths: &Paths, path: &str, stem: &str, controls_path: &str, folder: Option<&str>, thumb: Option<String>) -> Game {
+        let file = path.rsplit('/').next().unwrap_or(path).to_string();
+        // A folder game's size is the folder's movies and casts together.
+        let size = match folder {
+            Some(_) => std::path::Path::new(path)
+                .parent()
+                .and_then(|d| std::fs::read_dir(d).ok())
+                .map(|it| {
+                    it.filter_map(|e| e.ok())
+                        .filter(|e| {
+                            let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+                            crate::dirinfo::is_movie(&n) || n.ends_with(".cct") || n.ends_with(".cst") || n.ends_with(".cxt")
+                        })
+                        .filter_map(|e| e.metadata().ok())
+                        .map(|m| m.len())
+                        .sum()
+                })
+                .unwrap_or(0),
+            None => std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        };
+        let key = paths::game_key(stem);
+        let own_picture = thumb.is_some();
+        let picture = thumb.or_else(|| Some(paths.cover(&key)).filter(|p| std::path::Path::new(p).is_file()));
+        let thumb_png = picture.and_then(|p| std::fs::read(&p).ok());
+        let accent = Color::hue(hash(stem) as f32 / u32::MAX as f32, 0.55, 0.78);
+        let mapping = std::path::Path::new(&crate::controls::mapping_file(paths, Some(stem))).is_file();
+        Game {
+            kind: Kind::Shockwave,
+            path: path.to_string(),
+            controls_path: controls_path.to_string(),
+            director: crate::dirinfo::describe(path),
+            file,
+            name: pretty_name(folder.unwrap_or(stem)),
+            stem: stem.to_string(),
+            key,
+            size,
+            info: None,
             own_picture,
             mapping,
             thumb_png,
@@ -899,6 +979,7 @@ impl Menu {
         let game = &self.games[gi];
         let (name, file, size, info, thumb, accent, key, stem, mapping) =
             (game.name.clone(), game.file.clone(), game.size, game.info.clone(), game.thumb, game.accent, game.key.clone(), game.stem.clone(), game.mapping);
+        let (kind, director) = (game.kind, game.director.clone());
         let rec = library.get(&key);
 
         // The picture: large, floating a little over its own colours; it settles in when the
@@ -949,11 +1030,19 @@ impl Menu {
         scene.push_opacity(come);
         let mx = MARGIN - 28.0 * (1.0 - come);
         ribbon_fold(scene, Rect::new(mx + 2.0, STAGE_KICKER_Y - 12.0, 28.0 * come.max(0.2), 6.0), ORANGE, 1.0);
-        let kicker = if rec.favorite { "FAVORITE FLASH GAME" } else { "FLASH GAME" };
+        let kicker = match (kind, rec.favorite) {
+            (Kind::Flash, false) => "FLASH GAME",
+            (Kind::Flash, true) => "FAVORITE FLASH GAME",
+            (Kind::Shockwave, false) => "SHOCKWAVE GAME",
+            (Kind::Shockwave, true) => "FAVORITE SHOCKWAVE GAME",
+        };
         scene.text(ui, Face::SemiBold, 18.0, kicker, mx + 40.0, STAGE_KICKER_Y, ORANGE, Align::Left, 4.0);
         let headline = ui.fit(Face::Display, 88.0, &name, 1080.0);
         scene.text(ui, Face::Display, 88.0, &headline, mx - 4.0, STAGE_TITLE_Y, INK, Align::Left, 0.0);
         let mut meta = vec![file.clone(), size_text(size)];
+        if let Some(d) = &director {
+            meta.push(d.clone());
+        }
         if let Some(i) = &info {
             meta.push(format!("SWF {}", i.version));
             if i.width > 0 && i.height > 0 {
@@ -1048,6 +1137,9 @@ impl Menu {
             if let Some(i) = &game.info {
                 sub = format!("{sub}  \u{b7}  SWF {}", i.version);
             }
+            if game.kind == Kind::Shockwave {
+                sub = format!("{sub}  \u{b7}  Shockwave");
+            }
             if rec.play_secs > 0 {
                 sub = format!("{sub}  \u{b7}  {}", duration_text(rec.play_secs));
             }
@@ -1075,7 +1167,7 @@ impl Menu {
                     "NOTHING TO PLAY YET",
                     "No games",
                     vec![
-                        format!("Put .swf files in {} (FTP) and open Ruffle5 again,", self.games_dir),
+                        format!("Put .swf, .dcr or game folders in {} (FTP) and open Ruffle5 again,", self.games_dir),
                         "or in a ruffle5 folder on a USB drive. A game can sit in its own folder, with a cover.png.".to_string(),
                     ],
                 ),

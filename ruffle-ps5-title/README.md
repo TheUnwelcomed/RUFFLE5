@@ -127,6 +127,31 @@ Ruffle5 used `/data/ruffle` before 1.000.020; Ruffle-Flash-PS5 uses that folder 
 keeps its own. Mapping files found in the old places (`/data/ruffle/*.controls.txt`,
 `games/*.controls.txt`) are moved into Custom Mappings once, at start; the log lists each move.
 
+## Shockwave (Director) games
+
+Ruffle plays Flash. Macromedia Director movies — Shockwave games (`.dcr`), projector games
+(`.dir`/`.dxr` with `.cct` casts and Xtras) — are a different format with their own language,
+Lingo; Ruffle5 plays them with [DirPlayer](https://github.com/igorlira/dirplayer-rs), a Director
+player in Rust, built into the title (`src/shockwave.rs`):
+
+* put a `.dcr` in the games folder, or a game's whole folder (movie, `.cct` casts, `Xtras/`,
+  `Projector.ini`): the menu lists the folder as one game, started by the movie its
+  `Projector.ini` names (`[Movies] Movie01=`), else its only `.dcr`; its controls are
+  `Custom Mappings/<folder name>.controls.txt`;
+* the stage is rendered on the CPU and scaled to the TV: Settings › Display › Scale mode
+  *Unscaled* = whole multiples (every pixel the same size), *Zoom to Fit*/*Crop* = as large as fits,
+  *Stretch* = the whole screen; Quality Low/Medium = sharp pixels, High and up = smooth;
+* keys and the mouse reach the movie as a browser's events would; sound is DirPlayer's, mixed
+  without a browser (`native_audio`, MP3 through Symphonia);
+* quick menu, controls editor, on-screen keyboard, covers, FPS and play time work as for Flash.
+
+`tools/fetch-dirplayer.sh` (run by `build-title.sh`) fetches DirPlayer at a pinned commit into
+`vendor/dirplayer` and applies `tools/dirplayer-native.patch`: an embedding API for a native
+program (`player/native.rs`), a sound mixer without Web Audio (`player/native_audio.rs`), local
+files instead of `fetch()`, and browser-console calls compiled out off the web.
+`dcr-probe/` (at the repository root) runs a movie in DirPlayer on a PC or server and saves the
+stage as PNGs — for checking a game before it goes on the console.
+
 ## The menu
 
 The look is Ruffle's: its blue and orange, its logo beside the name, and the ruffle.rs logo

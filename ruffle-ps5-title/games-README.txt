@@ -8,6 +8,11 @@ Put Flash games here, then open Ruffle5: the menu lists them.
   games/Some Game/game.swf         or a game in its own folder (files it loads go beside it)...
   games/Some Game/cover.png        ...with its picture (cover.png or icon.png)
 
+Shockwave / Director games work too: a .dcr file here, or the game's whole folder (its .dcr or
+.dir movie, the .cct casts, Xtras, Projector.ini) as one folder in here:
+  games/Some Shockwave Game/game.dcr ...   started by the movie Projector.ini names, else its .dcr
+  games/Some Shockwave Game/cover.png      its picture (optional)
+
 A USB drive works too: put the games in a folder called ruffle5 on it.
 A game with no picture gets one from its own screen after 8 seconds of play (Settings > App >
 Automatic covers), or when you pick "Cover" in the quick menu (hold OPTIONS in a game).
