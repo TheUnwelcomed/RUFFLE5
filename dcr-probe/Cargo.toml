@@ -1,0 +1,21 @@
+# dcr-probe — runs a Shockwave / Director movie in DirPlayer on a PC or server (no browser, no PS5)
+# and saves what the stage shows. The first step of Shockwave support in Ruffle5: it tells whether
+# DirPlayer plays a game before any of it goes on the console. Built by ../dirplayer-probe.sh.
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "dcr-probe"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+# DirPlayer's VM at the commit ruffle-ps5-title/build-title.sh pins (vendor/dirplayer), with
+# ruffle-ps5-title/tools/dirplayer-native.patch applied.
+vm-rust = { path = "../ruffle-ps5-title/vendor/dirplayer/vm-rust", default-features = false }
+
+[profile.release]
+opt-level = 2
+debug = "line-tables-only"
+
+[workspace]

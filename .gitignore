@@ -12,3 +12,6 @@
 /ruffle-ps5-title/target/
 /ruffle-ps5-title/build/
 /ruffle-ps5-title/vendor/
+/dcr-probe/target/
+/dcr-probe/Cargo.lock
+/dcr-probe/*.log

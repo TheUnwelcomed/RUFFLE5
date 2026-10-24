@@ -1,0 +1,81 @@
+diff --git a/vm-rust/src/player/handlers/datum_handlers/sound_channel.rs b/vm-rust/src/player/handlers/datum_handlers/sound_channel.rs
+index 9ae62c7..ca40a1b 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/sound_channel.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/sound_channel.rs
+@@ -1613,6 +1613,10 @@ impl SoundChannel {
+         member_ref: DatumRef,
+         loop_count: i32,
+     ) -> Result<(), JsValue> {
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: no AudioContext off the web (native build): stay silent.
++        if channel_rc.borrow().audio_context.is_none() {
++            return Ok(());
++        }
+         let player_opt = unsafe { crate::PLAYER_OPT.as_ref() };
+         let player = player_opt.ok_or_else(|| JsValue::from_str("Player not initialized"))?;
+ 
+@@ -1822,6 +1826,10 @@ impl SoundChannel {
+     }
+ 
+     pub fn start_sound(self_rc: Rc<RefCell<Self>>, member_ref: DatumRef) {
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: no AudioContext off the web (native build): stay silent.
++        if self_rc.borrow().audio_context.is_none() {
++            return;
++        }
+         let (channel_num, audio_context, loop_count) = {
+             let mut this = self_rc.borrow_mut();
+             
+@@ -2281,6 +2289,10 @@ impl SoundChannel {
+         mp3_bytes: Vec<u8>,
+         sound_member: SoundMember,
+     ) -> Result<(), JsValue> {
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: no AudioContext off the web (native build): stay silent.
++        if self_rc.borrow().audio_context.is_none() {
++            return Ok(());
++        }
+         // Guard: prevent re-entrant decode/play
+         {
+             let ch = self_rc.borrow();
+@@ -3333,6 +3345,10 @@ impl SoundChannel {
+ 
+     /// Integrated MP3 playback in your sound channel
+     pub async fn play_mp3_via_web_audio(&mut self, mp3_bytes: &[u8]) -> Result<(), JsValue> {
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: no AudioContext off the web (native build): stay silent.
++        if self.audio_context.is_none() {
++            return Ok(());
++        }
+         debug!("🎵 Starting MP3 playback via Web Audio");
+ 
+         // Step 1: Decode MP3 to AudioBuffer
+@@ -3866,6 +3882,10 @@ impl SoundChannel {
+         sound_member: &SoundMember,
+         _loop_count: i32,
+     ) -> Result<(), ScriptError> {
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: no AudioContext off the web (native build): stay silent.
++        if self.audio_context.is_none() {
++            return Ok(());
++        }
+         self.sound_member = Some(sound_member.clone());
+         self.sample_rate = sound_member.info.sample_rate;
+         self.sample_count = sound_member.info.sample_count;
+@@ -4059,6 +4079,10 @@ impl SoundChannel {
+         num_channels: u32,
+         sample_rate: f64,
+     ) -> Result<(), JsValue> {
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: no AudioContext off the web (native build): stay silent.
++        if self.audio_context.is_none() {
++            return Ok(());
++        }
+         debug!(
+                 "🎵 play_castmember: {} frames @ {}Hz",
+                 samples.len() / num_channels as usize,
+@@ -4151,6 +4175,10 @@ impl SoundChannel {
+ 
+     pub async fn play_sound(&mut self, audio_data: &AudioData) -> Result<(), JsValue> {
+         use web_sys::{Blob, HtmlAudioElement, Url};
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: no AudioContext off the web (native build): stay silent.
++        if self.audio_context.is_none() {
++            return Ok(());
++        }
+ 
+         debug!("🎵 play_sound() called");
+ 
