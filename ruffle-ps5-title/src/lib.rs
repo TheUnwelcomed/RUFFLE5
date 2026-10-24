@@ -16,6 +16,9 @@
 //! and Ruffle's player options — most after Ruffle-Flash-PS5 by ZiZc3 (GPL-3.0); the frame-time
 //! log in its format; the sound on a CPU core of its own; data in /data/ruffle5.
 //!
+//! 1.000.021 (2026-10-24): Shockwave / Director games (.dcr .dir .dxr, or a game's folder) played
+//! by DirPlayer (src/shockwave.rs, src/dirinfo.rs), listed in the menu beside the Flash games.
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -23,7 +26,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.020";
+pub const APP_VERSION: &str = "1.000.021";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 
