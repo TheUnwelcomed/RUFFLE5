@@ -62,6 +62,18 @@ index f0a3b59..18098d0 100644
  features = [
    'ImageData',
    'ImageBitmap',
+diff --git a/vm-rust/build.rs b/vm-rust/build.rs
+index aa15ee1..6690cc0 100644
+--- a/vm-rust/build.rs
++++ b/vm-rust/build.rs
+@@ -1,4 +1,7 @@
+ fn main() {
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: without a rerun-if-changed line Cargo reruns this script, and so
++    // recompiles all of vm-rust, whenever any file in the package looks newer; it reads only TARGET.
++    println!("cargo:rerun-if-changed=build.rs");
+     // 0x200000 bytes = 2MiB — only for the WASM linker
+     let target = std::env::var("TARGET").unwrap_or_default();
+     if target.contains("wasm32") {
 diff --git a/vm-rust/src/director/file.rs b/vm-rust/src/director/file.rs
 index c71aa4f..4ba09d9 100644
 --- a/vm-rust/src/director/file.rs
