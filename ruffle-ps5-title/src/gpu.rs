@@ -1,4 +1,8 @@
-//! PS5_RUFFLE_GPU_V2 — bring up a `wgpu::Device` on the statically linked RADV, in a title.
+//! PS5_RUFFLE_GPU_V3 — bring up a `wgpu::Device` on the statically linked RADV, in a title.
+//!
+//! V3: the display is opened at the largest mode VideoOut offers (3840x2160 on the PS5): the menu
+//! is drawn at that size, and a game renders either at it (4K) or at 1920x1080 scaled up on the GPU
+//! (src/shell.rs). The surface configuration is handed on, so the shell can reconfigure it.
 //!
 //! This is the one piece with no prior art in Rust: PS5_RetroArch and PS5_Vulkan drive RADV from
 //! C/C++. The console facts they established shape every step here:
@@ -43,6 +47,8 @@ pub struct Gpu {
     pub format: wgpu::TextureFormat,
     pub width: u32,
     pub height: u32,
+    /// The surface's configuration (applied), for reconfiguring it.
+    pub config: wgpu::SurfaceConfiguration,
     /// What was found and chosen, for the log.
     pub report: String,
 }
@@ -54,9 +60,10 @@ pub struct Gpu {
 const INSTANCE_FLAGS: wgpu::InstanceFlags =
     wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
 
-/// The display size to ask for. VideoOut scales any of its sizes to the screen; 1080p is plenty for
-/// Flash content and a quarter of the fill of 2160p. The first mode (3840x2160) is the fallback.
-const PREFERRED_MODE: (u32, u32) = (1920, 1080);
+/// The display sizes to ask for, best first. VideoOut scales any of its sizes to the screen; the
+/// largest lets the menu and a 4K game be drawn at full resolution, and a 1080p game is scaled up
+/// to it by one GPU pass. 1920x1080 is the fallback; the first mode listed after that.
+const PREFERRED_MODES: [(u32, u32); 2] = [(3840, 2160), (1920, 1080)];
 
 /// Build the ash `Entry` from the statically linked RADV, with no dynamic loader.
 unsafe fn static_entry() -> Result<ash::Entry, String> {
@@ -137,11 +144,12 @@ unsafe fn create_display_surface(
             m.parameters.refresh_rate
         ));
     }
-    let chosen = modes
+    let chosen = PREFERRED_MODES
         .iter()
-        .find(|m| {
-            m.parameters.visible_region.width == PREFERRED_MODE.0
-                && m.parameters.visible_region.height == PREFERRED_MODE.1
+        .find_map(|&(w, h)| {
+            modes.iter().find(|m| {
+                m.parameters.visible_region.width == w && m.parameters.visible_region.height == h
+            })
         })
         .unwrap_or(&modes[0]);
     let extent = chosen.parameters.visible_region;
@@ -344,20 +352,18 @@ pub fn create() -> Result<Gpu, String> {
                 .copied()
                 .unwrap_or(wgpu::CompositeAlphaMode::Auto)
         };
-        surface.configure(
-            &device,
-            &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                format,
-                color_space: wgpu::SurfaceColorSpace::Auto,
-                width,
-                height,
-                present_mode: wgpu::PresentMode::Fifo,
-                alpha_mode,
-                view_formats: vec![],
-                desired_maximum_frame_latency: 2,
-            },
-        );
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width,
+            height,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
 
         Ok(Gpu {
             instance,
@@ -368,6 +374,7 @@ pub fn create() -> Result<Gpu, String> {
             format,
             width,
             height,
+            config,
             report,
         })
     }

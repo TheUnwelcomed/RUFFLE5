@@ -54,55 +54,113 @@ building for you, that is step one, before any of this links.
 
 ## Phases
 
-* **3a — `cargo build` with no features (default):** bring up wgpu on RADV and clear the display to
-  an animated colour for 6 s. Proves the static-RADV + VK_KHR_display + wgpu seam in a title. This is
-  the first server build; it exercises only `src/gpu.rs`.
-* **3b — `--features ruffle`:** load `/data/ruffle/movie.swf` and play it through `ruffle_render_wgpu`
-  (`run_ruffle` in `src/lib.rs`). Added once 3a shows colour on the TV.
+* **3a — `./build-title.sh` (no features):** bring up wgpu on RADV and clear the display to an
+  animated colour. Proves the static-RADV + VK_KHR_display + wgpu seam in a title; it exercises
+  only `src/gpu.rs`.
+* **3b — `./build-title.sh --ruffle`:** the product: the Ruffle5 menu, a Ruffle player per game.
+
+Release builds are `opt-level = 3`, fat LTO, one codegen unit, for `znver2` (the PS5's Zen 2 cores:
+`"cpu"` in `x86_64-sie-ps5.json`).
+
+## The display: 4K, and what "4K output" in Settings does
+
+The swapchain is opened at **3840x2160** (1920x1080 if the TV offers no 4K mode), once. Each game
+is then drawn one of two ways, chosen by Settings › Display › Resolution:
+
+* **4K** — Ruffle renders the game straight into the 4K swapchain. Flash is vectors, so this is a
+  real 4K rendering of the shapes and text (not an enlarged picture), with no extra copy.
+* **1080p** — Ruffle renders into a 1920x1080 texture that one GPU pass scales to the screen
+  (bilinear). The cheaper choice for a game that is slow at 4K.
+
+The menu is laid out at 1920x1080 and drawn at the display's size, its text rasterised at 4K.
+The `[Game]` lines in the log (below) say which a game ran at and how long each frame took, so the
+two settings can be compared on the same game.
 
 ## Files
 
 | file | what |
 |---|---|
-| `src/gpu.rs` | the static-RADV → wgpu bring-up (the novel piece) |
-| `src/lib.rs` | `ruffle_ps5_main`: 3a clear-screen; 3b the app — the menu, a Ruffle player per game, back |
-| `src/menu.rs` | the menu: Games (stage + shelf of tiles) and Settings; design after ProsperoStore's home screen |
-| `src/ui.rs` | the 2D renderer the menu draws with: one instanced SDF-quad pipeline, text from the bundled fonts |
-| `src/shell.rs` | the shared display: the swapchain every player's `RenderTarget` points at; the menu presents to it directly |
+| `src/gpu.rs` | the static-RADV → wgpu bring-up (the novel piece); picks 3840x2160, else 1920x1080 |
+| `src/lib.rs` | `ruffle_ps5_main`: 3a clear-screen; 3b the app — the menu loop, a player per game, back |
+| `src/shell.rs` | the display: the swapchain, a game's `RenderTarget` (direct at 4K, or 1080p + GPU scale), cover capture, frame timings |
+| `src/menu.rs` | the menu: Games / Favorites / Recent / Badges / Settings; stage, shelf, search, screensaver |
+| `src/game.rs` | one game: loading screen, the player and its options, quick menu, overlay, the frame-time log |
+| `src/background.rs` | the menu's moving background: ruffle.rs's logo animation, played by Ruffle at the display's size |
+| `src/widgets.rs` | the shared look: Ruffle's colours, buttons, hints, focus halo/ring, ribbons, sparks, easing |
+| `src/ui.rs` | the 2D renderer: one instanced SDF-quad pipeline (rounded rects, rings, glows, sheared ribbons, pictures), text, clipping |
+| `src/editor.rs` | the controls editor (one game, or all games), in the menu's look; writes Custom Mappings |
+| `src/controls.rs` | the mapping as data: defaults, the layered files, writing a file the way presets are written |
+| `src/settings.rs` | Settings: rows, values, help lines, `settings.txt` |
+| `src/quickmenu.rs` | the in-game menu (hold OPTIONS) |
+| `src/keyboard.rs` | the on-screen keyboard |
+| `src/library.rs` | favourites, recently played, play time, the last session (recovered after a crash) |
+| `src/badges.rs` | 34 badges for using the app, with progress |
+| `src/covers.rs` | a game's own cover picture, taken from its frame |
+| `src/saves.rs` | Flash saves (SharedObjects) on disk |
+| `src/ps5ui.rs` | Ruffle's UI hooks: text boxes open the keyboard, the pointer can be hidden |
+| `src/hid.rs` + `shell/hid.c` | a USB keyboard and mouse (loaded at run time, not imported) |
+| `src/cpu.rs` | a CPU core of its own for the sound |
+| `src/sounds.rs` | the menu's sounds, on their own audio port |
+| `src/input.rs` | the DualSense (and USB devices) as keyboard and mouse; menu navigation with auto-repeat |
+| `src/cursor.rs` | the pointer drawn over the game |
+| `src/audio.rs` | Ruffle's mixer → AudioOut: mixed in f32, clamped to s16 |
 | `src/swfinfo.rs` | a SWF's header (version, size, fps, frames) without inflating the movie |
-| `src/input.rs` | the DualSense as keyboard and mouse: buttons → keys/clicks per the controls, touchpad and right stick → pointer |
-| `src/controls.rs` | the mapping as data: defaults, `/data/ruffle/controls.txt`, `/data/ruffle/<movie>.controls.txt` |
-| `src/cursor.rs` | the pointer drawn over Ruffle's frame (a `RenderTarget` wrapping `SwapChainTarget`) |
-| `src/audio.rs` | Ruffle's mixer → AudioOut: mixed in f32, clamped to s16 (mixing into i16 wraps), 1024-frame grains, a 10-second score line in the log |
-| `shell/pad.c` | scePad / AudioOut calls, the hardware-verified sample layout |
-| `shell/libc_fixes.c` | a lexical `realpath` (the console's is EPERM in a title) |
-| `controls.txt` | the mapping file's format and the defaults, shipped in the title folder as a commented example |
-| `fonts/` | Inter Regular/SemiBold, Montserrat Medium (SIL OFL 1.1), embedded in the title |
-| `games-README.txt` | shipped as `games/README.txt`: what goes in the games folder |
-| `THIRD_PARTY.md` | what the title is built from, and the menu's design credit |
-| `presets/*.controls.txt` | per-game mappings shipped in the title folder (`dadnme` so far) |
-| `shell/main.c` | the C title shell: `sceAgcInit(8)`, exports the ICD entry, toasts + log |
-| `Cargo.toml` | ruffle_core / ruffle_render_wgpu / wgpu 30 / ash 0.38, Ruffle rev pinned |
+| `src/paths.rs`, `src/fsutil.rs` | where things live; durable and background writes |
+| `shell/main.c` | the C title shell: `sceAgcInit`, the ICD entry, toasts, the folders |
+| `shell/pad.c` | scePad / AudioOut |
+| `Custom Mappings/` | presets shipped in the title's Custom Mappings folder (`dadnme` so far) |
+| `controls.txt` | the mapping file's format and the defaults, shipped as a commented example |
+| `assets/` | `ruffle-mark.png` (the menu's logo), `logo-anim.swf` (the background) |
+| `art/` | `make-art.py`: draws `assets/ruffle-mark.png` and the launch icon `sce_sys/icon0.png` from Ruffle's logo |
+| `fonts/` | Inter Regular/SemiBold, Montserrat Medium (SIL OFL 1.1), embedded |
 | `build-title.sh` | links the Rust staticlib + RADV archive + runtime into a PPSA title (needs PS5_Vulkan) |
+
+## On the console
+
+| where | what |
+|---|---|
+| `/data/homebrew/PPSA99620/games/` | your games (`*.swf`, or one game per sub-folder); also `ruffle5/` on a USB drive |
+| `/data/homebrew/PPSA99620/Custom Mappings/` | every controls file: the shipped presets, the ones the editor writes, `_All Games.controls.txt` |
+| `/data/ruffle5/` | `ruffle.log`, `settings.txt`, the library and badges, `saves/`, `covers/` |
+
+Ruffle5 used `/data/ruffle` before 1.000.020; Ruffle-Flash-PS5 uses that folder too, so Ruffle5 now
+keeps its own. Mapping files found in the old places (`/data/ruffle/*.controls.txt`,
+`games/*.controls.txt`) are moved into Custom Mappings once, at start; the log lists each move.
 
 ## The menu
 
-Ruffle5 opens on a menu of **`/data/homebrew/PPSA99620/games/`**: every `.swf` there, and the
-first `.swf` in each sub-folder (a game with its own files). A `<name>.png` beside a file, or a
-`cover.png` / `icon.png` in a folder, is its picture; without one a tile gets a colour from its
-name and its initials. The focused game is shown big on the stage with what its header says (SWF
-version, size, frame rate, frames) and whether a controls preset ships for it.
+The look is Ruffle's: its blue and orange, its logo beside the name, and the ruffle.rs logo
+animation playing behind everything (Settings › App can turn it off). The layout follows
+ProsperoStore's home screen: a big stage for the focused game, a shelf of tiles below. The focused
+cover breathes a soft glow, a ring with a running light goes round its border, and a leaning
+Ruffle ribbon sits under its name; tiles lift and wobble as the focus lands, the stage crossfades
+between games, and a ribbon wipe carries you into a game and back out.
 
 | pad | in the menu |
 |---|---|
-| d-pad / left stick ← → | focus a game (↑ ↓ jump by four) |
-| Cross | play it |
-| L1 / R1 | Games ↔ Settings |
+| d-pad / left stick | move (held: repeats) |
+| Cross | play the focused game / open a Settings row |
+| Triangle | this game's controls editor |
+| Square | favourite / unfavourite |
+| L2 | search (on-screen keyboard, or type on a USB keyboard) |
+| L1 / R1 | Games · Favorites · Recent · Badges · Settings |
 | Circle, held | close Ruffle5 |
-| **OPTIONS, held (in a game)** | back to the menu |
 
-Settings shows the version (1.000.020) and the author. The layout, type and motion follow
-ProsperoStore's home screen (see `THIRD_PARTY.md`).
+**Settings**: *Display* — Resolution (4K / 1080p), quality, scale mode, letterbox, alignment;
+*Player* — frame rate, Flash Player version, runtime, load behaviour, script time limit, dummy
+ExternalInterface, a pretend site for sitelocked games; *Controls & Sound* — controls for all
+games (the editor), keyboard for text boxes, USB mouse speed, game volume, menu sounds; *App* — animated
+background, screensaver, FPS counter, automatic covers, badges; *Library* — rescan, clear recent;
+*About*.
+
+## In a game
+
+| pad | |
+|---|---|
+| OPTIONS, held (or Esc on a USB keyboard) | the quick menu: resume, restart, volume, controls, take a cover picture, FPS counter, back to games |
+| L2 (by default) | the on-screen keyboard (a text box in the game opens it too) |
+
+A game without a picture gets one from its own frame after 8 seconds (Settings › App).
 
 ## Controls
 
@@ -115,20 +173,37 @@ The pad does what `src/controls.rs` says, by default:
 | L1 / R1 | Shift / Control |
 | L3 / R3 | A / S |
 | Options | Enter |
-| touchpad | the mouse: touch to point (the pad's surface is the screen), press to click; a pointer is drawn, hidden 3 s after it stops |
+| touchpad | the mouse: touch to point, press to click |
 | right stick | moves the pointer |
-| R2 / L2 | left / right mouse button |
+| R2 | left mouse button |
+| L2 | the on-screen keyboard (it was the right mouse button before 1.000.020) |
 
-Every game wants different keys, so the mapping is layered, generic first: the defaults, then
-`controls.txt` in the title folder (shipped, all comments), `/data/ruffle/controls.txt` (yours, all
-games), `<movie>.controls.txt` in the title folder (a shipped preset — `presets/` here, e.g.
-`dadnme.controls.txt` for Dad 'n Me: Cross/Triangle = A, Square/Circle = S, R1 = Q), then yours
-for that movie: `/data/ruffle/<movie>.controls.txt` or `<movie>.controls.txt` beside it in the
-games folder. A button may press several keys at once
-(`cross = space, enter`) or click (`cross = click`); sticks can be `dpad`, `mouse` or `off`.
-`ruffle.log` lists every file read, every line applied and the mapping in effect.
+Change them without editing files: **Triangle** on a game opens its controls editor, **Settings ›
+Controls & Sound › Controls for all games** the one for every game. Pick a button, then what it
+does (Cross sets it, Square adds or removes a key so one button can press up to four, Triangle
+resets a row). Leaving saves a file to Custom Mappings written like the shipped presets: a comment,
+then only the lines that differ.
 
-## Progress
+The files are layered, generic first: the defaults; `controls.txt` in the title folder (all
+comments); `Custom Mappings/_All Games.controls.txt`; the game's own
+`Custom Mappings/<movie>.controls.txt` (or a shipped preset such as `dadnme.controls.txt` — Dad 'n
+Me: Cross/Triangle = A, Square/Circle = S, R1 = Q); then a `<movie>.controls.txt` beside the SWF.
+`ruffle.log` lists every file read and every line applied.
 
-On the TV: toasts. On disk: `/data/ruffle/ruffle.log` (FTP). 3a's success line is
-`ok   wgpu on RADV: 3840x2160 …` then `RADV present OK`.
+## The log
+
+`/data/ruffle5/ruffle.log` (FTP). While a game plays, every 5 s, in Ruffle-Flash-PS5's format so
+the same SWF can be compared in both players:
+
+```
+[Game] 5 s: 300 ticks, 300 frames drawn, 0 read back, 0 readbacks failed, root frame Some(42), playing true
+[Game] ms per loop: game 1.2, jobs 0.0, draw 2.9 | per frame drawn: readback 0.0 | overlay 0.3, present 11.8
+[Game] 3840x2160 4K: 60.0 fps drawn, 60.0 presents/s
+```
+
+*game* is Ruffle's tick (ActionScript and the timeline), *jobs* its background work, *draw*
+building and submitting the frame, *readback* copying a frame to the CPU (Ruffle5 does that only
+for a cover picture; Ruffle-Flash-PS5 does it every frame), *overlay* the pointer, menus and the
+1080p scale pass, *present* waiting for a swapchain image and showing it (time spent waiting for
+the TV's refresh lands here). 3a's success line is `ok   wgpu on RADV: 3840x2160 …` then
+`RADV present OK`.

@@ -16,19 +16,29 @@ crate-type = ["staticlib", "rlib"]
 default = []
 # Phase 3b: Ruffle itself. The default build (3a) is only the GPU seam: wgpu on the static RADV,
 # clearing the display — nothing of Ruffle is compiled, so nothing of Ruffle can block it.
-ruffle = ["dep:ruffle_core", "dep:ruffle_render", "dep:ruffle_render_wgpu"]
+ruffle = ["dep:ruffle_core", "dep:ruffle_render", "dep:ruffle_render_wgpu", "dep:ruffle_video_software", "dep:url"]
 
 [dependencies]
 # Pinned to a Ruffle revision whose render/wgpu uses wgpu 30 (clone HEAD 2026-10-19).
 # Rev is pinned, not "branch = master", so a build is reproducible.
+# Sound: MP3, AAC and Nellymoser (the codecs Flash games ship), as Ruffle on PC; LZMA-compressed
+# (ZWS) movies; Ruffle's per-game compatibility rules; its embedded fallback font for device text.
 ruffle_core = { git = "https://github.com/ruffle-rs/ruffle", rev = "be342ba07b48f3045a16659bdda5bd654ba064fe", default-features = false, features = [
     "default_font",
     "default_compatibility_rules",
     "audio",
     "mp3",
+    "aac",
+    "nellymoser",
+    "lzma",
 ], optional = true }
 ruffle_render = { git = "https://github.com/ruffle-rs/ruffle", rev = "be342ba07b48f3045a16659bdda5bd654ba064fe", optional = true }
 ruffle_render_wgpu = { git = "https://github.com/ruffle-rs/ruffle", rev = "be342ba07b48f3045a16659bdda5bd654ba064fe", optional = true }
+# FLV video in games (Sorenson H.263, VP6, Screen Video), decoded on the CPU — pure Rust.
+ruffle_video_software = { git = "https://github.com/ruffle-rs/ruffle", rev = "be342ba07b48f3045a16659bdda5bd654ba064fe", optional = true }
+# Only for a type in Ruffle's UiBackend trait (`display_unsupported_video(url: Url)`); the same
+# url 2.x Ruffle already builds.
+url = { version = "2", optional = true }
 
 # Bring-your-own-Vulkan: the instance/surface/device are built on the statically linked RADV and
 # handed to wgpu through its `from_hal` seams. Versions must match what Ruffle's wgpu pins
@@ -65,10 +75,13 @@ naga = { path = "vendor/wgpu/naga" }
 
 [profile.release]
 panic = "abort"
-# Ruffle + wgpu + RADV is large; keep the title's code small and let LTO drop what a Flash title
-# never reaches. opt-level "s" first; revisit if AVM2 throughput needs it.
-opt-level = "s"
-lto = "thin"
+# Speed over size (2026-10-24): ActionScript-heavy games spend their time in Ruffle's interpreter on
+# the CPU, and that is what these buy — opt-level 3, whole-program (fat) LTO across Ruffle, wgpu and
+# std, one codegen unit. With the target's `"cpu": "znver2"` (x86_64-sie-ps5.json: the PS5's Zen 2,
+# so AVX2/FMA/BMI2) LLVM may vectorise. The build is slower and the eboot larger; the frame-time
+# log ("[Game] ms per loop", src/lib.rs) shows what it bought.
+opt-level = 3
+lto = "fat"
 codegen-units = 1
 strip = false
 

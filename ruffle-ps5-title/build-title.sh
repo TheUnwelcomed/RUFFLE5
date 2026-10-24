@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PS5_RUFFLE_TITLE_BUILD_V4 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
+# PS5_RUFFLE_TITLE_BUILD_V5 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
 # under Games. Phase 3a by default (wgpu on the static RADV clears the display); 3b with --ruffle.
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
@@ -21,7 +21,7 @@
 #   LLVM_CONFIG      the LLVM 18 tarball (~/llvm18); rustup nightly + rust-src (milestone 1)
 #
 #   source ~/.ruffle-radv-env && ./build-title.sh           → build/app/PPSA99620/{eboot.bin,...}
-#   ./build-title.sh --ruffle     3b: Ruffle compiled in (--features ruffle), plays /data/ruffle/movie.swf
+#   ./build-title.sh --ruffle     3b: Ruffle compiled in (--features ruffle): the Ruffle5 menu and player
 #   ./build-title.sh --clean      remove build/ and target/ first
 #   JOBS=n                        parallel compile jobs (default 4: the build box is shared)
 #   PS5_RUST_KIT=<path>           ps5-rust-title (default ../ps5-rust-title)
@@ -151,6 +151,8 @@ log "compiling the shell and the native-app runtime"
 "$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$HERE/shell/main.c" -o "$BUILD/obj/main.o"
 "$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$HERE/shell/pad.c" -o "$BUILD/obj/pad.o"
 "$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$HERE/shell/libc_fixes.c" -o "$BUILD/obj/libc_fixes.o"
+# USB keyboard + mouse (src/hid.rs) and the import lookup src/cpu.rs uses; imports libSceSysmodule only
+"$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$HERE/shell/hid.c" -o "$BUILD/obj/hid.o"
 "$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$KIT/shell/boot_log.c" -o "$BUILD/obj/boot_log.o"
 VKNATIVE="$VK/tooling/native"; [[ -f "$VKNATIVE/app_crt.cpp" ]] || VKNATIVE="$NATIVE"
 "$TCXX" -std=c++20 -O2 -fno-exceptions -fno-rtti "${TFLAGS[@]}" -c "$VKNATIVE/app_crt.cpp" -o "$BUILD/obj/app_crt.o"
@@ -163,7 +165,7 @@ VKNATIVE="$VK/tooling/native"; [[ -f "$VKNATIVE/app_crt.cpp" ]] || VKNATIVE="$NA
 # malloc_shim first as in the kit; with the platform's --wrap=malloc it is only the __real_ fallback
 RUNTIME_OBJS=("$BUILD/obj/malloc_shim.o" "$BUILD/obj/app_crt.o" "$BUILD/obj/app_cpp_runtime.o"
               "$BUILD/obj/libc_ext.o" "$BUILD/obj/evo_dns.o")
-OBJS=("$BUILD/obj/main.o" "$BUILD/obj/pad.o" "$BUILD/obj/libc_fixes.o" "$BUILD/obj/boot_log.o")
+OBJS=("$BUILD/obj/main.o" "$BUILD/obj/pad.o" "$BUILD/obj/hid.o" "$BUILD/obj/libc_fixes.o" "$BUILD/obj/boot_log.o")
 
 # --- 4. the RADV link recipe (PS5_Vulkan tools/radv-link.sh) ----------------------------------------
 export PS5_CLANG="$LLVM_BIN/clang"        # for Clang's builtins archive (__emutls_get_address)
@@ -311,8 +313,12 @@ cp "$LIBC_PRX" "$APPDIR/sce_module/libc.prx"
 for asset in icon0.png pic0.png pic1.png pic0.dds pic1.dds; do
     [[ -f "$HERE/sce_sys/$asset" ]] && cp "$HERE/sce_sys/$asset" "$APPDIR/sce_sys/"
 done
-cp "$HERE/controls.txt" "$APPDIR/controls.txt"   # the example mapping file (all comments: no effect until edited)
-cp "$HERE"/presets/*.controls.txt "$APPDIR/"     # per-game presets: /app0/<movie>.controls.txt (src/controls.rs)
+cp "$HERE/controls.txt" "$APPDIR/controls.txt"   # the defaults' notes (all comments: no effect until edited)
+# Custom Mappings: the shipped presets (dadnme), and on the console every mapping the controls editor
+# writes (shell/main.c MAPPINGS_DIR = /data/homebrew/<id>/Custom Mappings, which is this folder)
+mkdir -p "$APPDIR/Custom Mappings"
+cp "$HERE/Custom Mappings"/*.controls.txt "$APPDIR/Custom Mappings/"
+grep -q "/data/homebrew/$TITLE_ID/Custom Mappings" "$HERE/shell/main.c" || die "shell/main.c MAPPINGS_DIR is not /data/homebrew/$TITLE_ID/Custom Mappings"
 mkdir -p "$APPDIR/games"                          # where the menu looks (shell/main.c GAMES_DIR); yours on the console
 cp "$HERE/games-README.txt" "$APPDIR/games/README.txt"
 grep -q "\"titleId\": \"$TITLE_ID\"" "$PARAM" || die "param.json titleId is not $TITLE_ID"
@@ -324,19 +330,18 @@ log "done: $APPDIR"
 echo "   $(du -sh "$APPDIR/eboot.bin" | cut -f1) eboot.bin · zip: $ZIP"
 echo "   install: copy the $TITLE_ID folder to /data/homebrew/ on the console (FTP), so that"
 echo "   /data/homebrew/$TITLE_ID/eboot.bin exists; a 'Ruffle5' tile appears under Games."
-echo "   UPDATING: copy eboot.bin (and sce_sys/, controls.txt, *.controls.txt) over the old ones --"
-echo "   do not delete the folder first: /data/homebrew/$TITLE_ID/games/ is where your games live."
+echo "   UPDATING: copy eboot.bin and sce_sys/ over the old ones -- do not delete the folder first:"
+echo "   games/ holds your games and Custom Mappings/ your controls (copy a shipped preset again only"
+echo "   if you want it back as it ships: it replaces your edits to that game's mapping)."
 if [[ $RUFFLE == 1 ]]; then
-    echo "   3b: Ruffle5 opens on a menu of /data/homebrew/$TITLE_ID/games/ (*.swf, or one game per"
-    echo "       sub-folder with a cover.png); Cross plays, hold OPTIONS in a game to come back, hold"
-    echo "       Circle in the menu to close. test-swf/bounce.swf is a known-good game. Default controls:"
-    echo "       d-pad/left stick = arrows,"
-    echo "       Cross = Space, Square = Z, Triangle = X, Circle = C, L1 = Shift, R1 = Ctrl, L3/R3 = A/S,"
-    echo "       Options = Enter; touchpad = mouse (touch to point, click to click; a pointer is drawn),"
-    echo "       right stick moves the pointer, R2/L2 = left/right button. Change any of it per game:"
-    echo "       controls.txt (a commented example is in the title folder) -> /data/ruffle/controls.txt"
-    echo "       or /data/ruffle/<movie>.controls.txt; presets for known games ship in the title folder"
-    echo "       ($(ls "$HERE"/presets/*.controls.txt | xargs -n1 basename | sed 's/.controls.txt//' | tr '\n' ' ')). Log: /data/ruffle/ruffle.log"
+    echo "   3b: Ruffle5 opens on its menu: /data/homebrew/$TITLE_ID/games/ (*.swf, or one game per"
+    echo "       sub-folder with a cover.png) and a ruffle5/ folder on a USB drive. Cross plays, Triangle"
+    echo "       on a game = its controls editor, Settings = the all-games controls, 4K output, player"
+    echo "       options. In a game: hold OPTIONS = quick menu (resume, restart, volume, controls, cover,"
+    echo "       FPS, back to the menu), L2 = on-screen keyboard. test-swf/bounce.swf is a known-good game."
+    echo "       Mappings: /data/homebrew/$TITLE_ID/Custom Mappings/ (presets shipped:"
+    echo "       $(ls "$HERE/Custom Mappings"/*.controls.txt | xargs -n1 basename | sed 's/.controls.txt//' | tr '\n' ' ')). Log: /data/ruffle5/ruffle.log"
+    echo "       (a [Game] ms per loop line every 5 s while a game plays)"
 else
-    echo "   3a: the screen should cycle through colours for 8 s, with toasts. Log: /data/ruffle/ruffle.log"
+    echo "   3a: the screen should cycle through colours for 8 s, with toasts. Log: /data/ruffle5/ruffle.log"
 fi

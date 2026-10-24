@@ -1,4 +1,4 @@
-/* PS5_RUFFLE_SHELL_V3 — the C shell of the Ruffle PS5 title.
+/* PS5_RUFFLE_SHELL_V4 — the C shell of the Ruffle PS5 title.
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Small on purpose: it does the few things that must happen from the title executable itself,
@@ -12,13 +12,17 @@
  *      about to present into (PS5_RetroArch src/display.cpp, PS5_Vulkan src/demo_renderer.cpp).
  *   4. Expose the RADV archive's ICD entry (vk_icdGetInstanceProcAddr) to Rust, which builds ash's
  *      Entry from it (src/gpu.rs). PS5_RetroArch resolves the whole API through this symbol.
- *   5. A toast and a /data/ruffle/ruffle.log for progress, since a title has no stdout anyone sees.
+ *   5. A toast and a /data/ruffle5/ruffle.log for progress, since a title has no stdout anyone sees.
+ * V4: Ruffle5's own data folder, /data/ruffle5 (the other Flash player for the PS5 uses /data/ruffle:
+ * the two no longer overwrite each other's log), the "Custom Mappings" folder beside games/, and the
+ * console's local hour (badges).
  */
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /* ---- platform layer (libps5platform.a, the SDK fork PS5_Vulkan builds against) ---- */
 void ps5_fp_ieee(void);
@@ -45,11 +49,12 @@ void ps5_notify(const char *msg)
     sceKernelSendNotificationRequest(0, &req, sizeof req, 0);
 }
 
-/* ---- a growing log in the title's data folder (FTP: /data/ruffle/ruffle.log) ---- */
-#define DATA_DIR "/data/ruffle"
-/* Where the menu looks for games: the title's own folder (PPSA99620 is sce_sys/param.json's
- * titleId; build-title.sh checks the two agree). The log and the controls stay in DATA_DIR. */
+/* ---- a log in the title's data folder (FTP: /data/ruffle5/ruffle.log) ---- */
+#define DATA_DIR "/data/ruffle5"
+/* Where the menu looks for games, and where every controls mapping lives: the title's own folder
+ * (PPSA99620 is sce_sys/param.json's titleId; build-title.sh checks the two agree). */
 #define GAMES_DIR "/data/homebrew/PPSA99620/games"
+#define MAPPINGS_DIR "/data/homebrew/PPSA99620/Custom Mappings"
 static FILE *g_log;
 void ps5_log(const char *msg)
 {
@@ -57,8 +62,18 @@ void ps5_log(const char *msg)
     fprintf(stderr, "%s\n", msg);
 }
 
+/* The console's local hour, 0-23 (-1 if the clock cannot be read). */
+int ps5_local_hour(void)
+{
+    time_t now = time(NULL);
+    struct tm tm;
+    if (now == (time_t)-1 || !localtime_r(&now, &tm))
+        return -1;
+    return tm.tm_hour;
+}
+
 /* Rust entry (src/lib.rs). */
-int ruffle_ps5_main(const char *data_dir, const char *games_dir);
+int ruffle_ps5_main(const char *data_dir, const char *games_dir, const char *mappings_dir);
 
 int main(int argc, char **argv)
 {
@@ -83,7 +98,8 @@ int main(int argc, char **argv)
     ps5_log(line);
 
     mkdir(GAMES_DIR, 0777);
-    int failures = ruffle_ps5_main(DATA_DIR, GAMES_DIR);
+    mkdir(MAPPINGS_DIR, 0777);
+    int failures = ruffle_ps5_main(DATA_DIR, GAMES_DIR, MAPPINGS_DIR);
     snprintf(line, sizeof line, "ruffle-ps5 returned %d", failures);
     ps5_log(line);
     if (g_log) fclose(g_log);

@@ -1,11 +1,16 @@
-//! PS5_RUFFLE_UI_V1 — a small 2D renderer for the title's own screens (the menu, the overlays).
+//! PS5_RUFFLE_UI_V2 — a small 2D renderer for the title's own screens (the menu, the overlays).
 //!
 //! Everything is one instanced quad pipeline: an instance is a rectangle with rounded corners
 //! (a signed-distance field in the fragment shader, so edges are anti-aliased), drawn as a solid,
 //! a vertical or horizontal gradient, a stroke, a soft shadow/glow, an image, or a glyph from the
 //! font atlas. Text comes from three bundled faces (Inter Regular, Inter SemiBold, Montserrat
-//! Medium — the ones ProsperoStore's screens use, SIL OFL 1.1, `fonts/`), rasterised by ab_glyph
-//! into an R8 atlas on demand. The canvas is the display (1920x1080), y down, in pixels.
+//! Medium, SIL OFL 1.1, `fonts/`), rasterised by ab_glyph into an R8 atlas on demand.
+//!
+//! V2: the screens are laid out on a 1920x1080 canvas (`W`, `H`) whatever the display's size. On a
+//! 3840x2160 display everything is drawn at twice the scale — glyphs are rasterised at the display's
+//! size, the edges' anti-aliasing is one display pixel wide — so the menu is as sharp in 4K as the
+//! display allows. Scenes can clip a region (`push_clip`), for lists that scroll under a header.
+//! Images remember their size, for pictures fitted into a frame of another shape.
 //!
 //! The menu builds a `Scene` (instances in draw order) through `Ui`, which owns the fonts and the
 //! atlas; `Ui::render` draws a scene into a texture view in one render pass.
@@ -14,6 +19,7 @@
 use ab_glyph::{point, Font, FontRef, GlyphId, PxScale, ScaleFont};
 use std::collections::HashMap;
 
+/// The canvas every screen is laid out on.
 pub const W: f32 = 1920.0;
 pub const H: f32 = 1080.0;
 
@@ -89,6 +95,12 @@ impl Rect {
     pub fn cy(&self) -> f32 {
         self.y + self.h * 0.5
     }
+    pub fn right(&self) -> f32 {
+        self.x + self.w
+    }
+    pub fn bottom(&self) -> f32 {
+        self.y + self.h
+    }
     pub fn inset(&self, d: f32) -> Rect {
         Rect::new(self.x + d, self.y + d, self.w - 2.0 * d, self.h - 2.0 * d)
     }
@@ -97,6 +109,12 @@ impl Rect {
         let w = self.w * s;
         let h = self.h * s;
         Rect::new(self.cx() - w * 0.5, self.cy() - h * 0.5, w, h)
+    }
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+    pub fn intersects(&self, o: &Rect) -> bool {
+        self.x < o.x + o.w && o.x < self.x + self.w && self.y < o.y + o.h && o.y < self.y + self.h
     }
 }
 
@@ -123,16 +141,18 @@ const MODE_STROKE: f32 = 2.0; // a ring of params.z pixels inside the edge
 const MODE_SHADOW: f32 = 3.0; // soft: fades out over params.z pixels beyond the edge
 const MODE_GRADIENT_V: f32 = 4.0; // colour at the top, color2 at the bottom
 const MODE_GRADIENT_H: f32 = 5.0; // colour at the left, color2 at the right
+const MODE_RIBBON: f32 = 6.0; // a solid leaning like Ruffle's "r": x shifts by -color2.r per pixel down
 
 const FLOATS_PER_INSTANCE: usize = 20;
-const ATLAS_SIZE: u32 = 1024;
+const ATLAS_SIZE: u32 = 2048;
 /// The atlas's top-left 4x4 is solid white: every untextured instance samples its middle.
 const WHITE_UV: [f32; 4] = [2.0 / ATLAS_SIZE as f32, 2.0 / ATLAS_SIZE as f32, 2.0 / ATLAS_SIZE as f32, 2.0 / ATLAS_SIZE as f32];
 
 const SHADER: &str = r#"
 struct Globals {
     viewport: vec2<f32>,
-    _pad: vec2<f32>,
+    scale: f32,
+    _pad: f32,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(1) @binding(0) var tex: texture_2d<f32>;
@@ -163,20 +183,29 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
         vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0),
     );
     let c = corners[vi];
-    var expand = 0.0;
+    // A soft shape spreads beyond its rectangle; every shape gets one display pixel of margin so
+    // its anti-aliased edge is not cut off.
+    var expand = 1.0 / globals.scale;
     if (inst.params.y == 3.0) {
         expand = inst.params.z;
     }
     let half = inst.rect.zw * 0.5 + vec2<f32>(expand, expand);
     let centre = inst.rect.xy + inst.rect.zw * 0.5;
     let local = (c - vec2<f32>(0.5, 0.5)) * 2.0 * half;
+    // A ribbon leans: its shape is a rounded rectangle in its own space, sheared in the world's.
+    var placed = local;
+    if (inst.params.y == 6.0) {
+        placed.x = placed.x - inst.color2.r * placed.y;
+    }
     let cs = cos(inst.params.w);
     let sn = sin(inst.params.w);
-    let world = centre + vec2<f32>(local.x * cs - local.y * sn, local.x * sn + local.y * cs);
+    let world = centre + vec2<f32>(placed.x * cs - placed.y * sn, placed.x * sn + placed.y * cs);
     var out: VsOut;
     out.pos = vec4<f32>(world.x / globals.viewport.x * 2.0 - 1.0, 1.0 - world.y / globals.viewport.y * 2.0, 0.0, 1.0);
     out.local = local;
-    out.uv = inst.uv.xy + (inst.uv.zw - inst.uv.xy) * c;
+    // The uv spans the rectangle itself; the margin samples just past it (clamped).
+    let uvc = (local / max(inst.rect.zw, vec2<f32>(0.001, 0.001))) + vec2<f32>(0.5, 0.5);
+    out.uv = inst.uv.xy + (inst.uv.zw - inst.uv.xy) * uvc;
     out.half = inst.rect.zw * 0.5;
     out.color = inst.color;
     out.params = inst.params;
@@ -186,6 +215,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let px = 1.0 / globals.scale;
     let r = min(in.params.x, min(in.half.x, in.half.y));
     let q = abs(in.local) - in.half + vec2<f32>(r, r);
     let d = length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
@@ -199,10 +229,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let t = clamp((in.local.x + in.half.x) / max(2.0 * in.half.x, 0.001), 0.0, 1.0);
         color = mix(in.color, in.color2, t);
     }
-    var coverage = 1.0 - smoothstep(-0.75, 0.75, d);
+    var coverage = 1.0 - smoothstep(-0.75 * px, 0.75 * px, d);
     if (mode == 2.0) {
         let w = in.params.z;
-        coverage = coverage * smoothstep(-w - 0.75, -w + 0.75, d);
+        coverage = coverage * smoothstep(-w - 0.75 * px, -w + 0.75 * px, d);
     }
     if (mode == 3.0) {
         let b = max(in.params.z, 0.5);
@@ -221,14 +251,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 #[derive(Clone, Copy)]
 struct GlyphEntry {
     uv: [f32; 4],
+    /// Canvas units (the bitmap's display pixels divided by the scale).
     w: f32,
     h: f32,
     left: f32,
     top: f32,
 }
 
+#[derive(Clone, Copy, PartialEq)]
 struct Run {
     image: Option<ImageId>,
+    clip: Option<Rect>,
     start: u32,
     count: u32,
 }
@@ -239,16 +272,7 @@ pub struct Scene {
     data: Vec<f32>,
     runs: Vec<Run>,
     opacity: Vec<f32>,
-}
-
-impl Default for Run {
-    fn default() -> Self {
-        Run {
-            image: None,
-            start: 0,
-            count: 0,
-        }
-    }
+    clips: Vec<Rect>,
 }
 
 impl Scene {
@@ -260,6 +284,7 @@ impl Scene {
         self.data.clear();
         self.runs.clear();
         self.opacity.clear();
+        self.clips.clear();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -276,6 +301,25 @@ impl Scene {
         self.opacity.pop();
     }
 
+    /// Everything pushed until `pop_clip` is cut to `r` (and to any clip already in force).
+    pub fn push_clip(&mut self, r: Rect) {
+        let r = match self.clips.last() {
+            Some(c) => {
+                let x0 = r.x.max(c.x);
+                let y0 = r.y.max(c.y);
+                let x1 = (r.x + r.w).min(c.x + c.w);
+                let y1 = (r.y + r.h).min(c.y + c.h);
+                Rect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
+            }
+            None => r,
+        };
+        self.clips.push(r);
+    }
+
+    pub fn pop_clip(&mut self) {
+        self.clips.pop();
+    }
+
     fn alpha(&self) -> f32 {
         self.opacity.last().copied().unwrap_or(1.0)
     }
@@ -283,15 +327,20 @@ impl Scene {
     #[allow(clippy::too_many_arguments)]
     fn push(&mut self, image: Option<ImageId>, rect: Rect, uv: [f32; 4], color: Color, params: [f32; 4], color2: Color) {
         let a = self.alpha();
+        if a <= 0.0 {
+            return;
+        }
         self.data.extend_from_slice(&[
             rect.x, rect.y, rect.w, rect.h, uv[0], uv[1], uv[2], uv[3], color.r, color.g, color.b, color.a * a, params[0], params[1],
             params[2], params[3], color2.r, color2.g, color2.b, color2.a * a,
         ]);
         let index = (self.data.len() / FLOATS_PER_INSTANCE - 1) as u32;
+        let clip = self.clips.last().copied();
         match self.runs.last_mut() {
-            Some(run) if run.image == image => run.count += 1,
+            Some(run) if run.image == image && run.clip == clip => run.count += 1,
             _ => self.runs.push(Run {
                 image,
+                clip,
                 start: index,
                 count: 1,
             }),
@@ -326,6 +375,13 @@ impl Scene {
         self.push(None, r, WHITE_UV, left, [radius, MODE_GRADIENT_H, 0.0, 0.0], right);
     }
 
+    /// A ribbon: `r` leaning like Ruffle's "r" (its stems lean `lean` pixels left per pixel down;
+    /// the mark's own is 0.1406), corners rounded by `radius`.
+    pub fn ribbon(&mut self, r: Rect, radius: f32, lean: f32, color: Color) {
+        let shear = Color { r: lean, g: 0.0, b: 0.0, a: 1.0 };
+        self.push(None, r, WHITE_UV, color, [radius, MODE_RIBBON, 0.0, 0.0], shear);
+    }
+
     pub fn circle(&mut self, cx: f32, cy: f32, radius: f32, color: Color) {
         self.rect(Rect::new(cx - radius, cy - radius, 2.0 * radius, 2.0 * radius), radius, color);
     }
@@ -339,25 +395,43 @@ impl Scene {
         self.push(Some(id), r, [0.0, 0.0, 1.0, 1.0], tint, [radius, MODE_IMAGE, 0.0, 0.0], tint);
     }
 
+    /// An image filling `r` without stretching: the middle of the picture, cropped to `r`'s shape
+    /// (`size` is the image's own size, from `Ui::image_size`).
+    pub fn image_cover(&mut self, id: ImageId, size: (u32, u32), r: Rect, radius: f32, tint: Color) {
+        let (iw, ih) = (size.0.max(1) as f32, size.1.max(1) as f32);
+        let want = r.w.max(1.0) / r.h.max(1.0);
+        let have = iw / ih;
+        let uv = if have > want {
+            let f = want / have;
+            [(1.0 - f) * 0.5, 0.0, (1.0 + f) * 0.5, 1.0]
+        } else {
+            let f = have / want;
+            [0.0, (1.0 - f) * 0.5, 1.0, (1.0 + f) * 0.5]
+        };
+        self.push(Some(id), r, uv, tint, [radius, MODE_IMAGE, 0.0, 0.0], tint);
+    }
+
     /// One line of text with its baseline at `baseline`; `x` is the left edge, centre or right
     /// edge per `align`. `tracking` is extra space between glyphs. Returns the width.
     #[allow(clippy::too_many_arguments)]
     pub fn text(&mut self, ui: &mut Ui, face: Face, size: f32, text: &str, x: f32, baseline: f32, color: Color, align: Align, tracking: f32) -> f32 {
         let width = ui.measure(face, size, text, tracking);
+        let s = ui.scale;
         let mut pen = match align {
             Align::Left => x,
             Align::Center => x - width * 0.5,
             Align::Right => x - width,
-        }
-        .round();
-        let baseline = baseline.round();
+        };
+        pen = (pen * s).round() / s;
+        let baseline = (baseline * s).round() / s;
         let mut prev: Option<GlyphId> = None;
         for ch in text.chars() {
             let (id, advance, kern) = ui.advance(face, size, ch, prev);
             pen += kern;
             if let Some(g) = ui.glyph(face, size, ch) {
                 if g.w > 0.0 {
-                    let r = Rect::new((pen + g.left).round(), baseline + g.top, g.w, g.h);
+                    let gx = ((pen + g.left) * s).round() / s;
+                    let r = Rect::new(gx, baseline + g.top, g.w, g.h);
                     self.push(None, r, g.uv, color, [0.0, MODE_SOLID, 0.0, 0.0], color);
                 }
             }
@@ -395,6 +469,12 @@ impl Atlas {
     }
 }
 
+struct Picture {
+    group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+}
+
 pub struct Ui {
     pipeline: wgpu::RenderPipeline,
     texture_layout: wgpu::BindGroupLayout,
@@ -402,11 +482,16 @@ pub struct Ui {
     globals_group: wgpu::BindGroup,
     atlas: Atlas,
     atlas_group: wgpu::BindGroup,
-    images: Vec<wgpu::BindGroup>,
+    images: Vec<Picture>,
     instances: Option<wgpu::Buffer>,
     instance_capacity: usize,
     fonts: [FontRef<'static>; 3],
     glyphs: HashMap<(Face, char, u32), Option<GlyphEntry>>,
+    /// Display pixels per canvas unit (1 at 1920x1080, 2 at 3840x2160).
+    pub scale: f32,
+    /// The display's size in pixels.
+    pub width: u32,
+    pub height: u32,
 }
 
 impl Ui {
@@ -416,6 +501,7 @@ impl Ui {
             FontRef::try_from_slice(include_bytes!("../fonts/Inter-SemiBold.ttf")).map_err(|e| format!("Inter SemiBold: {e}"))?,
             FontRef::try_from_slice(include_bytes!("../fonts/Montserrat-Medium.ttf")).map_err(|e| format!("Montserrat Medium: {e}"))?,
         ];
+        let scale = (width as f32 / W).max(0.25);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ui"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -424,7 +510,7 @@ impl Ui {
             label: Some("ui globals"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -460,7 +546,7 @@ impl Ui {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let g: [f32; 4] = [width as f32, height as f32, 0.0, 0.0];
+        let g: [f32; 4] = [W, H, scale, 0.0];
         let bytes: Vec<u8> = g.iter().flat_map(|f| f.to_ne_bytes()).collect();
         queue.write_buffer(&globals, 0, &bytes);
         let globals_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -592,6 +678,9 @@ impl Ui {
             instance_capacity: 0,
             fonts,
             glyphs: HashMap::new(),
+            scale,
+            width,
+            height,
         })
     }
 
@@ -649,15 +738,29 @@ impl Ui {
             },
         );
         let group = Self::texture_group(device, &self.texture_layout, &self.sampler, &texture, "ui image");
-        self.images.push(group);
+        self.images.push(Picture { group, width, height });
         self.images.len() - 1
+    }
+
+    /// Replace image `id`'s pixels (a new cover for a game), keeping its id.
+    pub fn replace_image(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, id: ImageId, width: u32, height: u32, rgba: &[u8]) {
+        let new_id = self.add_image(device, queue, width, height, rgba);
+        if id < self.images.len() && new_id != id {
+            let picture = self.images.pop().expect("just added");
+            self.images[id] = picture;
+        }
+    }
+
+    /// The size an image was added with.
+    pub fn image_size(&self, id: ImageId) -> (u32, u32) {
+        self.images.get(id).map(|p| (p.width, p.height)).unwrap_or((1, 1))
     }
 
     fn font(&self, face: Face) -> &FontRef<'static> {
         &self.fonts[face as usize]
     }
 
-    /// The glyph id, its advance and the kerning after `prev`.
+    /// The glyph id, its advance and the kerning after `prev` (canvas units).
     fn advance(&self, face: Face, size: f32, ch: char, prev: Option<GlyphId>) -> (GlyphId, f32, f32) {
         let font = self.font(face);
         let scaled = font.as_scaled(PxScale::from(size));
@@ -666,15 +769,16 @@ impl Ui {
         (id, scaled.h_advance(id), kern)
     }
 
-    /// The glyph's cell in the atlas, rasterised on first use. None for a glyph with no outline
-    /// (a space) or when the atlas is full.
+    /// The glyph's cell in the atlas, rasterised at the display's scale on first use. None for a
+    /// glyph with no outline (a space) or when the atlas is full.
     fn glyph(&mut self, face: Face, size: f32, ch: char) -> Option<GlyphEntry> {
         let key = (face, ch, (size * 4.0).round() as u32);
         if let Some(entry) = self.glyphs.get(&key) {
             return *entry;
         }
+        let s = self.scale;
         let font = &self.fonts[face as usize];
-        let glyph = font.glyph_id(ch).with_scale_and_position(PxScale::from(size), point(0.0, 0.0));
+        let glyph = font.glyph_id(ch).with_scale_and_position(PxScale::from(size * s), point(0.0, 0.0));
         let entry = font.outline_glyph(glyph).and_then(|outlined| {
             let bounds = outlined.px_bounds();
             let w = (bounds.max.x - bounds.min.x).ceil().max(0.0) as u32;
@@ -693,13 +797,13 @@ impl Ui {
                 }
             });
             self.atlas.pending.push((ax, ay, cw, chh, pixels));
-            let s = ATLAS_SIZE as f32;
+            let a = ATLAS_SIZE as f32;
             Some(GlyphEntry {
-                uv: [ax as f32 / s, ay as f32 / s, (ax + cw) as f32 / s, (ay + chh) as f32 / s],
-                w: cw as f32,
-                h: chh as f32,
-                left: bounds.min.x - 1.0,
-                top: bounds.min.y - 1.0,
+                uv: [ax as f32 / a, ay as f32 / a, (ax + cw) as f32 / a, (ay + chh) as f32 / a],
+                w: cw as f32 / s,
+                h: chh as f32 / s,
+                left: (bounds.min.x - 1.0) / s,
+                top: (bounds.min.y - 1.0) / s,
             })
         });
         self.glyphs.insert(key, entry);
@@ -740,12 +844,32 @@ impl Ui {
         "\u{2026}".to_string()
     }
 
+    /// `text` broken into lines no wider than `width` (at spaces; a word longer than a line is cut).
+    pub fn wrap(&self, face: Face, size: f32, text: &str, width: f32) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        for word in text.split_whitespace() {
+            let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+            if self.measure(face, size, &candidate, 0.0) <= width || line.is_empty() {
+                line = candidate;
+            } else {
+                lines.push(std::mem::take(&mut line));
+                line = word.to_string();
+            }
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+        lines.into_iter().map(|l| self.fit(face, size, &l, width)).collect()
+    }
+
     /// The face's ascent at `size` (baseline = top + ascent).
     pub fn ascent(&self, face: Face, size: f32) -> f32 {
         self.font(face).as_scaled(PxScale::from(size)).ascent()
     }
 
-    /// Draw `scene` into `view`: cleared to `clear` first when given, over what is there otherwise.
+    /// Draw `scene` into `view` (the display's size): cleared to `clear` first when given, over
+    /// what is there otherwise.
     pub fn render(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, view: &wgpu::TextureView, clear: Option<Color>, scene: &Scene) -> wgpu::CommandBuffer {
         for (x, y, w, h, pixels) in self.atlas.pending.drain(..) {
             queue.write_texture(
@@ -814,9 +938,30 @@ impl Ui {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.globals_group, &[]);
                 pass.set_vertex_buffer(0, self.instances.as_ref().expect("instance buffer").slice(..));
+                let mut clipped = false;
                 for run in &scene.runs {
+                    match run.clip {
+                        Some(c) => {
+                            let s = self.scale;
+                            let x0 = (c.x * s).floor().clamp(0.0, self.width as f32) as u32;
+                            let y0 = (c.y * s).floor().clamp(0.0, self.height as f32) as u32;
+                            let x1 = ((c.x + c.w) * s).ceil().clamp(0.0, self.width as f32) as u32;
+                            let y1 = ((c.y + c.h) * s).ceil().clamp(0.0, self.height as f32) as u32;
+                            if x1 <= x0 || y1 <= y0 {
+                                continue;
+                            }
+                            pass.set_scissor_rect(x0, y0, x1 - x0, y1 - y0);
+                            clipped = true;
+                        }
+                        None => {
+                            if clipped {
+                                pass.set_scissor_rect(0, 0, self.width, self.height);
+                                clipped = false;
+                            }
+                        }
+                    }
                     let group = match run.image {
-                        Some(id) => self.images.get(id).unwrap_or(&self.atlas_group),
+                        Some(id) => self.images.get(id).map(|p| &p.group).unwrap_or(&self.atlas_group),
                         None => &self.atlas_group,
                     };
                     pass.set_bind_group(1, group, &[]);
@@ -846,4 +991,37 @@ pub fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
         other => return Err(format!("unsupported colour type {other:?}")),
     };
     Ok((info.width, info.height, rgba))
+}
+
+/// Shrink an RGBA picture so that neither side exceeds `max` (a box filter; pictures for tiles).
+pub fn shrink_rgba(w: u32, h: u32, rgba: &[u8], max: u32) -> (u32, u32, Vec<u8>) {
+    if w <= max && h <= max {
+        return (w, h, rgba.to_vec());
+    }
+    let f = (w.max(h) as f32 / max as f32).ceil() as u32;
+    let (nw, nh) = ((w / f).max(1), (h / f).max(1));
+    let mut out = vec![0u8; (nw * nh * 4) as usize];
+    for y in 0..nh {
+        for x in 0..nw {
+            let mut acc = [0u32; 4];
+            let mut n = 0u32;
+            for dy in 0..f {
+                for dx in 0..f {
+                    let (sx, sy) = (x * f + dx, y * f + dy);
+                    if sx < w && sy < h {
+                        let i = ((sy * w + sx) * 4) as usize;
+                        for c in 0..4 {
+                            acc[c] += rgba[i + c] as u32;
+                        }
+                        n += 1;
+                    }
+                }
+            }
+            let o = ((y * nw + x) * 4) as usize;
+            for c in 0..4 {
+                out[o + c] = (acc[c] / n.max(1)) as u8;
+            }
+        }
+    }
+    (nw, nh, out)
 }

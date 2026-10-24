@@ -13,7 +13,7 @@ The plan, the decisions and every measurement taken on the console are in
 | 1 — Rust's standard library on the console, as a Games-row title | **done, 10/10 checks on hardware** (threads, clocks, files, directories, 64 MB allocations, random, TCP in and out of the sandbox) |
 | 2 — Flash on the TV as a payload (SDL2 + Mesa/zink on RADV + Ruffle core) | set aside: RADV runs in a payload process, but every launcher that gives a payload the GPU's memory budget is refused by `libSceAgc` (`FS Table offset has shifted`) — see the plan, §5j–5l |
 | 3 — the standalone title: Ruffle's wgpu renderer on a **statically linked RADV** | **done — Ruffle plays Flash on the console** (2026-10-21): `ruffle-ps5-title/` builds a 43 MB Games-row title (Rust std + Ruffle + wgpu 30 + the RADV archive + the SDK fork's platform layer); wgpu comes up on RADV in 60–90 ms and presents at 1920x1080 through `VK_KHR_display` on VideoOut; the DualSense is the keyboard and mouse, sound goes through AudioOut |
-| 4 — the product, **Ruffle5** | in progress: the title opens on its own menu (games folder, stage + shelf, Settings; design after ProsperoStore), a drawn pointer, per-game key mappings (`controls.txt`, shipped presets), f32 mixing; next: measurements on real games |
+| 4 — the product, **Ruffle5** | in progress: its own menu in Ruffle's colours over the ruffle.rs logo animation (Games, Favorites, Recent, Badges, Settings; layout after ProsperoStore), 4K output, a controls editor writing `Custom Mappings/`, a quick menu, on-screen keyboard, USB keyboard/mouse, saves, covers, Ruffle's player options; a `[Game] ms per loop` log in Ruffle-Flash-PS5's format; next: the 1.000.020 build on hardware, measurements on real games |
 
 ## What is here
 

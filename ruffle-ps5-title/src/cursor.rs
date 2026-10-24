@@ -1,4 +1,4 @@
-//! PS5_RUFFLE_CURSOR_V2 — a mouse pointer drawn over Ruffle's frame.
+//! PS5_RUFFLE_CURSOR_V3 — a mouse pointer drawn over Ruffle's frame.
 //!
 //! Ruffle draws no cursor (a desktop's window system does that), so on the TV there was nothing to
 //! show where the touchpad had put the mouse. `CursorPainter` paints an arrow at the pointer in one
@@ -6,6 +6,10 @@
 //! is presented. The arrow is 15 vertices in the shader (no vertex buffer), drawn five times by
 //! instancing: four black copies offset by two pixels make the outline, the fifth, white, is the
 //! pointer. `Cursor` is the shared state the input side updates (position, visible).
+//!
+//! V3: the pointer's position is in the game's own pixels (`space`: 1920x1080, or 3840x2160 when a
+//! game renders in 4K) and the painter maps it onto the display, whatever its size; the arrow is
+//! drawn at the display's scale, so it is as sharp in 4K as the rest.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::sync::{Arc, Mutex};
@@ -16,6 +20,9 @@ pub struct Cursor {
     pub y: f32,
     pub visible: bool,
     pub scale: f32,
+    /// The size of the coordinate space x and y are in (the game's viewport).
+    pub space_w: f32,
+    pub space_h: f32,
 }
 
 pub type SharedCursor = Arc<Mutex<Cursor>>;
@@ -26,6 +33,8 @@ pub fn shared(x: f32, y: f32, scale: f32) -> SharedCursor {
         y,
         visible: false,
         scale,
+        space_w: crate::ui::W,
+        space_h: crate::ui::H,
     }))
 }
 
@@ -34,7 +43,7 @@ struct Params {
     pos: vec2<f32>,
     viewport: vec2<f32>,
     scale: f32,
-    _pad0: f32,
+    outline: f32,
     _pad1: vec2<f32>,
 };
 @group(0) @binding(0) var<uniform> params: Params;
@@ -60,7 +69,7 @@ struct VsOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
-    let p = SHAPE[vi] * params.scale + OFFSETS[ii] + params.pos;
+    let p = SHAPE[vi] * params.scale + OFFSETS[ii] * params.outline + params.pos;
     let ndc = vec2<f32>(p.x / params.viewport.x * 2.0 - 1.0, 1.0 - p.y / params.viewport.y * 2.0);
     var out: VsOut;
     out.pos = vec4<f32>(ndc, 0.0, 1.0);
@@ -176,13 +185,16 @@ impl CursorPainter {
         if !c.visible {
             return None;
         }
+        // Game pixels to display pixels; the arrow's size follows the display (1920 wide = 1).
+        let sx = self.width as f32 / c.space_w.max(1.0);
+        let sy = self.height as f32 / c.space_h.max(1.0);
         let params: [f32; 8] = [
-            c.x.round(),
-            c.y.round(),
+            (c.x * sx).round(),
+            (c.y * sy).round(),
             self.width as f32,
             self.height as f32,
-            c.scale,
-            0.0,
+            c.scale * self.width as f32 / crate::ui::W,
+            self.width as f32 / crate::ui::W,
             0.0,
             0.0,
         ];

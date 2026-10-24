@@ -1,4 +1,4 @@
-//! PS5_RUFFLE_AUDIO_V4 — Ruffle's mixer on the console's speaker.
+//! PS5_RUFFLE_AUDIO_V5 — Ruffle's mixer on the console's speaker.
 //!
 //! Ruffle mixes every sound into whatever buffer the platform asks for; this backend asks on a
 //! thread that feeds AudioOut grains of 48 kHz s16 stereo (shell/pad.c: the port PS5_RetroArch's
@@ -18,6 +18,8 @@
 //! sounds great, some sound effects sound like garbled noise"). Ruffle's desktop and web
 //! frontends mix in f32 and let the device clip, which is what Flash did. The score line also
 //! counts samples that had to be clamped.
+//!
+//! V5: the mixing thread pins itself to the core src/cpu.rs keeps for sound.
 //!
 //! V4: a backend ends with its player (one per game, src/lib.rs): dropping it stops the thread,
 //! joins it (at most one grain) and closes the port, so the next game's `sceAudioOutOpen` finds
@@ -84,6 +86,11 @@ impl Ps5AudioBackend {
         let thread = std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
+                // V5: the sound on a CPU core of its own (src/cpu.rs), so a busy game cannot make it
+                // miss its deadline.
+                if let Some(warn) = crate::cpu::pin_audio_thread() {
+                    log(&warn);
+                }
                 let mut mixed = vec![0f32; frames * 2];
                 let mut buf = vec![0i16; frames * 2];
                 let mut grains = 0u64;

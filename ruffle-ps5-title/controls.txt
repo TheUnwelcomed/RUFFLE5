@@ -1,23 +1,30 @@
 # ruffle-ps5 controls — what each DualSense button does in a Flash game.
 #
-# Where this file goes (read in this order, each layer only changing the lines it sets):
-#   <title folder>/controls.txt             shipped: this file
-#   /data/ruffle/controls.txt               yours, every game
-#   <title folder>/<game>.controls.txt      shipped preset for <game>.swf (presets/ in the repo)
-#   /data/ruffle/<game>.controls.txt        yours, <game>.swf only (wins over everything)
-# What was read and applied is written to /data/ruffle/ruffle.log ("controls:" lines).
+# The easy way: Triangle on a game in the menu (that game), or Settings > Controls & Sound >
+# Controls for all games. The editor writes the files below; this one documents the format.
+#
+# The files, read in this order (each layer only changes the lines it sets):
+#   <title folder>/controls.txt                         shipped: this file (all comments)
+#   Custom Mappings/_All Games.controls.txt             every game
+#   Custom Mappings/<game>.controls.txt                 <game>.swf only: the editor's, or a shipped
+#                                                       preset (dadnme.controls.txt)
+#   <game>.controls.txt beside the SWF                  still read, last (wins over everything); one
+#                                                       directly in games/ is moved to Custom Mappings
+# Custom Mappings is /data/homebrew/PPSA99620/Custom Mappings. What was read and applied is written
+# to /data/ruffle5/ruffle.log ("controls:" lines).
 #
 # One setting per line: button = key[, key...]   (several keys = pressed together)
 #   buttons: cross circle square triangle l1 r1 l2 r2 l3 r3 options touchpad up down left right
 #            (up/down/left/right are the d-pad, and the left stick while left_stick = dpad)
 #   keys:    a..z 0..9 - = [ ] \ ; ' , . / `   space enter escape shift control alt tab backspace
 #            up down left right pageup pagedown home end insert delete f1..f12 numpad0..numpad9
-#   mouse:   click (left button at the pointer), rightclick, none (the button does nothing)
+#   mouse:   click (left button at the pointer), rightclick
+#   other:   keyboard (opens the on-screen keyboard), none (the button does nothing)
 #
 # The defaults built in (this file, as shipped, changes nothing — every line is a comment):
 #   up = up          down = down      left = left      right = right
 #   cross = space    circle = c       square = z       triangle = x
-#   l1 = shift       r1 = control     l2 = rightclick  r2 = click
+#   l1 = shift       r1 = control     l2 = keyboard    r2 = click
 #   l3 = a           r3 = s           options = enter  touchpad = click
 #   left_stick = dpad      right_stick = mouse      pointer_speed = 1100
 #   cursor = auto          cursor_hide = 3          cursor_scale = 1.75
@@ -32,6 +39,7 @@
 #left = left, a
 #right = right, d
 #cross = click              # a mouse game: Cross clicks where the pointer is
+#l2 = rightclick            # L2 as the right mouse button (as before 1.000.020)
 #left_stick = mouse         # ...and the left stick moves the pointer
 #right_stick = off
 #pointer_speed = 1600       # faster stick pointer

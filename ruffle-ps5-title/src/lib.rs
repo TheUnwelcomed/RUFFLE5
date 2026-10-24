@@ -1,18 +1,22 @@
-//! PS5_RUFFLE_V5 — Ruffle5: Ruffle as a PlayStation 5 title, with its own menu (milestone 4).
+//! PS5_RUFFLE_V6 — Ruffle5: Ruffle as a PlayStation 5 title, with its own menu.
 //!
 //! The C shell (shell/main.c) calls `sceAgcInit(8)` from the executable, then `ruffle_ps5_main`.
 //! Two phases, so the novel GPU seam is proven before Ruffle rides on it:
 //!   * 3a (the default build): bring up wgpu on the static RADV and clear the display to an
-//!     animated colour for a few seconds. Colour on the TV means the static-RADV + VK_KHR_display +
-//!     wgpu path works in a title — the thing the payload route could never get.
+//!     animated colour for a few seconds.
 //!   * 3b (feature `ruffle`): the title proper. It opens on a menu (src/menu.rs, drawn by
-//!     src/ui.rs) listing the games folder; Cross builds a Ruffle player for the chosen SWF and
-//!     plays it through ruffle_render_wgpu on the shared display (src/shell.rs); holding OPTIONS
-//!     in a game drops that player and returns to the menu; holding Circle in the menu ends the
-//!     title. A game plays with the DualSense as keyboard and mouse (src/input.rs, mapping from
-//!     src/controls.rs's files), a drawn pointer (src/cursor.rs) and sound (src/audio.rs).
+//!     src/ui.rs over ruffle.rs's logo animation, src/background.rs) listing the games folder;
+//!     Cross plays a game (src/game.rs) through ruffle_render_wgpu on the shared display
+//!     (src/shell.rs), Triangle edits its controls (src/editor.rs), Settings holds Ruffle's player
+//!     options and Ruffle5's own (src/settings.rs). Holding Circle in the menu ends the title.
 //!
-//! Progress is toasted on the TV and written to /data/ruffle/ruffle.log by the shell's `ps5_log`.
+//! V6 (1.000.020, 2026-10-24): the display at 3840x2160 and games in 4K or 1080p; Ruffle's colours
+//! and logo; the controls editor and "Custom Mappings"; saves on disk; the quick menu, on-screen
+//! keyboard, covers, favourites, play time, search, badges, menu sounds, USB keyboard and mouse,
+//! and Ruffle's player options — most after Ruffle-Flash-PS5 by ZiZc3 (GPL-3.0); the frame-time
+//! log in its format; the sound on a CPU core of its own; data in /data/ruffle5.
+//!
+//! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::ffi::{c_char, c_int, CStr};
@@ -21,39 +25,91 @@ use std::time::{Duration, Instant};
 /// The title's version, as Settings shows it.
 pub const APP_VERSION: &str = "1.000.020";
 pub const APP_NAME: &str = "Ruffle5";
+pub const AUTHOR: &str = "@TheUnwelcomed";
 
 #[cfg(feature = "ruffle")]
 mod audio;
 #[cfg(feature = "ruffle")]
+mod background;
+#[cfg(feature = "ruffle")]
+mod badges;
+#[cfg(feature = "ruffle")]
 mod controls;
 #[cfg(feature = "ruffle")]
+mod covers;
+#[cfg(feature = "ruffle")]
+mod cpu;
+#[cfg(feature = "ruffle")]
 mod cursor;
+#[cfg(feature = "ruffle")]
+mod editor;
+#[cfg(feature = "ruffle")]
+mod fsutil;
+#[cfg(feature = "ruffle")]
+mod game;
 mod gpu;
+#[cfg(feature = "ruffle")]
+mod hid;
 #[cfg(feature = "ruffle")]
 mod input;
 #[cfg(feature = "ruffle")]
+mod keyboard;
+#[cfg(feature = "ruffle")]
+mod library;
+#[cfg(feature = "ruffle")]
 mod menu;
+#[cfg(feature = "ruffle")]
+mod paths;
+#[cfg(feature = "ruffle")]
+mod ps5ui;
+#[cfg(feature = "ruffle")]
+mod quickmenu;
 mod random;
 #[cfg(feature = "ruffle")]
+mod saves;
+#[cfg(feature = "ruffle")]
+mod settings;
+#[cfg(feature = "ruffle")]
 mod shell;
+#[cfg(feature = "ruffle")]
+mod sounds;
 #[cfg(feature = "ruffle")]
 mod swfinfo;
 #[cfg(feature = "ruffle")]
 mod ui;
+#[cfg(feature = "ruffle")]
+mod widgets;
+
+/// For `cargo test` on a PC, the shell's C functions have stand-ins.
+#[cfg(test)]
+mod host;
 
 extern "C" {
     fn ps5_notify(msg: *const c_char);
     fn ps5_log(msg: *const c_char);
+    fn ps5_local_hour() -> c_int;
 }
 
-/// One line to ruffle.log. Serialised: the audio thread logs too, and the shell's `ps5_log` is
-/// plain fprintf.
-static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-fn say(s: &str) {
-    if let Ok(c) = std::ffi::CString::new(s) {
-        let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+/// One line to ruffle.log. Serialised (the audio, writer and cover threads log too), and a line
+/// that repeats the one before is only counted (games can warn the same thing every frame).
+static LOG_LOCK: std::sync::Mutex<(String, u32)> = std::sync::Mutex::new((String::new(), 0));
+fn write_log(s: &str) {
+    if let Ok(c) = std::ffi::CString::new(s.replace('\0', " ")) {
         unsafe { ps5_log(c.as_ptr()) };
     }
+}
+pub(crate) fn say(s: &str) {
+    let mut last = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if last.0 == s {
+        last.1 += 1;
+        return;
+    }
+    if last.1 > 0 {
+        write_log(&format!("    (repeated {} more times)", last.1));
+    }
+    last.0 = s.to_string();
+    last.1 = 0;
+    write_log(s);
 }
 
 /// wgpu-hal says why it declines an adapter, which extensions it lacks, what the swapchain does —
@@ -61,13 +117,15 @@ fn say(s: &str) {
 struct Ps5Logger;
 impl log::Log for Ps5Logger {
     fn enabled(&self, m: &log::Metadata) -> bool {
-        if m.target().starts_with("wgpu_hal") {
+        if m.target().starts_with("avm_trace") {
+            // a game's own trace() output would flood the log
+            false
+        } else if m.target().starts_with("wgpu_hal") {
             m.level() <= log::Level::Debug
         } else if m.target().starts_with("symphonia") {
             // Every MP3 event sound starts with "invalid main_data_begin, underflow by N bytes":
             // its first frame references bit-reservoir bytes from before the cut, and symphonia
-            // zeroes that granule (layer3/mod.rs, read_main_data) — a few ms of silence Flash's
-            // SeekSamples skip anyway, the same on every Ruffle frontend. Not worth a line per hit.
+            // zeroes that granule — a few ms of silence Flash's SeekSamples skip anyway.
             m.level() <= log::Level::Error
         } else {
             m.level() <= log::Level::Info
@@ -81,70 +139,75 @@ impl log::Log for Ps5Logger {
     fn flush(&self) {}
 }
 static LOGGER: Ps5Logger = Ps5Logger;
-fn toast(s: &str) {
-    if let Ok(c) = std::ffi::CString::new(s) {
+
+pub(crate) fn toast(s: &str) {
+    if let Ok(c) = std::ffi::CString::new(s.replace('\0', " ")) {
         unsafe { ps5_notify(c.as_ptr()) };
     }
 }
 
-/// Entry from the C shell. `data_dir` is where the log and the controls live (/data/ruffle),
-/// `games_dir` where the menu looks for SWFs. Returns the number of failures (0 = ok), which the
-/// shell logs.
+/// The console's local hour (0-23), or -1.
+pub(crate) fn local_hour() -> i32 {
+    unsafe { ps5_local_hour() }
+}
+
+/// Entry from the C shell. `data_dir` is Ruffle5's own folder (log, settings, saves), `games_dir`
+/// where the menu looks for SWFs, `mappings_dir` the "Custom Mappings" folder. Returns the number of
+/// failures (0 = ok), which the shell logs.
 #[no_mangle]
-pub extern "C" fn ruffle_ps5_main(data_dir: *const c_char, games_dir: *const c_char) -> c_int {
-    let data_dir = unsafe { CStr::from_ptr(data_dir) }
-        .to_string_lossy()
-        .into_owned();
-    let games_dir = unsafe { CStr::from_ptr(games_dir) }
-        .to_string_lossy()
-        .into_owned();
-    say(&format!(
-        "ruffle-ps5 (PS5_RUFFLE_V5, {APP_NAME} {APP_VERSION}) starting; data dir {data_dir}, games {games_dir}"
-    ));
+pub extern "C" fn ruffle_ps5_main(data_dir: *const c_char, games_dir: *const c_char, mappings_dir: *const c_char) -> c_int {
+    let data_dir = unsafe { CStr::from_ptr(data_dir) }.to_string_lossy().into_owned();
+    let games_dir = unsafe { CStr::from_ptr(games_dir) }.to_string_lossy().into_owned();
+    let mappings_dir = unsafe { CStr::from_ptr(mappings_dir) }.to_string_lossy().into_owned();
+    say(&format!("ruffle-ps5 (PS5_RUFFLE_V6, {APP_NAME} {APP_VERSION}) starting; data {data_dir}, games {games_dir}, mappings {mappings_dir}"));
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(log::LevelFilter::Debug);
     }
-    toast("ruffle-ps5: bringing up RADV");
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "(no message)".into());
+        let place = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        say(&format!("*** panic at {place}: {msg}"));
+        toast(&format!("Ruffle5 stopped: {msg}"));
+    }));
 
     let t_start = Instant::now();
     let gpu = match gpu::create() {
         Ok(g) => {
-            say(&format!(
-                "ok   wgpu on RADV in {:.2} s: {}x{} {:?}; {}",
-                t_start.elapsed().as_secs_f64(),
-                g.width,
-                g.height,
-                g.format,
-                g.report
-            ));
+            say(&format!("ok   wgpu on RADV in {:.2} s: {}x{} {:?}; {}", t_start.elapsed().as_secs_f64(), g.width, g.height, g.format, g.report));
             say(&format!("     adapter: {:?}", g.adapter.get_info()));
             say(&format!("     features: {:?}", g.device.features()));
-            toast(&format!("ruffle-ps5: RADV up, {}x{}", g.width, g.height));
             g
         }
         Err(e) => {
             say(&format!("FAIL wgpu on RADV: {e}"));
-            toast("ruffle-ps5: RADV bring-up failed (see ruffle.log)");
+            toast("Ruffle5: the GPU did not start (see ruffle.log)");
             return 1;
         }
     };
 
     #[cfg(not(feature = "ruffle"))]
-    let result = run_clear(&gpu);
+    let result = {
+        let _ = (&data_dir, &games_dir, &mappings_dir);
+        run_clear(&gpu)
+    };
     #[cfg(feature = "ruffle")]
-    let result = run_app(gpu, &data_dir, &games_dir);
+    let result = run_app(gpu, paths::Paths::new(&data_dir, &games_dir, &mappings_dir));
     match result {
         Ok(()) => 0,
         Err(e) => {
             say(&format!("FAIL {e}"));
-            toast("ruffle-ps5: failed (see ruffle.log)");
+            toast("Ruffle5: failed (see ruffle.log)");
             1
         }
     }
 }
 
-/// 3a: animate a clear colour for 8 seconds, proving present works end to end. The first frame
-/// is logged on its own: it is the one that creates the swapchain.
+/// 3a: animate a clear colour for 8 seconds, proving present works end to end.
 #[cfg(not(feature = "ruffle"))]
 fn run_clear(gpu: &gpu::Gpu) -> Result<(), String> {
     let t0 = Instant::now();
@@ -156,49 +219,79 @@ fn run_clear(gpu: &gpu::Gpu) -> Result<(), String> {
         let b = 0.5 + 0.5 * (t * 0.7).cos();
         gpu::present_clear(gpu, r, g, b).map_err(|e| format!("present at frame {frames}: {e}"))?;
         if frames == 0 {
-            say(&format!(
-                "ok   first frame presented after {:.3} s",
-                t0.elapsed().as_secs_f64()
-            ));
+            say(&format!("ok   first frame presented after {:.3} s", t0.elapsed().as_secs_f64()));
         }
         frames += 1;
     }
     let fps = frames as f64 / t0.elapsed().as_secs_f64();
-    say(&format!(
-        "ok   {frames} frames presented in {:.1} s, {fps:.1} fps",
-        t0.elapsed().as_secs_f64()
-    ));
+    say(&format!("ok   {frames} frames presented in {:.1} s, {fps:.1} fps", t0.elapsed().as_secs_f64()));
     toast(&format!("ruffle-ps5: RADV present OK, {fps:.0} fps"));
     Ok(())
 }
 
+/// Everything the title's screens and games share.
+#[cfg(feature = "ruffle")]
+pub(crate) struct App {
+    pub display: std::sync::Arc<shell::Display>,
+    pub descriptors: std::sync::Arc<ruffle_render_wgpu::descriptors::Descriptors>,
+    pub input: input::Input,
+    pub paths: paths::Paths,
+    pub settings: settings::Settings,
+    pub library: library::Library,
+    pub badges: badges::Badges,
+    pub menu: menu::Menu,
+}
+
+#[cfg(feature = "ruffle")]
+static GPU_ERRORS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// The title proper: the menu, and a player per game chosen from it.
 #[cfg(feature = "ruffle")]
-fn run_app(gpu: gpu::Gpu, data_dir: &str, games_dir: &str) -> Result<(), String> {
-    use ruffle_render_wgpu::target::SwapChainTarget;
+fn run_app(gpu: gpu::Gpu, paths: paths::Paths) -> Result<(), String> {
+    use std::sync::Arc;
 
     let descriptors = gpu::descriptors(&gpu);
-    let gpu::Gpu {
-        surface,
-        adapter,
-        device,
-        queue,
-        width,
-        height,
-        ..
-    } = gpu;
-    // One swapchain for the whole run (src/shell.rs); the pointer state the input side moves.
-    let swap_chain = SwapChainTarget::new(surface, &adapter, (width, height), &device);
+    let gpu::Gpu { surface, device, queue, width, height, config, .. } = gpu;
+    // A GPU validation error is written to the log instead of ending the title (wgpu's default
+    // handler panics, and a title's panic is an abort).
+    device.on_uncaptured_error(Arc::new(|e: wgpu::Error| {
+        let n = GPU_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 20 {
+            say(&format!("warn wgpu error #{}: {e}", n + 1));
+        }
+    }));
     let cursor = cursor::shared(width as f32 / 2.0, height as f32 / 2.0, 1.75);
-    let display = shell::Display::new(swap_chain, device.clone(), queue.clone(), std::sync::Arc::clone(&cursor))?;
-    say(&format!("ok   display shared: {}x{} {:?}; ui fonts loaded", display.width, display.height, display.format));
+    let display = shell::Display::new(surface, config, device.clone(), queue.clone(), Arc::clone(&cursor))?;
+    say(&format!("ok   display {}x{} {:?}; ui fonts loaded (scale {})", display.width, display.height, display.format, width as f32 / ui::W));
+    log::set_max_level(log::LevelFilter::Info);
 
-    // The controller, for the menu and every game (a game's mapping is set when it starts).
-    let mut input = input::Input::new(width, height, controls::Controls::default(), cursor);
+    // Files: Ruffle5's own folder, Custom Mappings, the old places moved over once.
+    let _ = std::fs::create_dir_all(&paths.data);
+    let _ = std::fs::create_dir_all(&paths.mappings);
+    for line in controls::migrate(&paths) {
+        say(&format!("     {line}"));
+    }
+    let settings = settings::Settings::load(&paths.file("settings.txt"));
+    say(&format!("     settings: {settings:?}"));
+    let mut library = library::Library::load(&paths.file("library.txt"), &paths.file("session.txt"));
+    if let Some((key, secs)) = library.recover_session() {
+        say(&format!("     counted {secs} s of {key} from a session that was cut off"));
+    }
+    let mut badges = badges::Badges::load(&paths.file("stats.txt"), &paths.file("badges.txt"));
+    badges.enabled = settings.badges;
+    say(&format!("     {}", cpu::init()));
+    say(&format!("     {}", sounds::init()));
+    sounds::set_enabled(settings.ui_sounds);
+
+    // The controller (the menus' pad; a game's mapping is set when it starts), and USB devices.
+    let mut input = input::Input::new(1920, 1080, controls::Controls::base_game(&paths), cursor);
     say(&format!("     {}", input.report));
+    for line in input.open_usb() {
+        say(&format!("     {line}"));
+    }
+    input.mouse_speed = settings.mouse_multiplier();
 
-    // The menu: what the games folder holds.
-    let mut menu = menu::Menu::new(games_dir, "/app0");
+    let mut menu = menu::Menu::new(&paths);
     {
         let mut ui = display.ui.lock().map_err(|_| "ui lock")?;
         menu.load_pictures(&mut ui, &display.device, &display.queue);
@@ -206,180 +299,157 @@ fn run_app(gpu: gpu::Gpu, data_dir: &str, games_dir: &str) -> Result<(), String>
     for line in &menu.report {
         say(&format!("     {line}"));
     }
-    toast(&format!("Ruffle5: {} game(s)", menu.games.len()));
+    let live = menu.live(&library);
+    badges.check(&live);
 
-    let mut scene = ui::Scene::new();
-    let mut last = Instant::now();
+    let mut app = App { display, descriptors, input, paths, settings, library, badges, menu };
     let mut events = Vec::new();
     loop {
         // ---- the menu ----
-        input.reset();
+        app.input.reset();
+        app.menu.enter(app.settings.animated_background);
+        let mut bg = make_background(&app);
+        let mut editor: Option<editor::Editor> = None;
+        let mut last = Instant::now();
+        let _ = app.display.stats.take();
         let chosen = loop {
             let now = Instant::now();
-            let dt = now.duration_since(last).as_secs_f64().min(0.1);
+            let dt = now.duration_since(last).as_secs_f32().min(0.1);
             last = now;
             events.clear();
-            if let Some(note) = input.poll(dt, &mut events) {
+            if let Some(note) = app.input.poll(dt as f64, &mut events) {
                 say(&format!("ok   {note}"));
             }
-            match menu.update(dt as f32, input.raw_pressed, input.raw_down) {
-                Some(menu::Action::Play(k)) => break Some(k),
+            for notice in std::mem::take(&mut app.input.hid_frame.notices) {
+                app.menu.toast(notice);
+            }
+            if let Some(mut ed) = editor.take() {
+                if ed.update(dt, app.input.nav) {
+                    if let Some(msg) = ed.save(say) {
+                        app.menu.toast(&msg);
+                        app.badges.stats.controls += 1;
+                        let live = app.menu.live(&app.library);
+                        app.badges.check(&live);
+                    }
+                    app.menu.refresh_mappings();
+                    sounds::play(sounds::Sfx::Back);
+                } else {
+                    editor = Some(ed);
+                }
+            }
+            let action = if editor.is_none() {
+                let typed = app.input.typed.clone();
+                let pad = menu::PadIn {
+                    nav: app.input.nav,
+                    pressed: app.input.raw_pressed,
+                    down: app.input.raw_down,
+                    typed: &typed,
+                    backspace: app.input.backspace,
+                };
+                app.menu.update(dt, &pad, &mut app.settings, &mut app.library, &mut app.badges)
+            } else {
+                None
+            };
+            match action {
+                Some(menu::Action::Play(i)) => break Some(i),
                 Some(menu::Action::Quit) => break None,
+                Some(menu::Action::EditControls(i)) => {
+                    if let Some(g) = app.menu.games.get(i) {
+                        let target = editor::Target::Game { stem: g.stem.clone(), name: g.name.clone() };
+                        let path = g.path.clone();
+                        editor = Some(editor::Editor::open(&app.paths, target, Some(&path)));
+                    }
+                }
+                Some(menu::Action::EditAllControls) => editor = Some(editor::Editor::open(&app.paths, editor::Target::AllGames, None)),
+                Some(menu::Action::Rescan) => {
+                    app.menu.scan(&app.paths);
+                    if let Ok(mut ui) = app.display.ui.lock() {
+                        app.menu.load_pictures(&mut ui, &app.display.device, &app.display.queue);
+                    }
+                    for line in &app.menu.report {
+                        say(&format!("     {line}"));
+                    }
+                    let found = format!("{} game(s) found", app.menu.games.len());
+                    app.menu.toast(&found);
+                    let live = app.menu.live(&app.library);
+                    app.badges.check(&live);
+                }
+                Some(menu::Action::ClearRecent) => {}
+                Some(menu::Action::Setting(row)) => apply_setting(&mut app, row, &mut bg),
                 None => {}
             }
-            scene.clear();
-            {
-                let mut ui = display.ui.lock().map_err(|_| "ui lock")?;
-                menu.draw(&mut ui, &mut scene, dt as f32);
+            if app.input.nav != 0 {
+                if let Some(b) = bg.as_mut() {
+                    b.nudge();
+                }
             }
-            display.present_scene(&scene, ui::Color::rgb(0x0e0f12))?;
+            let mut scene = ui::Scene::new();
+            {
+                let mut ui = app.display.ui.lock().map_err(|_| "ui lock")?;
+                app.menu.poll_cover(dt, &mut ui, &app.display.device, &app.display.queue);
+                app.menu.draw(&mut ui, &mut scene, dt, &app.settings, &app.library, &mut app.badges, bg.is_some());
+                if let Some(ed) = editor.as_mut() {
+                    ed.draw(&mut ui, &mut scene, 1.0, false);
+                }
+            }
+            match bg.as_mut() {
+                Some(b) => b.frame(&app.display, dt as f64, scene),
+                None => app.display.present_scene(&scene, widgets::BLUE)?,
+            }
         };
-        let Some(k) = chosen else {
+        drop(bg);
+        app.display.set_overlay(ui::Scene::new());
+        let Some(gi) = chosen else {
             say("menu: closing (Circle held)");
-            toast("Ruffle5: bye");
+            app.settings.save(&app.paths.file("settings.txt"));
+            app.library.save();
+            app.badges.save();
+            // let the writer thread finish
+            std::thread::sleep(Duration::from_millis(300));
             return Ok(());
         };
-        let (swf_path, name) = match menu.games.get(k) {
-            Some(g) => (g.path.clone(), g.name.clone()),
-            None => continue,
-        };
 
-        // ---- a game ----
-        say(&format!("menu: play {name} ({swf_path})"));
-        toast(&format!("Ruffle5: {name}"));
-        let outcome = play_game(&display, &descriptors, &mut input, data_dir, &swf_path, &mut events);
-        display.set_overlay(ui::Scene::new());
-        match outcome {
-            Ok(()) => say(&format!("menu: back from {name}")),
-            Err(e) => {
-                say(&format!("FAIL {name}: {e}"));
-                toast(&format!("Ruffle5: {name} failed (see ruffle.log)"));
-            }
+        // ---- a game (again, while the quick menu says restart) ----
+        while game::play(&mut app, gi) == game::GameEnd::Restart {
+            say("game: restarting");
         }
-        last = Instant::now();
     }
 }
 
-/// Play one SWF until OPTIONS is held: a fresh player on the shared display, its own audio
-/// backend, the game's controls. Returns when the player is dropped.
 #[cfg(feature = "ruffle")]
-fn play_game(
-    display: &std::sync::Arc<shell::Display>,
-    descriptors: &std::sync::Arc<ruffle_render_wgpu::descriptors::Descriptors>,
-    input: &mut input::Input,
-    data_dir: &str,
-    swf_path: &str,
-    events: &mut Vec<ruffle_core::events::PlayerEvent>,
-) -> Result<(), String> {
-    use ruffle_core::backend::audio::AudioBackend;
-    use ruffle_core::backend::audio::NullAudioBackend;
-    use ruffle_core::backend::log::NullLogBackend;
-    use ruffle_core::backend::navigator::{NullExecutor, NullNavigatorBackend};
-    use ruffle_core::backend::storage::MemoryStorageBackend;
-    use ruffle_core::backend::ui::NullUiBackend;
-    use ruffle_core::tag_utils::SwfMovieData;
-    use ruffle_core::PlayerBuilder;
-    use ruffle_render_wgpu::backend::WgpuRenderBackend;
-
-    let t0 = Instant::now();
-    let data = std::fs::read(swf_path).map_err(|e| format!("read {swf_path}: {e}"))?;
-    let movie = SwfMovieData::from_data(&data, format!("file://{swf_path}"), None, None)
-        .map_err(|e| format!("parse swf: {e}"))?;
-    // The game's folder is its base path: files it loads sit beside it.
-    let base = std::path::Path::new(swf_path)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| data_dir.to_string());
-
-    // What the pad does for this movie: defaults, then the layers of files (src/controls.rs).
-    let controls = controls::Controls::load(data_dir, swf_path);
-    for line in &controls.report {
-        say(&format!("     {line}"));
+fn make_background(app: &App) -> Option<background::Background> {
+    if !app.settings.animated_background {
+        return None;
     }
-    say("     controls in effect:");
-    for line in controls.summary() {
-        say(&format!("       {line}"));
-    }
-    input.set_controls(controls);
-
-    let renderer = WgpuRenderBackend::new(std::sync::Arc::clone(descriptors), display.target())
-        .map_err(|e| format!("renderer: {e}"))?;
-    let audio: Box<dyn AudioBackend> = match audio::Ps5AudioBackend::new(say) {
-        Ok(a) => {
-            say(&format!("ok   AudioOut open: 48 kHz s16 stereo, {}-frame grains", a.grain));
-            Box::new(a)
-        }
+    match background::Background::new(&app.display, &app.descriptors) {
+        Ok(b) => Some(b),
         Err(e) => {
-            say(&format!("warn no sound: {e}"));
-            Box::new(NullAudioBackend::new())
-        }
-    };
-    let mut executor = NullExecutor::new();
-    let player = PlayerBuilder::new()
-        .with_renderer(renderer)
-        .with_boxed_audio(audio)
-        .with_letterbox(ruffle_core::config::Letterbox::On)
-        .with_navigator(
-            NullNavigatorBackend::with_base_path(std::path::Path::new(&base), &executor)
-                .map_err(|e| format!("navigator base path: {e}"))?,
-        )
-        .with_storage(Box::new(MemoryStorageBackend::new()))
-        .with_ui(NullUiBackend::new())
-        .with_log(NullLogBackend::new())
-        .with_movie(movie)
-        .with_viewport_dimensions(display.width, display.height, 1.0)
-        .with_autoplay(true)
-        .build();
-    say(&format!("ok   player built in {:.2} s; entering frame loop", t0.elapsed().as_secs_f64()));
-
-    let mut last = Instant::now();
-    let mut hold = 0.0f32;
-    let mut overlay = ui::Scene::new();
-    let frame = Duration::from_micros(16_666);
-    loop {
-        let now = Instant::now();
-        let dt = now.duration_since(last);
-        last = now;
-        events.clear();
-        if let Some(note) = input.poll(dt.as_secs_f64(), events) {
-            say(&format!("ok   {note}"));
-        }
-        // Holding OPTIONS: the bar appears, fills, and the game ends.
-        if input.raw_down & input::BTN_OPTIONS != 0 {
-            hold += dt.as_secs_f32();
-        } else {
-            hold = 0.0;
-        }
-        if hold >= menu::HOLD_TOTAL {
-            say("game: OPTIONS held, returning to the menu");
-            break;
-        }
-        overlay.clear();
-        if hold > menu::HOLD_SHOW_AFTER {
-            if let Ok(mut ui) = display.ui.lock() {
-                menu::draw_hold_bar(&mut ui, &mut overlay, hold, "Keep holding to return to the menu", menu::Glyph::Chip("OPTIONS"));
-            }
-        }
-        display.set_overlay(std::mem::take(&mut overlay));
-        {
-            let mut p = player.lock().unwrap();
-            for event in events.drain(..) {
-                p.handle_event(event);
-            }
-            p.tick(ruffle_core::FloatDuration::from_millis(dt.as_secs_f64() * 1000.0));
-            if p.needs_render() || hold > 0.0 {
-                p.render();
-            }
-        }
-        executor.run();
-        // The surface is FIFO: present paces the loop at the display's rate. A floor for a
-        // movie that needs no render this frame.
-        if dt < frame {
-            std::thread::sleep(frame - dt);
+            say(&format!("warn menu background: {e} (a still one instead)"));
+            None
         }
     }
-    // The player goes (its renderer's handle to the display, its audio port) before the menu
-    // draws again.
-    drop(player);
-    Ok(())
+}
+
+/// A setting changed in the menu: save it, and apply what applies at once.
+#[cfg(feature = "ruffle")]
+fn apply_setting(app: &mut App, row: settings::Row, bg: &mut Option<background::Background>) {
+    use settings::Row;
+    match row {
+        Row::UiSounds => sounds::set_enabled(app.settings.ui_sounds),
+        Row::Badges => app.badges.enabled = app.settings.badges,
+        Row::MouseSpeed => app.input.mouse_speed = app.settings.mouse_multiplier(),
+        Row::AnimatedBackground => {
+            if app.settings.animated_background {
+                *bg = make_background(app);
+            } else {
+                *bg = None;
+            }
+        }
+        _ => {}
+    }
+    app.settings.save(&app.paths.file("settings.txt"));
+    app.badges.stats.settings += 1;
+    let live = app.menu.live(&app.library);
+    app.badges.check(&live);
+    say(&format!("settings: {} = {}", row.label(), row.value(&app.settings)));
 }

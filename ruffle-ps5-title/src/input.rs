@@ -1,21 +1,28 @@
-//! PS5_RUFFLE_INPUT_V3 — the DualSense as Ruffle's keyboard and mouse (and the menu's pad).
+//! PS5_RUFFLE_INPUT_V4 — the DualSense (and a USB keyboard and mouse) as Ruffle's keyboard and
+//! mouse, and as the menus' pad.
 //!
 //! The pad is read through shell/pad.c (scePad, the hardware-verified sample layout). Each pad
-//! button does what the controls say (src/controls.rs: the defaults, `/data/ruffle/controls.txt`,
-//! `<movie>.controls.txt`): one or more keys, sent to Ruffle as ordinary key events, or a mouse
-//! click at the pointer. The left stick is a d-pad by default; the touchpad is the screen (its
-//! surface reports 1920x1080 coordinates), a touch moves the mouse there; the right stick moves it
-//! too; the touchpad's click and R2 are the left button, L2 the right. The pointer is drawn by
-//! src/cursor.rs from the state this module keeps up to date.
+//! button does what the controls say (src/controls.rs): one or more keys, sent to Ruffle as ordinary
+//! key events, a mouse click at the pointer, or the on-screen keyboard. The left stick is a d-pad by
+//! default; the touchpad is the screen (its surface reports 1920x1080 coordinates), a touch moves
+//! the mouse there; the right stick moves it too. The pointer is drawn by src/cursor.rs from the
+//! state this module keeps up to date.
+//!
+//! V4: the pointer lives in the game's own pixels (`set_viewport`: 1920x1080, or 3840x2160 for a
+//! game in 4K), sticks moving it at the same speed either way. A USB keyboard and mouse (src/hid.rs)
+//! play too: keys and typed characters go to the game, the mouse points, clicks and scrolls, Esc
+//! asks for the quick menu (`menu_request`). In the menus (`game` false) the keyboard's arrows,
+//! Enter, Esc and Tab act as the pad's d-pad, Cross, Circle and R1, and what is typed is in `typed`.
 //!
 //! A key held by two buttons at once is pressed once and released when the last button lets go.
-//! `raw_down` / `raw_pressed` carry the plain button bits of the last poll for the shell's own
-//! screens (src/menu.rs), which read the pad directly rather than through a game's mapping.
+//! `raw_down` / `raw_pressed` carry the plain button bits of the last poll for the title's own
+//! screens, which read the pad directly rather than through a game's mapping.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::controls::{Action, Button, Controls, CursorMode, Key, StickRole};
 use crate::cursor::SharedCursor;
-use ruffle_core::events::{MouseButton, PlayerEvent};
+use crate::hid::{self, Hid, HidFrame};
+use ruffle_core::events::{MouseButton, MouseWheelDelta, PlayerEvent};
 use std::collections::HashMap;
 
 #[repr(C)]
@@ -62,6 +69,7 @@ const BTN_INTERCEPTED: u32 = 0x8000_0000;
 // verified ones; the digital L2/R2 bits are not relied on).
 pub const BTN_L2: u32 = 0x0100;
 pub const BTN_R2: u32 = 0x0200;
+pub const DPAD: u32 = BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT;
 
 const STICK_CENTRE: i32 = 128;
 const STICK_DEADZONE: i32 = 40;
@@ -106,32 +114,59 @@ pub struct Input {
     touch_id: u8,
     /// Seconds since the pointer last moved (for hiding the cursor).
     idle: f64,
+    user: i32,
+    pub hid: Hid,
+    /// The USB keyboard and mouse's last read.
+    pub hid_frame: HidFrame,
     pub report: String,
-    /// The last poll's buttons (BTN_ bits; the sticks as d-pad and the triggers merged in).
+    /// The last poll's buttons (BTN_ bits; the sticks as d-pad, the triggers and, in the menus, the
+    /// keyboard's arrows/Enter/Esc/Tab merged in).
     pub raw_down: u32,
     /// The buttons that went down in the last poll.
     pub raw_pressed: u32,
+    /// Buttons drive the game (true) or only the title's screens.
+    pub game: bool,
+    /// The pad's buttons reach the game (false while the on-screen keyboard has them).
+    pub pad_to_game: bool,
+    /// A button bound to the on-screen keyboard was pressed.
+    pub keyboard_toggle: bool,
+    /// Esc on a USB keyboard: the quick menu, please.
+    pub menu_request: bool,
+    /// Characters typed on a USB keyboard this poll (the menus' search), and Backspace presses.
+    pub typed: Vec<char>,
+    pub backspace: bool,
+    /// USB mouse: game pixels per count (Settings).
+    pub mouse_speed: f64,
+    /// The pointer moved this poll (overlays and the cursor need a fresh frame).
+    pub moved: bool,
+    /// `raw_pressed` plus the d-pad's repeats while held (lists in the menus).
+    pub nav: u32,
+    repeat_bits: u32,
+    repeat_at: f64,
 }
+
+/// A held d-pad direction repeats after this, then every `REPEAT_EVERY` seconds.
+const REPEAT_AFTER: f64 = 0.36;
+const REPEAT_EVERY: f64 = 0.085;
 
 impl Input {
     /// Initialise the pad services; the controller itself is opened lazily (`poll` retries).
     pub fn new(width: u32, height: u32, controls: Controls, cursor: SharedCursor) -> Self {
         let mut detail = 0i32;
         let rc = unsafe { ps5_pad_init(&mut detail) };
-        let report = if rc == 0 {
-            format!("pad services up, user {detail}")
+        let (report, user) = if rc == 0 {
+            (format!("pad services up, user {detail}"), detail)
         } else {
-            format!(
-                "pad services: step {rc} failed with 0x{:08x}",
-                detail as u32
-            )
+            (format!("pad services: step {rc} failed with 0x{:08x}", detail as u32), -1)
         };
         let pointer = (width as f64 / 2.0, height as f64 / 2.0);
         if let Ok(mut c) = cursor.lock() {
             c.x = pointer.0 as f32;
             c.y = pointer.1 as f32;
             c.scale = controls.cursor_scale;
-            c.visible = controls.cursor == CursorMode::On;
+            c.visible = false;
+            c.space_w = width as f32;
+            c.space_h = height as f32;
         }
         Self {
             controls,
@@ -147,10 +182,30 @@ impl Input {
             touching: false,
             touch_id: 0,
             idle: 0.0,
+            user,
+            hid: Hid::none(),
+            hid_frame: HidFrame::default(),
             report,
             raw_down: 0,
             raw_pressed: 0,
+            game: false,
+            pad_to_game: true,
+            keyboard_toggle: false,
+            menu_request: false,
+            typed: Vec::new(),
+            backspace: false,
+            mouse_speed: 1.2,
+            moved: false,
+            nav: 0,
+            repeat_bits: 0,
+            repeat_at: 0.0,
         }
+    }
+
+    /// Open the USB keyboard and mouse (once, at start); lines for the log.
+    pub fn open_usb(&mut self) -> Vec<String> {
+        self.hid = Hid::open(self.user);
+        std::mem::take(&mut self.hid.report)
     }
 
     /// A new game's mapping. Nothing is held any more: the player the holds were for is gone.
@@ -166,13 +221,62 @@ impl Input {
         self.controls = controls;
     }
 
+    /// The game's pixel size: where the pointer moves. The pointer keeps its place on the screen.
+    pub fn set_viewport(&mut self, width: u32, height: u32) {
+        let (ow, oh) = self.viewport;
+        let (w, h) = (width.max(1) as f64, height.max(1) as f64);
+        self.pointer = (self.pointer.0 / ow * w, self.pointer.1 / oh * h);
+        self.viewport = (w, h);
+        if let Ok(mut c) = self.cursor.lock() {
+            c.space_w = w as f32;
+            c.space_h = h as f32;
+            c.x = self.pointer.0 as f32;
+            c.y = self.pointer.1 as f32;
+        }
+    }
+
     /// Hide the pointer (the menu draws none) and forget the holds.
     pub fn reset(&mut self) {
         self.keys_held.clear();
         self.left_held = 0;
         self.right_held = 0;
+        self.game = false;
+        self.pad_to_game = true;
+        self.keyboard_toggle = false;
+        self.menu_request = false;
         if let Ok(mut c) = self.cursor.lock() {
             c.visible = false;
+        }
+    }
+
+    /// Show or hide the pointer whatever the controls say (the quick menu hides it).
+    pub fn set_cursor_visible(&mut self, visible: bool) {
+        if let Ok(mut c) = self.cursor.lock() {
+            c.visible = visible;
+        }
+    }
+
+    /// Release every key and button the game believes is held (leaving a game, opening a menu
+    /// over it, the on-screen keyboard taking the pad).
+    pub fn release_all(&mut self, events: &mut Vec<PlayerEvent>) {
+        for (key, count) in self.keys_held.drain() {
+            if count > 0 {
+                events.push(PlayerEvent::KeyUp { key: key.descriptor() });
+            }
+        }
+        let (x, y) = self.pointer;
+        if self.left_held > 0 {
+            events.push(PlayerEvent::MouseUp { x, y, button: MouseButton::Left });
+        }
+        if self.right_held > 0 {
+            events.push(PlayerEvent::MouseUp { x, y, button: MouseButton::Right });
+        }
+        self.left_held = 0;
+        self.right_held = 0;
+        for usage in self.hid.held_keys() {
+            if let Some((key, _)) = hid::key_for(usage, false, false) {
+                events.push(PlayerEvent::KeyUp { key });
+            }
         }
     }
 
@@ -189,23 +293,34 @@ impl Input {
         }
     }
 
-    /// Read the pad and translate what changed since the last poll into events. `dt` paces the
-    /// stick-driven pointer and the cursor's hide timer. Lines worth logging (the controller
-    /// appearing) come back too.
+    /// Read the pad (and the USB devices) and translate what changed since the last poll into
+    /// events. `dt` paces the stick-driven pointer and the cursor's hide timer. Lines worth logging
+    /// (the controller appearing) come back too.
     pub fn poll(&mut self, dt: f64, events: &mut Vec<PlayerEvent>) -> Option<String> {
         let note = self.try_open();
         self.raw_pressed = 0;
-        if !self.open {
-            return note;
-        }
+        self.keyboard_toggle = false;
+        self.menu_request = false;
+        self.typed.clear();
+        self.backspace = false;
+        self.moved = false;
+        self.hid_frame = self.hid.read();
+
         let mut s = PadState::default();
-        let got = unsafe { ps5_pad_read(&mut s) };
-        if got <= 0 {
-            // nothing new (or a refused read): keep moving the pointer with the last stick reading
-            s = self.last;
-            if got < 0 {
-                s.buttons = 0;
+        if self.open {
+            let got = unsafe { ps5_pad_read(&mut s) };
+            if got <= 0 {
+                // nothing new (or a refused read): keep moving the pointer with the last stick reading
+                s = self.last;
+                if got < 0 {
+                    s.buttons = 0;
+                }
             }
+        } else {
+            s.left_x = STICK_CENTRE as u8;
+            s.left_y = STICK_CENTRE as u8;
+            s.right_x = STICK_CENTRE as u8;
+            s.right_y = STICK_CENTRE as u8;
         }
         if s.buttons & BTN_INTERCEPTED != 0 {
             s.buttons = 0; // the system overlay has the pad: release everything
@@ -229,19 +344,16 @@ impl Input {
         }
         let left_axes = (s.left_x as i32 - STICK_CENTRE, s.left_y as i32 - STICK_CENTRE);
         let right_axes = (s.right_x as i32 - STICK_CENTRE, s.right_y as i32 - STICK_CENTRE);
-        for (role, (ax, ay)) in [
-            (self.controls.left_stick, left_axes),
-            (self.controls.right_stick, right_axes),
-        ] {
+        // The stick speed is in 1080p pixels per second: the same feel in a 4K game.
+        let speed = self.controls.pointer_speed * self.viewport.0 / TOUCHPAD.0;
+        for (role, (ax, ay)) in [(self.controls.left_stick, left_axes), (self.controls.right_stick, right_axes)] {
             if role != StickRole::Mouse || (ax.abs() <= STICK_DEADZONE && ay.abs() <= STICK_DEADZONE) {
                 continue;
             }
-            let speed = self.controls.pointer_speed;
             let scale = |v: i32| {
                 let v = (if v.abs() > STICK_DEADZONE { v } else { 0 }) as f64;
                 let sign = v.signum();
-                let mag = ((v.abs() - STICK_DEADZONE as f64) / (127.0 - STICK_DEADZONE as f64))
-                    .clamp(0.0, 1.0);
+                let mag = ((v.abs() - STICK_DEADZONE as f64) / (127.0 - STICK_DEADZONE as f64)).clamp(0.0, 1.0);
                 sign * mag * mag * speed * dt
             };
             let nx = (self.pointer.0 + scale(ax)).clamp(0.0, self.viewport.0);
@@ -251,31 +363,46 @@ impl Input {
                 moved = true;
             }
         }
+        // A USB mouse.
+        if self.hid_frame.mouse_moved() {
+            let k = self.mouse_speed * self.viewport.0 / TOUCHPAD.0;
+            let nx = (self.pointer.0 + self.hid_frame.dx as f64 * k).clamp(0.0, self.viewport.0);
+            let ny = (self.pointer.1 + self.hid_frame.dy as f64 * k).clamp(0.0, self.viewport.1);
+            if (nx, ny) != self.pointer {
+                self.pointer = (nx, ny);
+                moved = true;
+            }
+        }
         let (x, y) = self.pointer;
         if moved {
-            events.push(PlayerEvent::MouseMove { x, y });
+            if self.game {
+                events.push(PlayerEvent::MouseMove { x, y });
+            }
             self.idle = 0.0;
+            self.moved = true;
         } else {
             self.idle += dt;
         }
-        let visible = match self.controls.cursor {
-            CursorMode::On => true,
-            CursorMode::Off => false,
-            CursorMode::Auto => self.touching || self.idle < self.controls.cursor_hide,
-        };
-        if let Ok(mut c) = self.cursor.lock() {
-            c.x = x as f32;
-            c.y = y as f32;
-            c.visible = visible;
+        if self.game {
+            let mouse_plugged = self.hid.mouse_connected();
+            let visible = match self.controls.cursor {
+                CursorMode::On => true,
+                CursorMode::Off => false,
+                CursorMode::Auto => self.touching || self.idle < self.controls.cursor_hide || mouse_plugged,
+            };
+            if let Ok(mut c) = self.cursor.lock() {
+                c.x = x as f32;
+                c.y = y as f32;
+                c.visible = visible;
+            }
         }
 
         // --- buttons: the pad's bits, the sticks as d-pads, the triggers past their threshold ---
         let mut held = s.buttons & !BTN_INTERCEPTED & !(BTN_L2 | BTN_R2);
-        for (role, (ax, ay)) in [
-            (self.controls.left_stick, left_axes),
-            (self.controls.right_stick, right_axes),
-        ] {
-            if role != StickRole::Dpad {
+        for (i, (role, (ax, ay))) in [(self.controls.left_stick, left_axes), (self.controls.right_stick, right_axes)].into_iter().enumerate() {
+            // In the menus the left stick always moves the selection.
+            let as_dpad = role == StickRole::Dpad || (!self.game && i == 0);
+            if !as_dpad {
                 continue;
             }
             if ax < -STICK_DEADZONE {
@@ -298,9 +425,7 @@ impl Input {
             held |= BTN_R2;
         }
         let changed = held ^ self.down;
-        self.raw_down = held;
-        self.raw_pressed = changed & held;
-        if changed != 0 {
+        if self.game && self.pad_to_game && changed != 0 {
             // Releases first, then presses: a button swapped for another holding the same key
             // keeps the key down throughout.
             for (bit, button) in PAIRS {
@@ -316,6 +441,84 @@ impl Input {
         }
         self.down = held;
         self.last = s;
+
+        // --- the USB keyboard and mouse ---
+        let hf = std::mem::take(&mut self.hid_frame);
+        let mut raw = held;
+        let mut pressed = changed & held;
+        if self.game {
+            if hf.key_pressed(hid::KEY_ESCAPE) {
+                self.menu_request = true;
+            }
+            hid::key_events(&hf, events);
+            for (bit, button) in [(hid::MOUSE_LEFT, MouseButton::Left), (hid::MOUSE_RIGHT, MouseButton::Right), (hid::MOUSE_MIDDLE, MouseButton::Middle)] {
+                if hf.pressed & bit != 0 {
+                    events.push(PlayerEvent::MouseDown { x, y, button, index: None });
+                }
+                if hf.released & bit != 0 {
+                    events.push(PlayerEvent::MouseUp { x, y, button });
+                }
+            }
+            if hf.wheel != 0 {
+                events.push(PlayerEvent::MouseWheel { delta: MouseWheelDelta::Lines(hf.wheel as f64) });
+            }
+        } else {
+            for &(usage, down) in &hf.keys {
+                let bit = match usage {
+                    hid::KEY_UP => BTN_UP,
+                    hid::KEY_DOWN => BTN_DOWN,
+                    hid::KEY_LEFT => BTN_LEFT,
+                    hid::KEY_RIGHT => BTN_RIGHT,
+                    hid::KEY_ENTER => BTN_CROSS,
+                    hid::KEY_ESCAPE => BTN_CIRCLE,
+                    hid::KEY_TAB | hid::KEY_PAGE_DOWN => BTN_R1,
+                    hid::KEY_PAGE_UP => BTN_L1,
+                    hid::KEY_F2 => BTN_SQUARE,
+                    hid::KEY_F3 => BTN_TRIANGLE,
+                    hid::KEY_BACKSPACE => {
+                        if down {
+                            self.backspace = true;
+                        }
+                        0
+                    }
+                    _ => 0,
+                };
+                if down && bit != 0 {
+                    pressed |= bit;
+                    raw |= bit;
+                }
+            }
+            for usage in self.hid.held_keys() {
+                raw |= match usage {
+                    hid::KEY_UP => BTN_UP,
+                    hid::KEY_DOWN => BTN_DOWN,
+                    hid::KEY_LEFT => BTN_LEFT,
+                    hid::KEY_RIGHT => BTN_RIGHT,
+                    hid::KEY_ESCAPE => BTN_CIRCLE,
+                    _ => 0,
+                };
+            }
+            self.typed = hf.typed().into_iter().filter(|c| !c.is_control()).collect();
+        }
+        self.raw_down = raw;
+        self.raw_pressed = pressed;
+        self.hid_frame = hf;
+
+        // --- the d-pad's repeats, for lists ---
+        self.nav = pressed;
+        let dirs = raw & DPAD;
+        if pressed & DPAD != 0 {
+            self.repeat_bits = pressed & DPAD;
+            self.repeat_at = REPEAT_AFTER;
+        } else if dirs & self.repeat_bits != 0 {
+            self.repeat_at -= dt;
+            if self.repeat_at <= 0.0 {
+                self.nav |= self.repeat_bits & dirs;
+                self.repeat_at = REPEAT_EVERY;
+            }
+        } else {
+            self.repeat_bits = 0;
+        }
         note
     }
 
@@ -334,44 +537,32 @@ impl Input {
                     if pressed {
                         *count += 1;
                         if *count == 1 {
-                            events.push(PlayerEvent::KeyDown {
-                                key: key.descriptor(),
-                            });
+                            events.push(PlayerEvent::KeyDown { key: key.descriptor() });
                         }
                     } else if *count > 0 {
                         *count -= 1;
                         if *count == 0 {
-                            events.push(PlayerEvent::KeyUp {
-                                key: key.descriptor(),
-                            });
+                            events.push(PlayerEvent::KeyUp { key: key.descriptor() });
                         }
                     }
                 }
                 Action::Click(mouse) => {
-                    let count = if mouse == MouseButton::Right {
-                        &mut self.right_held
-                    } else {
-                        &mut self.left_held
-                    };
+                    let count = if mouse == MouseButton::Right { &mut self.right_held } else { &mut self.left_held };
                     if pressed {
                         *count += 1;
                         if *count == 1 {
-                            events.push(PlayerEvent::MouseDown {
-                                x,
-                                y,
-                                button: mouse,
-                                index: None,
-                            });
+                            events.push(PlayerEvent::MouseDown { x, y, button: mouse, index: None });
                         }
                     } else if *count > 0 {
                         *count -= 1;
                         if *count == 0 {
-                            events.push(PlayerEvent::MouseUp {
-                                x,
-                                y,
-                                button: mouse,
-                            });
+                            events.push(PlayerEvent::MouseUp { x, y, button: mouse });
                         }
+                    }
+                }
+                Action::Keyboard => {
+                    if pressed {
+                        self.keyboard_toggle = true;
                     }
                 }
             }

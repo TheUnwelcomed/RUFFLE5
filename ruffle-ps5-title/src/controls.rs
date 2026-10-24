@@ -1,12 +1,21 @@
-//! PS5_RUFFLE_CONTROLS_V2 — what each pad button does, from a text file.
+//! PS5_RUFFLE_CONTROLS_V3 — what each pad button does, from text files in "Custom Mappings".
 //!
 //! Flash games have no common control scheme: one wants Space to jump, the next wants Z, a third
 //! A/S/D or the mouse. So the mapping is data, layered, generic first and the game's own last:
-//! the built-in defaults (`Controls::default`), `/app0/controls.txt` (shipped with the title),
-//! `/data/ruffle/controls.txt` (yours, all games), `/app0/<movie>.controls.txt` (a preset shipped
-//! for that game — `presets/` in the repo), `/data/ruffle/<movie>.controls.txt` and
-//! `<movie>.controls.txt` beside the SWF in the games folder (yours, that game). Every line a
-//! file sets, and every line it gets wrong, is written to ruffle.log.
+//!   1. the built-in defaults (`Controls::default`);
+//!   2. `/app0/controls.txt` — shipped with the title (all comments: an example);
+//!   3. `Custom Mappings/_All Games.controls.txt` — every game (Settings > Controls for all games);
+//!   4. the game's own: `Custom Mappings/<movie>.controls.txt` (the editor writes it; presets such as
+//!      dadnme.controls.txt ship there), else the copy shipped in the title's own folder;
+//!   5. `<movie>.controls.txt` beside the SWF, if there is one (still honoured).
+//! Every line a file sets, and every line it gets wrong, is written to ruffle.log.
+//!
+//! V3: "Custom Mappings" (the title folder, next to games/) holds every mapping; files from the old
+//! places (/data/ruffle/controls.txt, /data/ruffle/<movie>.controls.txt, games/<movie>.controls.txt)
+//! are moved there once (`migrate`). The controls editor (src/editor.rs) writes a file the way the
+//! shipped presets are written: a comment, then only the lines that differ from what the game would
+//! get without it (`Controls::file_text`). A button can now open the on-screen keyboard
+//! (`keyboard`, L2 by default, where `rightclick` was).
 //!
 //! File format, one setting per line, `#` starts a comment:
 //!
@@ -14,11 +23,12 @@
 //! cross = space            # a button = the keys it presses, comma-separated: several at once is fine
 //! square = z, a            # Square presses Z and A together
 //! r2 = click               # click / rightclick = the mouse buttons, at the pointer
+//! l2 = keyboard            # opens the on-screen keyboard
 //! circle = none            # does nothing
 //! up = up, w               # up/down/left/right are the d-pad (and the left stick in dpad mode)
 //! left_stick = dpad        # dpad | mouse | off
 //! right_stick = mouse      # mouse | dpad | off
-//! pointer_speed = 1100     # stick-driven pointer, pixels per second at full deflection
+//! pointer_speed = 1100     # stick-driven pointer, pixels per second at full deflection (1080p)
 //! cursor = auto            # auto (shown while the pointer moves, hidden after cursor_hide seconds) | on | off
 //! cursor_hide = 3
 //! cursor_scale = 1.75
@@ -30,8 +40,12 @@
 //! f1..f12 numpad0..numpad9.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use crate::paths::Paths;
 use ruffle_core::events::{KeyDescriptor, KeyLocation, LogicalKey, MouseButton, NamedKey, PhysicalKey};
 use std::collections::HashMap;
+
+/// The file in Custom Mappings that applies to every game.
+pub const ALL_GAMES_FILE: &str = "_All Games.controls.txt";
 
 /// A pad button, as the files name it (the order is the `NAMES` table's).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -95,6 +109,28 @@ impl Button {
         }
     }
 
+    /// The name the editor shows.
+    pub fn title(self) -> &'static str {
+        match self {
+            Button::Up => "D-pad Up",
+            Button::Down => "D-pad Down",
+            Button::Left => "D-pad Left",
+            Button::Right => "D-pad Right",
+            Button::Cross => "Cross",
+            Button::Circle => "Circle",
+            Button::Square => "Square",
+            Button::Triangle => "Triangle",
+            Button::L1 => "L1",
+            Button::R1 => "R1",
+            Button::L2 => "L2",
+            Button::R2 => "R2",
+            Button::L3 => "L3 (left stick press)",
+            Button::R3 => "R3 (right stick press)",
+            Button::Options => "Options",
+            Button::Touchpad => "Touchpad press",
+        }
+    }
+
     fn parse(s: &str) -> Option<Button> {
         Button::ALL.into_iter().find(|b| b.name() == s)
     }
@@ -124,15 +160,17 @@ impl Key {
 pub enum Action {
     Key(Key),
     Click(MouseButton),
+    /// Opens or closes the on-screen keyboard.
+    Keyboard,
 }
 
 impl Action {
     pub fn name(&self) -> String {
         match self {
             Action::Key(k) => k.name.to_string(),
-            Action::Click(MouseButton::Left) => "click".into(),
             Action::Click(MouseButton::Right) => "rightclick".into(),
             Action::Click(_) => "click".into(),
+            Action::Keyboard => "keyboard".into(),
         }
     }
 }
@@ -144,11 +182,31 @@ pub enum StickRole {
     Mouse,
 }
 
+impl StickRole {
+    pub fn name(self) -> &'static str {
+        match self {
+            StickRole::Off => "off",
+            StickRole::Dpad => "dpad",
+            StickRole::Mouse => "mouse",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CursorMode {
     Auto,
     On,
     Off,
+}
+
+impl CursorMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            CursorMode::Auto => "auto",
+            CursorMode::On => "on",
+            CursorMode::Off => "off",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -162,18 +220,28 @@ pub struct Controls {
     pub cursor_scale: f32,
     /// What happened while loading: files found or not, lines applied, lines refused.
     pub report: Vec<String>,
+    /// The file that gave the game its own mapping, if one did (for the menu to say so).
+    pub source: Option<String>,
+}
+
+impl PartialEq for Controls {
+    /// The same mapping (the report and where it came from aside).
+    fn eq(&self, other: &Controls) -> bool {
+        Button::ALL.iter().all(|b| self.bindings.get(b).cloned().unwrap_or_default() == other.bindings.get(b).cloned().unwrap_or_default())
+            && self.left_stick == other.left_stick
+            && self.right_stick == other.right_stick
+            && self.pointer_speed == other.pointer_speed
+            && self.cursor == other.cursor
+            && self.cursor_hide == other.cursor_hide
+            && self.cursor_scale == other.cursor_scale
+    }
 }
 
 impl Default for Controls {
     fn default() -> Self {
         let mut bindings = HashMap::new();
         let mut bind = |b: Button, keys: &[&str]| {
-            bindings.insert(
-                b,
-                keys.iter()
-                    .map(|k| parse_action(k).expect("built-in default binding"))
-                    .collect(),
-            );
+            bindings.insert(b, keys.iter().map(|k| parse_action(k).expect("built-in default binding")).collect());
         };
         bind(Button::Up, &["up"]);
         bind(Button::Down, &["down"]);
@@ -185,7 +253,7 @@ impl Default for Controls {
         bind(Button::Triangle, &["x"]);
         bind(Button::L1, &["shift"]);
         bind(Button::R1, &["control"]);
-        bind(Button::L2, &["rightclick"]);
+        bind(Button::L2, &["keyboard"]);
         bind(Button::R2, &["click"]);
         bind(Button::L3, &["a"]);
         bind(Button::R3, &["s"]);
@@ -200,45 +268,85 @@ impl Default for Controls {
             cursor_hide: 3.0,
             cursor_scale: 1.75,
             report: Vec::new(),
+            source: None,
         }
     }
 }
 
+/// The stem the mapping files of a movie are named after ("dadnme" for .../dadnme.swf).
+pub fn movie_stem(movie_path: &str) -> String {
+    let file_name = movie_path.rsplit('/').next().unwrap_or(movie_path);
+    match file_name.rsplit_once('.') {
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("swf") => stem.to_string(),
+        _ => file_name.to_string(),
+    }
+}
+
+/// The mapping file the editor writes for a movie (or for all games, `stem` None).
+pub fn mapping_file(paths: &Paths, stem: Option<&str>) -> String {
+    match stem {
+        Some(stem) => format!("{}/{stem}.controls.txt", paths.mappings),
+        None => format!("{}/{ALL_GAMES_FILE}", paths.mappings),
+    }
+}
+
+/// A shipped preset for the movie, in the title's own folder (read-only), if any.
+fn shipped_preset(paths: &Paths, stem: &str) -> Option<String> {
+    [format!("{}/Custom Mappings/{stem}.controls.txt", paths.app), format!("{}/{stem}.controls.txt", paths.app)]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file())
+}
+
 impl Controls {
-    /// Defaults, then the generic files, then the movie's own (`<movie>.controls.txt`, the `.swf`
-    /// replaced; the shipped preset is looked up by the movie's file name in the title folder),
-    /// each layered over the previous.
-    pub fn load(data_dir: &str, movie_path: &str) -> Self {
+    fn layer(&mut self, path: &str) -> bool {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                self.report.push(format!("controls: reading {path}"));
+                self.apply(&text, path);
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.report.push(format!("controls: no {path}"));
+                false
+            }
+            Err(e) => {
+                self.report.push(format!("controls: cannot read {path}: {e}"));
+                false
+            }
+        }
+    }
+
+    /// What every game starts from: the defaults and the shipped example file.
+    pub fn base_all(paths: &Paths) -> Controls {
         let mut c = Controls::default();
-        let file_name = movie_path.rsplit('/').next().unwrap_or(movie_path);
-        let stem = match file_name.rsplit_once('.') {
-            Some((stem, ext)) if ext.eq_ignore_ascii_case("swf") => stem,
-            _ => file_name,
-        };
-        let per_game = match movie_path.rsplit_once('.') {
+        c.layer(&format!("{}/controls.txt", paths.app));
+        c
+    }
+
+    /// What a game gets before its own mapping: `base_all` and the all-games mapping.
+    pub fn base_game(paths: &Paths) -> Controls {
+        let mut c = Controls::base_all(paths);
+        c.layer(&mapping_file(paths, None));
+        c
+    }
+
+    /// Everything that applies to `movie_path`, in order (module comment).
+    pub fn load(paths: &Paths, movie_path: &str) -> Controls {
+        let mut c = Controls::base_game(paths);
+        let stem = movie_stem(movie_path);
+        let own = mapping_file(paths, Some(&stem));
+        if c.layer(&own) {
+            c.source = Some(own.clone());
+        } else if let Some(preset) = shipped_preset(paths, &stem) {
+            c.layer(&preset);
+            c.source = Some(preset);
+        }
+        let beside = match movie_path.rsplit_once('.') {
             Some((p, ext)) if ext.eq_ignore_ascii_case("swf") => format!("{p}.controls.txt"),
             _ => format!("{movie_path}.controls.txt"),
         };
-        let mut layers = vec![
-            "/app0/controls.txt".to_string(),
-            format!("{data_dir}/controls.txt"),
-            format!("/app0/{stem}.controls.txt"),
-            format!("{data_dir}/{stem}.controls.txt"),
-        ];
-        if !layers.contains(&per_game) {
-            layers.push(per_game); // beside the movie itself (the games folder)
-        }
-        for path in layers {
-            match std::fs::read_to_string(&path) {
-                Ok(text) => {
-                    c.report.push(format!("controls: reading {path}"));
-                    c.apply(&text, &path);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    c.report.push(format!("controls: no {path}"));
-                }
-                Err(e) => c.report.push(format!("controls: cannot read {path}: {e}")),
-            }
+        if beside != own && std::path::Path::new(&beside).is_file() && c.layer(&beside) {
+            c.source = Some(beside);
         }
         c
     }
@@ -263,7 +371,7 @@ impl Controls {
         }
     }
 
-    fn set(&mut self, key: &str, value: &str) -> Result<String, String> {
+    pub fn set(&mut self, key: &str, value: &str) -> Result<String, String> {
         if let Some(button) = Button::parse(key) {
             let mut actions = Vec::new();
             if value != "none" && value != "nothing" && !value.is_empty() {
@@ -272,7 +380,10 @@ impl Controls {
                     if part.is_empty() {
                         continue;
                     }
-                    actions.push(parse_action(part).ok_or_else(|| format!("unknown key `{part}`"))?);
+                    let action = parse_action(part).ok_or_else(|| format!("unknown key `{part}`"))?;
+                    if !actions.contains(&action) {
+                        actions.push(action);
+                    }
                 }
             }
             let shown = describe(button, &actions);
@@ -319,12 +430,15 @@ impl Controls {
         }
     }
 
+    pub fn actions(&self, b: Button) -> Vec<Action> {
+        self.bindings.get(&b).cloned().unwrap_or_default()
+    }
+
     /// The whole mapping in effect, one line per button, for the log.
     pub fn summary(&self) -> Vec<String> {
         let mut out = Vec::new();
         for b in Button::ALL {
-            let actions = self.bindings.get(&b).cloned().unwrap_or_default();
-            out.push(describe(b, &actions));
+            out.push(describe(b, &self.actions(b)));
         }
         out.push(format!(
             "left_stick = {:?}, right_stick = {:?}, pointer_speed = {}, cursor = {:?} (hide after {} s, scale {})",
@@ -332,25 +446,133 @@ impl Controls {
         ));
         out
     }
-}
 
-fn describe(button: Button, actions: &[Action]) -> String {
-    if actions.is_empty() {
-        format!("{} = none", button.name())
-    } else {
-        format!(
-            "{} = {}",
-            button.name(),
-            actions.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")
-        )
+    /// The lines that turn `base` into this mapping, in the files' format.
+    pub fn diff_lines(&self, base: &Controls) -> Vec<String> {
+        let mut out = Vec::new();
+        for b in Button::ALL {
+            let mine = self.actions(b);
+            if mine != base.actions(b) {
+                out.push(describe(b, &mine));
+            }
+        }
+        if self.left_stick != base.left_stick {
+            out.push(format!("left_stick = {}", self.left_stick.name()));
+        }
+        if self.right_stick != base.right_stick {
+            out.push(format!("right_stick = {}", self.right_stick.name()));
+        }
+        if self.pointer_speed != base.pointer_speed {
+            out.push(format!("pointer_speed = {}", self.pointer_speed));
+        }
+        if self.cursor != base.cursor {
+            out.push(format!("cursor = {}", self.cursor.name()));
+        }
+        if self.cursor_hide != base.cursor_hide {
+            out.push(format!("cursor_hide = {}", self.cursor_hide));
+        }
+        if self.cursor_scale != base.cursor_scale {
+            out.push(format!("cursor_scale = {}", self.cursor_scale));
+        }
+        out
+    }
+
+    /// A mapping file as the editor writes it: a heading, then only the lines that differ from
+    /// `base` (as the shipped presets are written).
+    pub fn file_text(&self, base: &Controls, heading: &str) -> String {
+        let mut text = String::new();
+        for line in heading.lines() {
+            text.push_str("# ");
+            text.push_str(line);
+            text.push('\n');
+        }
+        text.push_str("# Written by Ruffle5's controls editor; edit it there or by hand (format: controls.txt in the title folder).\n");
+        let lines = self.diff_lines(base);
+        if lines.is_empty() {
+            text.push_str("# (nothing differs: the buttons do what they do in every game)\n");
+        }
+        for line in lines {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        text
     }
 }
 
-fn parse_action(s: &str) -> Option<Action> {
+pub fn describe(button: Button, actions: &[Action]) -> String {
+    if actions.is_empty() {
+        format!("{} = none", button.name())
+    } else {
+        format!("{} = {}", button.name(), actions.iter().map(|a| a.name()).collect::<Vec<_>>().join(", "))
+    }
+}
+
+/// What the editor shows for a button's actions: "Space", "Z + A", "Mouse click", "Nothing".
+pub fn describe_short(actions: &[Action]) -> String {
+    if actions.is_empty() {
+        return "Nothing".to_string();
+    }
+    actions.iter().map(|a| choice_label(&a.name())).collect::<Vec<_>>().join(" + ")
+}
+
+pub fn parse_action(s: &str) -> Option<Action> {
     match s {
         "click" | "leftclick" | "mouse" => Some(Action::Click(MouseButton::Left)),
         "rightclick" => Some(Action::Click(MouseButton::Right)),
+        "keyboard" | "osk" => Some(Action::Keyboard),
         _ => key_by_name(s).map(Action::Key),
+    }
+}
+
+/// Everything a button can be set to in the editor, in the order its picker shows them (file names).
+pub const CHOICES: [&str; 91] = [
+    "click", "rightclick", "keyboard", "none", "space", "enter", //
+    "up", "down", "left", "right", "shift", "control", //
+    "alt", "tab", "escape", "backspace", "delete", "insert", //
+    "a", "b", "c", "d", "e", "f", //
+    "g", "h", "i", "j", "k", "l", //
+    "m", "n", "o", "p", "q", "r", //
+    "s", "t", "u", "v", "w", "x", //
+    "y", "z", "0", "1", "2", "3", //
+    "4", "5", "6", "7", "8", "9", //
+    "-", "=", "[", "]", ";", "'", //
+    ",", ".", "/", "\\", "`", "home", //
+    "end", "pageup", "pagedown", "f1", "f2", "f3", //
+    "f4", "f5", "f6", "f7", "f8", "f9", //
+    "f10", "f11", "f12", "numpad0", "numpad1", "numpad2", //
+    "numpad3", "numpad4", "numpad5", "numpad6", "numpad7", "numpad8", //
+    "numpad9",
+];
+
+/// How a choice reads on screen.
+pub fn choice_label(name: &str) -> String {
+    match name {
+        "click" => "Mouse click".into(),
+        "rightclick" => "Right click".into(),
+        "keyboard" => "On-screen keyboard".into(),
+        "none" => "Nothing".into(),
+        "space" => "Space".into(),
+        "enter" => "Enter".into(),
+        "up" => "Arrow \u{2191}".into(),
+        "down" => "Arrow \u{2193}".into(),
+        "left" => "Arrow \u{2190}".into(),
+        "right" => "Arrow \u{2192}".into(),
+        "shift" => "Shift".into(),
+        "control" => "Ctrl".into(),
+        "alt" => "Alt".into(),
+        "tab" => "Tab".into(),
+        "escape" => "Esc".into(),
+        "backspace" => "Backspace".into(),
+        "delete" => "Delete".into(),
+        "insert" => "Insert".into(),
+        "home" => "Home".into(),
+        "end" => "End".into(),
+        "pageup" => "Page Up".into(),
+        "pagedown" => "Page Down".into(),
+        n if n.starts_with("numpad") => format!("Num {}", &n[6..]),
+        n if n.starts_with('f') && n.len() > 1 && n[1..].chars().all(|c| c.is_ascii_digit()) => n.to_uppercase(),
+        n if n.chars().count() == 1 => n.to_uppercase(),
+        n => n.to_string(),
     }
 }
 
@@ -465,5 +687,142 @@ pub fn key_by_name(s: &str) -> Option<Key> {
         "numpad8" => key("numpad8", P::Numpad8, Ch('8'), KeyLocation::Numpad),
         "numpad9" => key("numpad9", P::Numpad9, Ch('9'), KeyLocation::Numpad),
         _ => None,
+    }
+}
+
+/// Move mapping files from where older Ruffle5 builds read them into Custom Mappings, once:
+/// /data/ruffle/controls.txt (every game) -> _All Games.controls.txt, /data/ruffle/<movie>.controls.txt
+/// and games/<movie>.controls.txt -> <movie>.controls.txt. A file already in Custom Mappings is kept
+/// (the old one stays where it is). Returns lines for the log.
+pub fn migrate(paths: &Paths) -> Vec<String> {
+    let mut report = Vec::new();
+    let _ = std::fs::create_dir_all(&paths.mappings);
+    let mut moves: Vec<(String, String)> = Vec::new();
+    moves.push((format!("{}/controls.txt", paths.legacy), mapping_file(paths, None)));
+    for dir in [&paths.legacy, &paths.games] {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if let Some(stem) = name.strip_suffix(".controls.txt") {
+                    if !stem.is_empty() {
+                        moves.push((format!("{dir}/{name}"), mapping_file(paths, Some(stem))));
+                    }
+                }
+            }
+        }
+    }
+    for (from, to) in moves {
+        if !std::path::Path::new(&from).is_file() {
+            continue;
+        }
+        if std::path::Path::new(&to).exists() {
+            report.push(format!("controls: {from} not moved: {to} already exists"));
+            continue;
+        }
+        if crate::fsutil::move_file(&from, &to) {
+            report.push(format!("controls: moved {from} -> {to}"));
+        } else {
+            report.push(format!("controls: could not move {from} -> {to}"));
+        }
+    }
+    report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_paths(tag: &str) -> Paths {
+        let root = std::env::temp_dir().join(format!("ruffle5-controls-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let p = |s: &str| {
+            let d = root.join(s);
+            std::fs::create_dir_all(&d).unwrap();
+            d.to_string_lossy().into_owned()
+        };
+        let mut paths = Paths::new(&p("data"), &p("games"), &p("Custom Mappings"));
+        paths.app = p("app0");
+        paths.legacy = p("legacy");
+        paths
+    }
+
+    #[test]
+    fn every_choice_parses_and_has_a_label() {
+        for c in CHOICES {
+            if c != "none" {
+                assert!(parse_action(c).is_some(), "{c}");
+            }
+            assert!(!choice_label(c).is_empty());
+        }
+        assert_eq!(choice_label("f11"), "F11");
+        assert_eq!(choice_label("numpad7"), "Num 7");
+        assert_eq!(choice_label("q"), "Q");
+        assert_eq!(choice_label("up"), "Arrow \u{2191}");
+    }
+
+    #[test]
+    fn defaults_have_the_keyboard_on_l2() {
+        let c = Controls::default();
+        assert_eq!(c.actions(Button::L2), vec![Action::Keyboard]);
+        assert_eq!(describe_short(&c.actions(Button::Cross)), "Space");
+    }
+
+    #[test]
+    fn a_file_lists_only_what_differs_and_reads_back_the_same() {
+        let base = Controls::default();
+        let mut c = base.clone();
+        c.set("cross", "a").unwrap();
+        c.set("square", "s, d").unwrap();
+        c.set("left_stick", "mouse").unwrap();
+        let text = c.file_text(&base, "Dad 'n Me (dadnme.swf)");
+        assert!(text.starts_with("# Dad 'n Me (dadnme.swf)\n"));
+        assert!(text.contains("\ncross = a\n"));
+        assert!(text.contains("\nsquare = s, d\n"));
+        assert!(text.contains("\nleft_stick = mouse\n"));
+        assert!(!text.contains("circle"));
+        let mut back = base.clone();
+        back.apply(&text, "test");
+        assert_eq!(back, c);
+        assert!(base.file_text(&base, "x").contains("nothing differs"));
+    }
+
+    #[test]
+    fn layers_apply_in_order_and_the_game_file_wins() {
+        let paths = temp_paths("layers");
+        std::fs::write(format!("{}/controls.txt", paths.app), "cross = enter\n").unwrap();
+        std::fs::write(mapping_file(&paths, None), "cross = z\ncircle = x\n").unwrap();
+        std::fs::write(mapping_file(&paths, Some("game")), "cross = a\n").unwrap();
+        let movie = format!("{}/game.swf", paths.games);
+        let c = Controls::load(&paths, &movie);
+        assert_eq!(describe_short(&c.actions(Button::Cross)), "A");
+        assert_eq!(describe_short(&c.actions(Button::Circle)), "X");
+        assert_eq!(c.source.as_deref(), Some(mapping_file(&paths, Some("game")).as_str()));
+        // without its own file a game gets the all-games mapping
+        let d = Controls::load(&paths, &format!("{}/other.swf", paths.games));
+        assert_eq!(describe_short(&d.actions(Button::Cross)), "Z");
+        assert_eq!(d.source, None);
+        // a shipped preset applies when Custom Mappings has none
+        std::fs::create_dir_all(format!("{}/Custom Mappings", paths.app)).unwrap();
+        std::fs::write(format!("{}/Custom Mappings/other.controls.txt", paths.app), "square = q\n").unwrap();
+        let e = Controls::load(&paths, &format!("{}/other.swf", paths.games));
+        assert_eq!(describe_short(&e.actions(Button::Square)), "Q");
+    }
+
+    #[test]
+    fn old_files_move_into_custom_mappings() {
+        let paths = temp_paths("migrate");
+        std::fs::write(format!("{}/controls.txt", paths.legacy), "cross = a\n").unwrap();
+        std::fs::write(format!("{}/dadnme.controls.txt", paths.legacy), "square = s\n").unwrap();
+        std::fs::write(format!("{}/x.controls.txt", paths.games), "r1 = q\n").unwrap();
+        std::fs::write(mapping_file(&paths, Some("keep")), "l1 = z\n").unwrap();
+        std::fs::write(format!("{}/keep.controls.txt", paths.games), "l1 = y\n").unwrap();
+        let report = migrate(&paths);
+        assert!(std::path::Path::new(&mapping_file(&paths, None)).is_file());
+        assert!(std::path::Path::new(&mapping_file(&paths, Some("dadnme"))).is_file());
+        assert!(std::path::Path::new(&mapping_file(&paths, Some("x"))).is_file());
+        assert!(!std::path::Path::new(&format!("{}/controls.txt", paths.legacy)).exists());
+        // an existing mapping is not overwritten
+        assert_eq!(std::fs::read_to_string(mapping_file(&paths, Some("keep"))).unwrap(), "l1 = z\n");
+        assert!(report.iter().any(|l| l.contains("already exists")));
     }
 }
