@@ -65,6 +65,11 @@ pub unsafe extern "C" fn ps5_hid_load(_which: i32, detail: *mut i32) -> i32 {
 }
 
 #[no_mangle]
+pub extern "C" fn ps5_hid_sysmodule_rc(_which: i32) -> i32 {
+    1
+}
+
+#[no_mangle]
 pub extern "C" fn ps5_hid_init(_which: i32) -> i32 {
     -1
 }

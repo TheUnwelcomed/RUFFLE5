@@ -1,12 +1,25 @@
-/* PS5_RUFFLE_HID_V1 — a USB keyboard and mouse, for src/hid.rs.
+/* PS5_RUFFLE_HID_V2 — a USB keyboard and mouse, for src/hid.rs.
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * libSceKeyboard and libSceMouse are not loaded for a title. As Ruffle-Flash-PS5 does it
- * (ps5/scripts/ps5_early.c, GPL-3.0, by ZiZc3, after the device-tested
- * ps5-native-gamepad-input-research probe): load each through its sysmodule id (0x0106 keyboard,
- * 0x00a9 mouse), find the module among the loaded ones (or load its .sprx), and look its four
- * functions up with sceKernelDlsym. Nothing is imported from those libraries, so a console where
- * a step fails just has no keyboard or mouse (the log says which step).
+ * libSceKeyboard and libSceMouse are not loaded for a title. They are system modules: loaded with
+ * sceSysmoduleLoadModule (0x0106 keyboard, 0x00a9 mouse) and their four functions then looked up
+ * with sceKernelDlsym. Nothing is imported from those libraries, so a console where a step fails
+ * just has no keyboard or mouse (the log says which step and what the console answered).
+ *
+ * V2 (1.000.022), after V1 failed on hardware with "step -1, 0x80020002" for both:
+ *   - V1 found the loaded module in sceKernelGetModuleList by name, else loaded
+ *     /system/common/lib/<lib>.sprx by path. Neither works from a title: the module list shows only
+ *     the title's own modules (prospero-win, native/pw_hid_ps5.c, measured on the console), and a
+ *     title's sandbox does not see /system/common/lib (0x80020002 = ENOENT; loading by path from
+ *     outside the sandbox answers 0x80020063, ESDKVERSION — Ruffle-Flash-PS5, PS5SX2).
+ *     V2 asks libSceSysmodule for the module's handle instead, by its id and then its internal id
+ *     (0x80000000 | id), as prospero-win and Playden do.
+ *   - The sysmodule loads now run first thing in main() (ps5_hid_preload), before the title opens
+ *     /data or initialises the GPU — as Ruffle-Flash-PS5 (.preinit_array), ProsperoLight and
+ *     prospero-win do ("before the /data grant changes the title's credentials").
+ *   - V1 overwrote sceSysmoduleLoadModule's answer with the path load's. V2 keeps both: the load's
+ *     answer (ps5_hid_sysmodule_rc) and the handle lookup's (the `detail` of step -1).
+ * Research: reports/PS5 homebrew USB keyboard input.md (2026-10-24).
  *
  * The system calls it does use are checked first against the title's import table (build-title.sh
  * links a table of every import; one the console does not export is bound to NULL, and calling it
@@ -18,10 +31,11 @@
 #include <string.h>
 
 int32_t sceSysmoduleLoadModule(uint16_t id);
-int sceKernelGetModuleList(int *handles, size_t count, size_t *actual);
-int sceKernelGetModuleInfo(int handle, void *info);
+/* Weak: the PS5 payload SDK's libSceSysmodule stub exports it (sce_stubs/libSceSysmodule.c at
+ * a7685ce, 2026-10-12), but an older SDK's may not; then the link still succeeds, the symbol is
+ * NULL (build-title.sh links with -z nodynamic-undefined-weak) and step -3 says so. */
+__attribute__((weak)) int32_t sceSysmoduleGetModuleHandleInternal(uint32_t id, int32_t *handle);
 int sceKernelDlsym(int handle, const char *symbol, void **address);
-int sceKernelLoadStartModule(const char *path, size_t argc, const void *argv, uint32_t flags, void *opt, int *result);
 
 /* From the import table build-title.sh links (import_check.c). */
 int ps5_import_count(void);
@@ -41,47 +55,57 @@ int ps5_import_missing(const char *name)
 
 struct hid_api {
     uint16_t sysmodule;
-    const char *module;
     const char *names[4]; /* init, open, read, close */
     int (*init)(void);
     int (*open)(int user, int type, int index, const void *param);
     int (*read)(int handle, void *data, int count);
     int (*close)(int handle);
-    int loaded; /* 0 not tried, 1 ready, <0 the step that failed */
+    int32_t sysmodule_rc; /* sceSysmoduleLoadModule's answer; 1 = not called yet */
+    int loaded;           /* 0 not tried, 1 ready, <0 the step that failed */
     int detail;
 };
 
 static struct hid_api g_hid[2] = {
-    { 0x0106, "libSceKeyboard", { "sceKeyboardInit", "sceKeyboardOpen", "sceKeyboardRead", "sceKeyboardClose" }, 0, 0, 0, 0, 0, 0 },
-    { 0x00a9, "libSceMouse", { "sceMouseInit", "sceMouseOpen", "sceMouseRead", "sceMouseClose" }, 0, 0, 0, 0, 0, 0 },
+    { 0x0106, { "sceKeyboardInit", "sceKeyboardOpen", "sceKeyboardRead", "sceKeyboardClose" }, 0, 0, 0, 0, 1, 0, 0 },
+    { 0x00a9, { "sceMouseInit", "sceMouseOpen", "sceMouseRead", "sceMouseClose" }, 0, 0, 0, 0, 1, 0, 0 },
 };
 
-/* The handle of a loaded module whose name contains `module`, or -1. */
-static int find_module(const char *module)
+/* Load both system modules. main() calls this before anything else; ps5_hid_load does it later
+ * if it was not called. */
+void ps5_hid_preload(void)
 {
-    static int handles[512];
-    size_t count = 0;
-    if (sceKernelGetModuleList(handles, sizeof(handles) / sizeof(handles[0]), &count) != 0)
-        return -1;
-    /* SceKernelModuleInfo's size differs between systems: try a few. */
-    static const uint64_t sizes[] = { 0x160, 0x1a8, 0x1b0, 0x158, 0x200 };
-    for (size_t i = 0; i < count; i++) {
-        for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
-            struct { uint64_t size; char name[256]; uint8_t rest[0x400]; } info;
-            memset(&info, 0, sizeof(info));
-            info.size = sizes[k];
-            if (sceKernelGetModuleInfo(handles[i], &info) != 0)
-                continue;
-            info.name[sizeof(info.name) - 1] = 0;
-            if (strstr(info.name, module))
-                return handles[i];
-            break;
-        }
-    }
+    if (ps5_import_missing("sceSysmoduleLoadModule"))
+        return;
+    for (int i = 0; i < 2; i++)
+        if (g_hid[i].sysmodule_rc == 1)
+            g_hid[i].sysmodule_rc = sceSysmoduleLoadModule(g_hid[i].sysmodule);
+}
+
+/* sceSysmoduleLoadModule's answer for the keyboard (0) or mouse (1); 1 if it was not called. */
+int32_t ps5_hid_sysmodule_rc(int which)
+{
+    return which >= 0 && which <= 1 ? g_hid[which].sysmodule_rc : 1;
+}
+
+/* The module's handle by its sysmodule id, else by its internal id (0x80000000 | id); -1 and the
+ * first lookup's answer in *rc when neither gives one. */
+static int32_t sysmodule_handle(uint16_t id, int32_t *rc)
+{
+    int32_t handle = -1;
+    int32_t r = sceSysmoduleGetModuleHandleInternal(id, &handle);
+    if (r == 0 && handle >= 0)
+        return handle;
+    *rc = r != 0 ? r : handle;
+    handle = -1;
+    if (sceSysmoduleGetModuleHandleInternal(0x80000000u | id, &handle) == 0 && handle >= 0)
+        return handle;
     return -1;
 }
 
-/* 0 when the keyboard (0) or mouse (1) functions are ready; else the failed step (<0). */
+/* 0 when the keyboard (0) or mouse (1) functions are ready; else the failed step (<0):
+ *   -3  a system call this needs is not bound (detail: which one, 0..2)
+ *   -1  no handle for the module (detail: the handle lookup's answer)
+ *   -2  the module has no such functions (detail: the handle) */
 int ps5_hid_load(int which, int32_t *detail)
 {
     if (which < 0 || which > 1)
@@ -91,28 +115,24 @@ int ps5_hid_load(int which, int32_t *detail)
         *detail = api->detail;
         return api->loaded > 0 ? 0 : api->loaded;
     }
-    static const char *const needed[] = { "sceSysmoduleLoadModule", "sceKernelGetModuleList", "sceKernelGetModuleInfo",
-                                          "sceKernelDlsym", "sceKernelLoadStartModule" };
+    static const char *const needed[] = { "sceSysmoduleLoadModule", "sceSysmoduleGetModuleHandleInternal", "sceKernelDlsym" };
     for (size_t i = 0; i < sizeof(needed) / sizeof(needed[0]); i++) {
-        if (ps5_import_missing(needed[i])) {
+        if (ps5_import_missing(needed[i]) || (i == 1 && !sceSysmoduleGetModuleHandleInternal)) {
             api->loaded = -3;
             api->detail = (int)i;
             *detail = (int)i;
             return -3;
         }
     }
-    api->detail = sceSysmoduleLoadModule(api->sysmodule);
-    int handle = find_module(api->module);
+    if (api->sysmodule_rc == 1)
+        api->sysmodule_rc = sceSysmoduleLoadModule(api->sysmodule);
+    int32_t lookup = 0;
+    int32_t handle = sysmodule_handle(api->sysmodule, &lookup);
     if (handle < 0) {
-        char path[96];
-        snprintf(path, sizeof(path), "/system/common/lib/%s.sprx", api->module);
-        handle = sceKernelLoadStartModule(path, 0, NULL, 0, NULL, NULL);
-        if (handle < 0) {
-            api->loaded = -1;
-            api->detail = handle;
-            *detail = handle;
-            return -1;
-        }
+        api->loaded = -1;
+        api->detail = lookup;
+        *detail = lookup;
+        return -1;
     }
     void *fns[4] = { NULL, NULL, NULL, NULL };
     for (int i = 0; i < 4; i++)
@@ -128,6 +148,7 @@ int ps5_hid_load(int which, int32_t *detail)
         return -2;
     }
     api->loaded = 1;
+    api->detail = handle;
     *detail = handle;
     return 0;
 }

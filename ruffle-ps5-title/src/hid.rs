@@ -1,8 +1,9 @@
-//! PS5_RUFFLE_HID_V1 — a USB keyboard and mouse plugged into the PS5 (libSceKeyboard, libSceMouse).
+//! PS5_RUFFLE_HID_V2 — a USB keyboard and mouse plugged into the PS5 (libSceKeyboard, libSceMouse).
 //!
 //! Ported from Ruffle-Flash-PS5 (src/hid.rs, GPL-3.0, by ZiZc3), whose record layouts come from the
 //! device-tested ps5-native-gamepad-input-research notes. The libraries are not loaded for a title:
-//! shell/hid.c loads them by their sysmodule ids and looks their four functions up, so nothing is
+//! shell/hid.c loads them by their sysmodule ids (V2: first thing in main(), and the functions are
+//! found through libSceSysmodule's module handle) and looks their four functions up, so nothing is
 //! imported that could be missing; if any step fails the log says which and there is no keyboard or
 //! mouse, nothing else changes.
 //!
@@ -60,6 +61,7 @@ pub const MOUSE_MIDDLE: u32 = 4;
 
 extern "C" {
     fn ps5_hid_load(which: i32, detail: *mut i32) -> i32;
+    fn ps5_hid_sysmodule_rc(which: i32) -> i32;
     fn ps5_hid_init(which: i32) -> i32;
     fn ps5_hid_open(which: i32, user: i32, index: i32) -> i32;
     fn ps5_hid_read(which: i32, handle: i32, data: *mut u8, count: i32) -> i32;
@@ -150,10 +152,23 @@ impl Hid {
             let what = if which == KEYBOARD { "keyboard" } else { "mouse" };
             let mut detail = 0i32;
             let rc = unsafe { ps5_hid_load(which, &mut detail) };
+            // shell/hid.c V2: the sysmodule load's own answer (main() makes it first), then the
+            // handle lookup's or the step that failed.
+            let sysmodule = unsafe { ps5_hid_sysmodule_rc(which) } as u32;
             if rc != 0 {
-                hid.report.push(format!("usb {what}: library not available (step {rc}, 0x{:08x})", detail as u32));
+                let step = match rc {
+                    -3 => "a system call is not bound",
+                    -1 => "no module handle",
+                    -2 => "functions not found",
+                    _ => "failed",
+                };
+                hid.report.push(format!(
+                    "usb {what}: library not available: sysmodule load 0x{sysmodule:08x}; step {rc} ({step}), 0x{:08x}",
+                    detail as u32
+                ));
                 continue;
             }
+            hid.report.push(format!("usb {what}: sysmodule load 0x{sysmodule:08x}, module handle {detail}"));
             let init = unsafe { ps5_hid_init(which) };
             let mut opened = Vec::new();
             for index in 0..INDEXES {

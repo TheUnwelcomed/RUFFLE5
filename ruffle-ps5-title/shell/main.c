@@ -1,4 +1,4 @@
-/* PS5_RUFFLE_SHELL_V4 — the C shell of the Ruffle PS5 title.
+/* PS5_RUFFLE_SHELL_V5 — the C shell of the Ruffle PS5 title.
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Small on purpose: it does the few things that must happen from the title executable itself,
@@ -16,6 +16,8 @@
  * V4: Ruffle5's own data folder, /data/ruffle5 (the other Flash player for the PS5 uses /data/ruffle:
  * the two no longer overwrite each other's log), the "Custom Mappings" folder beside games/, and the
  * console's local hour (badges).
+ * V5 (1.000.022): the USB keyboard and mouse system modules load first thing in main(), before the
+ * title opens /data or touches the GPU (shell/hid.c V2), and their answers are logged.
  */
 #include <stdarg.h>
 #include <stdint.h>
@@ -72,6 +74,10 @@ int ps5_local_hour(void)
     return tm.tm_hour;
 }
 
+/* USB keyboard and mouse system modules (shell/hid.c). */
+void ps5_hid_preload(void);
+int32_t ps5_hid_sysmodule_rc(int which);
+
 /* Rust entry (src/lib.rs). */
 int ruffle_ps5_main(const char *data_dir, const char *games_dir, const char *mappings_dir);
 
@@ -79,11 +85,16 @@ int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
     ps5_fp_ieee();
+    /* before /data and the GPU: see shell/hid.c */
+    ps5_hid_preload();
     mkdir(DATA_DIR, 0777);
     g_log = fopen(DATA_DIR "/ruffle.log", "w");
-    ps5_log("ruffle-ps5 shell (PS5_RUFFLE_SHELL_V3) up");
+    ps5_log("ruffle-ps5 shell (PS5_RUFFLE_SHELL_V5) up");
 
     char line[160];
+    snprintf(line, sizeof line, "usb: sysmodule keyboard 0x0106 = 0x%08x, mouse 0x00a9 = 0x%08x (loaded first)",
+             (unsigned)ps5_hid_sysmodule_rc(0), (unsigned)ps5_hid_sysmodule_rc(1));
+    ps5_log(line);
     int32_t agc = sceAgcInit(8);
     snprintf(line, sizeof line, "sceAgcInit(8) from the title executable = 0x%08x", (unsigned)agc);
     ps5_log(line);

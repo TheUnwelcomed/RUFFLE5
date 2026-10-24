@@ -1,4 +1,4 @@
-//! PS5_RUFFLE_MENU_V3 — the screen the title opens on: pick a game, set its controls, change
+//! PS5_RUFFLE_MENU_V4 — the screen the title opens on: pick a game, set its controls, change
 //! settings, look at badges.
 //!
 //! The layout follows ProsperoStore's home screen (darkxex/BlackBearReloaded, GPL-3.0-or-later:
@@ -280,21 +280,28 @@ impl Menu {
                     let stem = n.rsplit_once('.').map(|(s, _)| s).unwrap_or(&n);
                     let thumb = [format!("{dir}/{stem}.png"), format!("{dir}/{stem}.PNG")].into_iter().find(|p| std::path::Path::new(p).is_file());
                     games.push(Self::director_game(paths, &full, stem, &full, None, thumb));
-                } else if std::path::Path::new(&full).is_dir() {
-                    // A game in its own folder: its first .swf, its cover.png / icon.png.
-                    if let Ok(inner) = std::fs::read_dir(&full) {
-                        let mut files: Vec<String> = inner.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-                        files.sort_by_key(|n| n.to_ascii_lowercase());
-                        if let Some(swf) = files.iter().find(|f| f.to_ascii_lowercase().ends_with(".swf")) {
-                            let stem = &swf[..swf.len() - 4];
-                            let thumb = [format!("{full}/{stem}.png"), format!("{full}/cover.png"), format!("{full}/icon.png")].into_iter().find(|p| std::path::Path::new(p).is_file());
-                            games.push(Self::game(paths, &format!("{full}/{swf}"), swf, Some(&n), thumb, &mut self.report));
-                        } else if let Some(movie) = crate::dirinfo::launcher(&full, &files) {
-                            // A Director game in its own folder: named and mapped after the folder.
-                            let thumb = [format!("{full}/{n}.png"), format!("{full}/cover.png"), format!("{full}/icon.png")].into_iter().find(|p| std::path::Path::new(p).is_file());
-                            let controls_path = format!("{full}/{n}.dcr");
-                            games.push(Self::director_game(paths, &format!("{full}/{movie}"), &n, &controls_path, Some(&n), thumb));
+                } else if !n.starts_with('.') && std::path::Path::new(&full).is_dir() {
+                    // A game in its own folder (V4: or in the one folder inside it, as unzipping
+                    // into a folder of the same name leaves it). Skipped folders are logged for
+                    // the games folder and a USB drive's ruffle5 folder, not a drive's root.
+                    let logged = dir == &paths.games || dir.ends_with("/ruffle5");
+                    if Self::folder_game(paths, &full, &n, &mut games, &mut self.report) {
+                        continue;
+                    }
+                    let subdirs = Self::list(&full).into_iter().filter(|f| !f.starts_with('.') && std::path::Path::new(&format!("{full}/{f}")).is_dir()).collect::<Vec<_>>();
+                    if subdirs.len() == 1 && Self::folder_game(paths, &format!("{full}/{}", subdirs[0]), &n, &mut games, &mut self.report) {
+                        if logged {
+                            self.report.push(format!("menu: {n}/ is one folder down, in {n}/{}/ (listed)", subdirs[0]));
                         }
+                    } else if logged {
+                        let files = Self::list(&full);
+                        let shown: Vec<&str> = files.iter().take(8).map(|f| f.as_str()).collect();
+                        self.report.push(format!(
+                            "menu: {dir}/{n}/ not listed: no .swf and no Director movie (.dcr/.dir/.dxr) in it; {} entries: {}{}",
+                            files.len(),
+                            shown.join(", "),
+                            if files.len() > shown.len() { ", ..." } else { "" }
+                        ));
                     }
                 }
             }
@@ -315,6 +322,35 @@ impl Menu {
         self.games = games;
         self.focus = [0; 3];
         self.scroll.snap(0.0);
+    }
+
+    /// A folder's entry names, sorted case-insensitively (empty if it cannot be read).
+    fn list(dir: &str) -> Vec<String> {
+        let mut files: Vec<String> = std::fs::read_dir(dir)
+            .map(|it| it.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        files.sort_by_key(|n| n.to_ascii_lowercase());
+        files
+    }
+
+    /// The game in folder `full` (named after `name`, the folder in the games folder): its first
+    /// .swf, else the Director movie its projector starts. True if one was added.
+    fn folder_game(paths: &Paths, full: &str, name: &str, games: &mut Vec<Game>, report: &mut Vec<String>) -> bool {
+        let files = Self::list(full);
+        if let Some(swf) = files.iter().find(|f| f.to_ascii_lowercase().ends_with(".swf")) {
+            let stem = &swf[..swf.len() - 4];
+            let thumb = [format!("{full}/{stem}.png"), format!("{full}/cover.png"), format!("{full}/icon.png")].into_iter().find(|p| std::path::Path::new(p).is_file());
+            games.push(Self::game(paths, &format!("{full}/{swf}"), swf, Some(name), thumb, report));
+            return true;
+        }
+        if let Some(movie) = crate::dirinfo::launcher(full, &files) {
+            // A Director game in its own folder: named and mapped after the folder.
+            let thumb = [format!("{full}/{name}.png"), format!("{full}/cover.png"), format!("{full}/icon.png")].into_iter().find(|p| std::path::Path::new(p).is_file());
+            let controls_path = format!("{full}/{name}.dcr");
+            games.push(Self::director_game(paths, &format!("{full}/{movie}"), name, &controls_path, Some(name), thumb));
+            return true;
+        }
+        false
     }
 
     fn game(paths: &Paths, path: &str, file: &str, folder: Option<&str>, thumb: Option<String>, report: &mut Vec<String>) -> Game {
@@ -1335,5 +1371,45 @@ impl Menu {
             hints.push((Glyph::Circle, if self.search.is_empty() { "Close (hold)" } else { "Clear search" }));
         }
         draw_hints(ui, scene, &hints, RIGHT, HINTS_Y);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn director_folders_are_found_one_level_down_and_skips_are_logged() {
+        let root = std::env::temp_dir().join(format!("ruffle5-menu-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let games = root.join("games");
+        let mk = |rel: &str, body: &[u8]| {
+            let p = games.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        // unzipped into a folder of the same name: the game is one level down
+        mk("ttbattleblitz/ttbattleblitz/gamewrapper.dir", b"XFIR\0\0\0\039VM");
+        mk("ttbattleblitz/ttbattleblitz/game.dcr", b"XFIR\0\0\0\0MDGF");
+        mk("ttbattleblitz/ttbattleblitz/Projector.ini", b"[Movies]\r\nMovie01=gamewrapper.dir\r\n");
+        // the usual layout
+        mk("flat/game.dcr", b"XFIR\0\0\0\0MDGF");
+        // nothing playable
+        mk("notes/readme.txt", b"hi");
+        let p = |s: &str| {
+            let d = root.join(s);
+            std::fs::create_dir_all(&d).unwrap();
+            d.to_string_lossy().into_owned()
+        };
+        let paths = Paths::new(&p("data"), &p("games"), &p("maps"));
+        let menu = Menu::new(&paths);
+        let names: Vec<&str> = menu.games.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["Flat", "Ttbattleblitz"], "{:?}", menu.report);
+        let tt = menu.games.iter().find(|g| g.name == "Ttbattleblitz").unwrap();
+        assert!(tt.path.ends_with("ttbattleblitz/ttbattleblitz/gamewrapper.dir"), "{}", tt.path);
+        assert_eq!(crate::controls::movie_stem(&tt.controls_path), "ttbattleblitz");
+        assert!(menu.report.iter().any(|l| l.contains("one folder down")), "{:?}", menu.report);
+        assert!(menu.report.iter().any(|l| l.contains("notes/ not listed") && l.contains("readme.txt")), "{:?}", menu.report);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
