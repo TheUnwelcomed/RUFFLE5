@@ -1,8 +1,20 @@
 diff --git a/vm-rust/Cargo.toml b/vm-rust/Cargo.toml
-index f0a3b59..dba3283 100644
+index f0a3b59..18098d0 100644
 --- a/vm-rust/Cargo.toml
 +++ b/vm-rust/Cargo.toml
-@@ -16,7 +16,7 @@ word_hard_break = []
+@@ -8,7 +8,10 @@ license = "GPL-3.0-only"
+ edition = "2024"
+ 
+ [lib]
+-crate-type = ["cdylib", "rlib"]
++# PS5_RUFFLE_DIRPLAYER_NATIVE: an rlib only. The cdylib is the wasm-pack build for the web; as a
++# dependency cargo would also link it as a shared library for the console target (another fat-LTO
++# pass, and a link through the title's linker wrapper, which has no shim for it).
++crate-type = ["rlib"]
+ 
+ [features]
+ default = ["console_error_panic_hook"]
+@@ -16,7 +19,7 @@ word_hard_break = []
  alloc-debug-overlay = []
  
  [dependencies]
@@ -11,7 +23,7 @@ index f0a3b59..dba3283 100644
  
  # Insertion-ordered map. `externalParamName(n)` / `externalParamValue(n)` are
  # INDEXED accessors in Director — the params keep the order the host handed
-@@ -34,8 +34,8 @@ xtra-sdk = { path = "../xtra-sdk" }
+@@ -34,8 +37,8 @@ xtra-sdk = { path = "../xtra-sdk" }
  # all the `std::fmt` and `std::panicking` infrastructure, so isn't great for
  # code size when deploying.
  console_error_panic_hook = { version = "0.1.7", optional = true }
@@ -22,7 +34,7 @@ index f0a3b59..dba3283 100644
  binary-reader = "0.4.5"
  num = "0.4.1"
  num-derive = "0.4.0"
-@@ -57,7 +57,10 @@ console_log = "1.0.0"
+@@ -57,7 +60,10 @@ console_log = "1.0.0"
  log = "0.4.22"
  percent-encoding = "2"
  xml = "1.0"
@@ -34,7 +46,7 @@ index f0a3b59..dba3283 100644
  rand = { version = "0.9", features = ["small_rng"] }
  getrandom = { version = "0.3", features = ["wasm_js"] }
  base64 = "0.22"
-@@ -77,8 +80,14 @@ wasm-bindgen-test = "0.3.34"
+@@ -77,8 +83,14 @@ wasm-bindgen-test = "0.3.34"
  version = "1.12.0"
  features = ["unstable"]
  

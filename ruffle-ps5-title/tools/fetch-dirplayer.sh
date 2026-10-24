@@ -26,8 +26,8 @@ fi
 want="$(sha256sum "$PATCH" | cut -d' ' -f1)"
 if [[ "$(cat "$DEST/.patch-sha" 2>/dev/null)" != "$want" ]]; then
     git -C "$DEST" checkout -q -- . && git -C "$DEST" clean -qfd -e .fetched-rev -e .patch-sha
-    git -C "$DEST" apply --check "$PATCH" || die "tools/dirplayer-native.patch does not apply to DirPlayer ${DP_REV:0:7}"
-    git -C "$DEST" apply "$PATCH"
+    git -C "$DEST" apply --whitespace=nowarn --check "$PATCH" || die "tools/dirplayer-native.patch does not apply to DirPlayer ${DP_REV:0:7}"
+    git -C "$DEST" apply --whitespace=nowarn "$PATCH"
     printf '%s\n' "$want" > "$DEST/.patch-sha"
 fi
 grep -rq "$MARK" "$DEST/vm-rust/src" || die "the DirPlayer patch is not in place"
