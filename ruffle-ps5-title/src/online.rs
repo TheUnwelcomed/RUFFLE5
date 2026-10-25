@@ -243,6 +243,11 @@ fn online_txt(source: Source, item: &Item, movie: &str, address: Option<&str>, l
     if let Some(r) = web_root {
         s.push_str(&format!("webroot = {}\n", one_line(r)));
     }
+    // 1.000.033: what the source calls it (Flashpoint: Game, or Animation for its Animations
+    // library); the menu sorts animations into their own category
+    if let Some(k) = &item.kind {
+        s.push_str(&format!("kind = {}\n", one_line(k)));
+    }
     if let Some(c) = &item.creator {
         s.push_str(&format!("creator = {}\n", one_line(c)));
     }
@@ -633,6 +638,42 @@ pub fn installed(games_dir: &str) -> HashMap<String, String> {
     out
 }
 
+/// Of Ruffle5's lists, the first other than `source` that shows an entry of `elsewhere`.
+fn other_list(source: Source, elsewhere: Option<&Result<r5net::Elsewhere, String>>) -> Option<usize> {
+    let Some(Ok(e)) = elsewhere else {
+        return None;
+    };
+    SOURCES.iter().position(|&s| s != source && e.entries.iter().any(|o| o.in_list(s)))
+}
+
+/// What the page says when a search found nothing: in `source`, and (Flashpoint) what the archive
+/// has for the words on other platforms (1.000.033).
+fn nothing_found(source: Source, words: &str, elsewhere: Option<&Result<r5net::Elsewhere, String>>) -> Vec<String> {
+    let mut lines = vec![format!("{} has nothing for \u{201c}{words}\u{201d}.", source.name())];
+    match elsewhere {
+        Some(Ok(e)) if !e.entries.is_empty() => {
+            let total = e.total.unwrap_or(0).max(e.entries.len() as u64);
+            let named: Vec<String> = e.entries.iter().take(3).map(|o| format!("{} ({})", o.title, o.platforms.join(", "))).collect();
+            let rest = total - named.len() as u64;
+            let list = if rest > 0 { format!("{} and {rest} more", named.join(", ")) } else { named.join(", ") };
+            lines.push(if total == 1 {
+                format!("Flashpoint has one entry for it, on another platform: {list}.")
+            } else {
+                format!("Flashpoint has {total} entries for it on other platforms: {list}.")
+            });
+            lines.push(match other_list(source, elsewhere) {
+                Some(i) => format!("Cross searches {}, the list of its {} games.", SOURCES[i].name(), SOURCES[i].plays()),
+                None => "Ruffle5 plays Flash and Shockwave games; Flashpoint has these for other platforms only.".into(),
+            });
+        }
+        Some(Ok(_)) => lines.push("Flashpoint has nothing for it on its other platforms either.".into()),
+        Some(Err(e)) => lines.push(format!("Its other platforms were not looked at: {e}")),
+        None => {}
+    }
+    lines.push("Circle clears the search; R2 tries another source.".into());
+    lines
+}
+
 // ---- the tab ----------------------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -649,6 +690,8 @@ struct List {
     gen: u64,
     focus: usize,
     asked: bool,
+    /// 1.000.033: nothing found: what the archive has for the words on other platforms.
+    elsewhere: Option<Result<r5net::Elsewhere, String>>,
 }
 
 enum Picture {
@@ -811,6 +854,38 @@ impl Online {
         let _ = w.jobs.send(Job::Search { source, words: l.words.clone(), page, gen: l.gen });
     }
 
+    /// Show the list of `SOURCES[i]`, searching it for `words` unless it already did.
+    fn switch_to(&mut self, i: usize, words: &str) {
+        self.source = i.min(SOURCES.len() - 1);
+        sounds::play(Sfx::Tab);
+        self.shelf_anim = 0.0;
+        self.scroll.snap(0.0);
+        if !self.list().asked || self.list().words != words {
+            let w = words.to_string();
+            let l = self.list_mut();
+            let gen = l.gen + 1;
+            *l = List { words: w, gen, ..List::default() };
+            self.ask_page(1);
+        }
+    }
+
+    /// The list nothing was found in has an archive answer naming an entry another list of
+    /// Ruffle5's shows (a Flash game when Flashpoint Shockwave was searched): that list's index.
+    fn other_list(&self) -> Option<usize> {
+        let l = self.list();
+        if l.loading || l.words.is_empty() || !l.items.is_empty() {
+            return None;
+        }
+        other_list(self.src(), l.elsewhere.as_ref())
+    }
+
+    /// The page a search that found nothing shows (the screen shots of the host tests).
+    #[cfg(test)]
+    pub(crate) fn show_nothing_found(&mut self, source: usize, words: &str, elsewhere: Option<Result<r5net::Elsewhere, String>>) {
+        self.source = source.min(SOURCES.len() - 1);
+        *self.list_mut() = List { words: words.to_string(), asked: true, elsewhere, ..List::default() };
+    }
+
     fn new_search(&mut self, words: &str) {
         let l = self.list_mut();
         let gen = l.gen + 1;
@@ -847,16 +922,11 @@ impl Online {
             self.new_search(&words_now);
         }
         if pressed & BTN_R2 != 0 {
-            self.source = (self.source + 1) % SOURCES.len();
-            sounds::play(Sfx::Tab);
-            self.shelf_anim = 0.0;
-            self.scroll.snap(0.0);
-            if !self.list().asked || self.list().words != words_now {
-                let w = words_now.clone();
-                let l = self.list_mut();
-                let gen = l.gen + 1;
-                *l = List { words: w, gen, ..List::default() };
-                self.ask_page(1);
+            self.switch_to((self.source + 1) % SOURCES.len(), &words_now);
+        } else if pressed & BTN_CROSS != 0 && self.list().items.is_empty() {
+            // 1.000.033: nothing found here, the archive's other list has it
+            if let Some(i) = self.other_list() {
+                self.switch_to(i, &words_now);
             }
         }
         let n = self.list().items.len();
@@ -1020,13 +1090,26 @@ impl Online {
                             l.total = p.total.or(l.total);
                             l.more = p.more;
                             l.pages = page;
+                            if page <= 1 {
+                                l.elsewhere = p.elsewhere;
+                            }
                             crate::say(&format!(
-                                "online: {} {}page {page}: {} new, {} listed{}",
+                                "online: {} ({}) {}page {page}: {} new, {} listed{}{}",
+                                source.name(),
                                 source.site(),
                                 if l.words.is_empty() { String::new() } else { format!("\"{}\" ", l.words) },
                                 l.items.len() - before,
                                 l.items.len(),
-                                l.total.map(|t| format!(" of {t}")).unwrap_or_default()
+                                l.total.map(|t| format!(" of {t}")).unwrap_or_default(),
+                                match &l.elsewhere {
+                                    Some(Ok(e)) => format!(
+                                        "; without the platform: {} ({})",
+                                        e.total.map(|t| t.to_string()).unwrap_or_else(|| e.entries.len().to_string()),
+                                        e.entries.iter().map(|o| format!("{} [{}]", o.title, o.platforms.join("/"))).collect::<Vec<_>>().join(", ")
+                                    ),
+                                    Some(Err(e)) => format!("; without the platform: not answered ({e})"),
+                                    None => String::new(),
+                                }
                             ));
                         }
                         Err(e) => {
@@ -1124,6 +1207,9 @@ impl Online {
         if self.list().error.is_some() {
             h.push((Glyph::Triangle, "Try again"));
         }
+        if let Some(i) = self.other_list() {
+            h.push((Glyph::Cross, if SOURCES[i] == Source::Flashpoint { "Search Flashpoint Shockwave" } else { "Search Flashpoint Flash" }));
+        }
         h.push((Glyph::Chip("L2"), "Search"));
         h.push((Glyph::Chip("R2"), "Source"));
         h
@@ -1163,7 +1249,7 @@ impl Online {
             } else if l.loading || !l.asked {
                 (source.name().to_uppercase(), "Looking\u{2026}".into(), vec![if l.words.is_empty() { format!("Asking {} for its {} games.", source.site(), source.plays()) } else { format!("Searching {} for \u{201c}{}\u{201d}.", source.site(), l.words) }])
             } else if !l.words.is_empty() {
-                (source.name().to_uppercase(), "Nothing found".into(), vec![format!("{} has nothing for \u{201c}{}\u{201d}.", source.name(), l.words), "Circle clears the search; R2 tries another source.".into()])
+                (source.name().to_uppercase(), "Nothing found".into(), nothing_found(source, &l.words, l.elsewhere.as_ref()))
             } else {
                 (source.name().to_uppercase(), "Nothing listed".into(), vec![format!("{} listed nothing.", source.site())])
             };
@@ -1802,5 +1888,31 @@ mod tests {
         let (w, h, rgba) = decode_picture(&tiny_png(), 512).unwrap();
         assert_eq!((w, h, rgba.len()), (2, 2, 16));
         assert!(decode_picture(b"not a picture", 512).is_err());
+    }
+
+    #[test]
+    fn a_search_that_found_nothing_says_where_flashpoint_has_it() {
+        use r5net::{Elsewhere, Other};
+        let racer = Other { title: "Pyongyang Racer".into(), platforms: vec!["Flash".into()] };
+        let html = Other { title: "Racer HD".into(), platforms: vec!["HTML5".into()] };
+        // a Flash game asked for among the Shockwave ones: Flashpoint Flash has it, Cross goes there
+        let one = Some(Ok(Elsewhere { entries: vec![racer.clone()], total: Some(1) }));
+        let lines = nothing_found(Source::Flashpoint, "pyongyang", one.as_ref());
+        assert_eq!(lines[0], "Flashpoint Shockwave has nothing for \u{201c}pyongyang\u{201d}.");
+        assert_eq!(lines[1], "Flashpoint has one entry for it, on another platform: Pyongyang Racer (Flash).");
+        assert_eq!(lines[2], "Cross searches Flashpoint Flash, the list of its Flash games.");
+        assert_eq!(other_list(Source::Flashpoint, one.as_ref()), SOURCES.iter().position(|&s| s == Source::FlashpointFlash));
+        // only platforms Ruffle5 does not play: no list to go to
+        let other = Some(Ok(Elsewhere { entries: vec![html.clone()], total: Some(1) }));
+        assert_eq!(other_list(Source::FlashpointFlash, other.as_ref()), None);
+        assert!(nothing_found(Source::FlashpointFlash, "racer hd", other.as_ref())[2].starts_with("Ruffle5 plays Flash and Shockwave games"));
+        // more than are named
+        let many = Some(Ok(Elsewhere { entries: vec![racer.clone(), html.clone(), racer.clone(), html.clone()], total: Some(9) }));
+        assert!(nothing_found(Source::Flashpoint, "racer", many.as_ref())[1].ends_with("Racer HD (HTML5), Pyongyang Racer (Flash) and 6 more."));
+        // the archive has nothing anywhere; the second question failed; not asked (Internet Archive)
+        assert_eq!(nothing_found(Source::Flashpoint, "zzz", Some(&Ok(Elsewhere::default())))[1], "Flashpoint has nothing for it on its other platforms either.");
+        assert!(nothing_found(Source::Flashpoint, "zzz", Some(&Err("timed out".into())))[1].contains("timed out"));
+        assert_eq!(nothing_found(Source::InternetArchive, "zzz", None).len(), 2);
+        assert_eq!(other_list(Source::InternetArchive, None), None);
     }
 }

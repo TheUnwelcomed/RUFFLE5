@@ -193,6 +193,8 @@ pub struct Osk {
     /// Where it is now (it starts at the setting's place; R1 / L1 move it for the session).
     pos: KbPos,
     shown: f32,
+    /// Seconds since the last key (the caret of the typed text blinks from then).
+    blink: f32,
 }
 
 impl Default for Osk {
@@ -213,7 +215,15 @@ impl Osk {
             prefs: KeyboardPrefs::default(),
             pos: KbPos::Bottom,
             shown: 0.0,
+            blink: 0.0,
         }
+    }
+
+    /// Caps on or off (the screen shots of the host tests).
+    #[cfg(test)]
+    pub(crate) fn with_caps(mut self, on: bool) -> Osk {
+        self.caps = on;
+        self
     }
 
     /// A keyboard as `prefs` draw it, fully shown: the settings' preview.
@@ -261,6 +271,7 @@ impl Osk {
     }
 
     fn tap(&mut self, def: KeyDef, events: &mut Vec<PlayerEvent>) {
+        self.blink = 0.0;
         if def.1 == "shift" {
             self.caps = !self.caps;
             return;
@@ -288,6 +299,7 @@ impl Osk {
     /// with repeats (input's `nav`).
     pub fn update(&mut self, dt: f32, pressed: u32, events: &mut Vec<PlayerEvent>) -> bool {
         let target = if self.open { 1.0 } else { 0.0 };
+        self.blink += dt;
         self.shown += (target - self.shown) * (1.0 - (-18.0 * dt).exp());
         if (target - self.shown).abs() < 0.01 {
             self.shown = target;
@@ -428,6 +440,17 @@ impl Osk {
 
     /// `draw` with other button hints than the keyboard's own (the settings' full-size preview).
     pub fn draw_with(&self, ui: &mut Ui, scene: &mut Scene, title: &str, hints: Option<&[(Glyph, &str)]>) {
+        self.draw_all(ui, scene, title, hints, None);
+    }
+
+    /// `draw` with what has been typed shown in the keyboard's head, after the title, with a
+    /// caret (`placeholder` while nothing is): the menu's search (1.000.033: the text was only in
+    /// the top bar's corner, far from the keys).
+    pub fn draw_typed(&self, ui: &mut Ui, scene: &mut Scene, title: &str, typed: &str, placeholder: &str) {
+        self.draw_all(ui, scene, title, None, Some((typed, placeholder)));
+    }
+
+    fn draw_all(&self, ui: &mut Ui, scene: &mut Scene, title: &str, hints: Option<&[(Glyph, &str)]>, field: Option<(&str, &str)>) {
         if self.shown <= 0.0 {
             return;
         }
@@ -440,7 +463,23 @@ impl Osk {
         scene.stroke(p, m.panel_radius, 1.5, ORANGE.with_alpha(0.3));
         let x0 = p.x + m.pad;
         let y0 = p.y + m.head;
-        if m.title > 0.0 {
+        if let (Some((typed, placeholder)), true) = (field, m.title > 0.0) {
+            // the head: the title, then the field
+            let s = m.title / 26.0;
+            let fh = m.title * 2.0;
+            let cy = p.y + (m.head - m.gap) * 0.5 + 2.0 * s;
+            self.draw_field(ui, scene, Rect::new(x0, cy - fh * 0.5, m.board_w(), fh), m.title, title, typed, placeholder);
+        } else if let Some((typed, placeholder)) = field {
+            // Mini has no head: the field in a box of its own above the panel (below it at the top)
+            let size = 20.0;
+            let fh = 40.0;
+            let bh = fh + 16.0;
+            let y = if p.y - 10.0 - bh >= 24.0 { p.y - 10.0 - bh } else { p.y + p.h + 10.0 };
+            let bx = Rect::new(p.x, y, p.w.max(360.0), bh);
+            scene.rect(bx, m.panel_radius, NIGHT.with_alpha(0.95 * solid));
+            scene.stroke(bx, m.panel_radius, 1.5, ORANGE.with_alpha(0.3));
+            self.draw_field(ui, scene, Rect::new(bx.x + 12.0, bx.y + 8.0, bx.w - 24.0, fh), size, title, typed, placeholder);
+        } else if m.title > 0.0 {
             let base = p.y + m.head - 38.0 * m.title / 26.0;
             scene.text(ui, Face::SemiBold, m.title, title, x0, base, INK, Align::Left, 0.0);
             if self.caps {
@@ -491,6 +530,61 @@ impl Osk {
         }
         scene.pop_opacity();
     }
+}
+
+impl Osk {
+    /// A text field across `row`: the title, then a rounded box with the typed text (its end, when
+    /// it is longer than the box) and a blinking caret; CAPS inside the box on the right while caps
+    /// are on. `size` is the text's.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_field(&self, ui: &mut Ui, scene: &mut Scene, row: Rect, size: f32, title: &str, typed: &str, placeholder: &str) {
+        let s = size / 26.0;
+        let cy = row.cy();
+        let tw = scene.text(ui, Face::SemiBold, size, title, row.x, centred(cy, size), INK, Align::Left, 0.0);
+        let fh = row.h;
+        let fx = row.x + tw + 18.0 * s;
+        let field = Rect::new(fx, cy - fh * 0.5, (row.x + row.w - fx).max(fh), fh);
+        scene.rect(field, fh * 0.5, WHITE.with_alpha(0.08));
+        scene.stroke(field, fh * 0.5, 1.5, ORANGE.with_alpha(0.55));
+        let inner_x = field.x + fh * 0.45;
+        let mut right = field.x + field.w - fh * 0.45;
+        if self.caps {
+            let caps = size * 18.0 / 26.0;
+            let cw = scene.text(ui, Face::SemiBold, caps, "CAPS", right, centred(cy, caps), ORANGE, Align::Right, 2.0);
+            right -= cw + 14.0 * s;
+        }
+        let room = (right - inner_x - 6.0 * s).max(0.0);
+        let caret_on = self.blink < 0.6 || (self.blink - 0.6).rem_euclid(1.0) < 0.5;
+        if typed.is_empty() {
+            if caret_on {
+                scene.rect(Rect::new(inner_x, cy - size * 0.55, 2.5 * s.max(0.8), size * 1.1), 1.0, ORANGE);
+            }
+            let hint = ui.fit(Face::SemiBold, size, placeholder, room);
+            scene.text(ui, Face::SemiBold, size, &hint, inner_x + 8.0 * s, centred(cy, size), INK.with_alpha(0.45), Align::Left, 0.0);
+            return;
+        }
+        let shown = tail_fit(ui, size, typed, room);
+        let w = scene.text(ui, Face::SemiBold, size, &shown, inner_x, centred(cy, size), INK, Align::Left, 0.0);
+        if caret_on {
+            scene.rect(Rect::new(inner_x + w + 3.0 * s, cy - size * 0.55, 2.5 * s.max(0.8), size * 1.1), 1.0, ORANGE);
+        }
+    }
+}
+
+/// `text`, or its end after an ellipsis, in no more than `room` wide (what is being typed is at
+/// the end).
+fn tail_fit(ui: &mut Ui, size: f32, text: &str, room: f32) -> String {
+    if ui.measure(Face::SemiBold, size, text, 0.0) <= room {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    for start in 1..chars.len() {
+        let t: String = std::iter::once('\u{2026}').chain(chars[start..].iter().copied()).collect();
+        if ui.measure(Face::SemiBold, size, &t, 0.0) <= room {
+            return t;
+        }
+    }
+    chars.last().map(|c| c.to_string()).unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -87,6 +87,7 @@ two settings can be compared on the same game.
 | `src/online.rs` | the Flash Browser tab (*Online* before 1.000.029): lists, pictures and fetching games from the Internet Archive and Flashpoint (its Flash and Shockwave games; Flash Museum until 1.000.032), on threads of its own |
 | `net/` | `r5net`, its own crate: HTTPS on the console's sockets (rustls + RustCrypto, Mozilla's roots), the three sources' APIs and pages, a zip reader for Flashpoint's game data; `examples/online-check.rs`, `examples/fetch.rs` |
 | `src/game.rs` | one game: loading screen, the player and its options, quick menu, overlay, the frame-time log |
+| `src/dir3d.rs` | which Director games have Shockwave 3D (the menu's categories, 1.000.033) |
 | `src/navigator.rs` | where a Flash game's files come from: beside the movie, and (a Flashpoint game) by web address from its game data's `content/` (1.000.033) |
 | `src/fsutil.rs` | writing files safely; removing a game's folder, or moving it to `games/.ruffle5-trash` when the console refuses (1.000.032) |
 | `src/watchdog.rs` | names the step of a game's loop that takes 5 s or more, in ruffle.log (1.000.032) |
@@ -275,10 +276,22 @@ between games, and a ribbon wipe carries you into a game and back out.
 | Cross | play the focused game / open a Settings row |
 | Triangle | this game's controls editor |
 | Square | favourite / unfavourite |
-| L2 | search (on-screen keyboard, or type on a USB keyboard) |
+| L2 | search (on-screen keyboard, or type on a USB keyboard); the keyboard shows what is typed (1.000.033) |
+| R2 | category (1.000.033): All · Flash · Shockwave · Shockwave 3D · Animations, each with its count |
 | L1 / R1 | Games · Favorites · Recent · Badges · Flash Browser · Settings |
 | OPTIONS | delete the focused game (1.000.028): Cross deletes, Circle keeps; its saves, cover and play time stay |
 | Circle, held | close Ruffle5 |
+
+**Categories** (1.000.033, R2 on Games, Favorites and Recent; All at each start): every game is in
+one of Flash, Shockwave, Shockwave 3D and Animations. A Director game is *Shockwave 3D* when one of
+its files has a Shockwave 3D cast member — an Xtra member whose record holds the type
+`shockwave3d`, as DirPlayer itself tells them (`src/dir3d.rs`; a game in a folder of its own counts
+every Director file beside its movie, so Paul Blart's loader counts its 3D movie). The movie's Xtra
+list is not used: a loader can list the 3D Xtra and have no 3D member. Each file is read once; the
+answers are kept in `/data/ruffle5/shockwave3d.txt` by size and time. *Animations* are the movies
+Flashpoint calls animations (its Animations library; `kind = Animation` in the game's online.txt
+from 1.000.033 on) and every movie or folder in a folder named `Animations` in the games folder or a
+USB drive's `ruffle5` folder. The stage says which (*Shockwave 3D game*, *Flash animation*).
 
 **Flash Browser** (1.000.027 as *Online*, Flashpoint 1.000.028, renamed and moved last before
 Settings 1.000.029): games and movies from three lists, R2 switching
@@ -294,6 +307,12 @@ Flashpoint's own proxy serves them. One without game data comes as its movie alo
 Flashpoint's legacy server (the files such a movie loads are not fetched). Flash Museum was a
 source until 1.000.032: its file server refused the movies on the console (403 Forbidden), so it
 was taken out; games fetched from it before still play. L2 searches the current list.
+Flashpoint's search (FPA-Rust, the archive's search library) looks for each word in the title, an
+alternate title, the developer, the publisher and the series, in one platform per list; a search
+that finds nothing in its list is asked again without the platform (1.000.033), and the page names
+what the archive has and on which platform — Cross goes to the other list when it is Flash or
+Shockwave (1.000.032's single Flashpoint list was Shockwave only: no Pyongyang Racer, a Flash
+game).
 Cross fetches the focused one and plays it, Square only fetches it; it lands in the games folder in a
 folder of its own — the movie (and, from the Internet Archive, the small files beside it in the
 item: levels, sounds, XML), its picture as `cover.png`, and `online.txt`, which names the source,
@@ -399,7 +418,13 @@ shows the keyboard at full size where it will open (in a game, the paused game m
 as it will), where L1 / R1 move it, Left / Right size it, Up / Down set its background and Triangle
 puts the game under it or beside it. With the game beside it, a Flash game's stage is shown without
 Ruffle's letterbox around it, so it gets as much of the free part as its shape allows; a Director
-stage is fitted the same way. The menu's search keyboard stays as it was.
+stage is fitted the same way.
+
+The menu's search keyboard (1.000.033) has settings of its own, Settings › Controls & Sound ›
+Search keyboard: its size, where it opens and its background, starting from the keyboard for all
+games (so a change there reaches it until it is given its own), kept in `Custom Mappings/_Menu
+Search.keyboard.txt`. It shows what is typed in its head, with a caret (Mini, which has no head: in
+a box above or below it).
 
 The files are layered, generic first: the defaults; `controls.txt` in the title folder (all
 comments); `Custom Mappings/_All Games.controls.txt`; the game's own

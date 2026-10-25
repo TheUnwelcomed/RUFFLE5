@@ -17,7 +17,7 @@ pub mod url;
 pub mod zip;
 
 pub use http::{Client, Download, Error, Head, Request, Response};
-pub use source::{Archive, Files, Item, Page, RemoteFile, Source, SOURCES};
+pub use source::{Archive, Elsewhere, Files, Item, Other, Page, RemoteFile, Source, SOURCES};
 
 /// A file's SHA-256, lowercase hex (Flashpoint's game data is checked against it).
 pub fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {

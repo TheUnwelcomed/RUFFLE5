@@ -106,7 +106,11 @@
 //! "Flashpoint Shockwave"), those Flashpoint's own launcher plays with Ruffle marked "Ruffle". A
 //! game from its game data plays as if from its address (online.txt `url`, ahead of the Pretend
 //! Site setting now), and the files it loads by web address are read from the game data's
-//! `content/` (src/navigator.rs), as Flashpoint's proxy serves them.
+//! `content/` (src/navigator.rs), as Flashpoint's proxy serves them. A Flashpoint search that
+//! finds nothing is asked again without the platform and says what the archive has and where
+//! (1.000.032 searched Shockwave only). The menu's categories (R2): All, Flash, Shockwave,
+//! Shockwave 3D (src/dir3d.rs) and Animations (Flashpoint's, and an Animations folder). The search
+//! keyboard shows what is typed and has settings of its own (Settings > Search keyboard).
 //!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -133,6 +137,8 @@ mod covers;
 mod cpu;
 #[cfg(feature = "ruffle")]
 mod cursor;
+#[cfg(feature = "ruffle")]
+mod dir3d;
 #[cfg(feature = "ruffle")]
 mod dirinfo;
 #[cfg(feature = "ruffle")]
@@ -473,6 +479,7 @@ fn run_app(gpu: gpu::Gpu, paths: paths::Paths) -> Result<(), String> {
                 }
                 Some(menu::Action::EditAllControls) => editor = Some(editor::Editor::open(&app.paths, editor::Target::AllGames, None)),
                 Some(menu::Action::EditKeyboard) => editor = Some(editor::Editor::open_keyboard(&app.paths, editor::Target::AllGames, None)),
+                Some(menu::Action::EditSearchKeyboard) => editor = Some(editor::Editor::open_keyboard(&app.paths, editor::Target::Search, None)),
                 Some(menu::Action::Rescan) => {
                     rescan(&mut app);
                     let found = format!("{} game(s) found", app.menu.games.len());

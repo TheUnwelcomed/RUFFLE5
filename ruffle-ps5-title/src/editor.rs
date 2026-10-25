@@ -33,6 +33,8 @@ use crate::widgets::{card, centred, draw_glyph, draw_hints, hints_width, Glyph, 
 pub enum Target {
     AllGames,
     Game { stem: String, name: String },
+    /// 1.000.033: the menu's search keyboard (its keyboard page only).
+    Search,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -55,6 +57,8 @@ enum ERow {
 }
 
 const KB_ROWS: [ERow; 6] = [ERow::KbKind, ERow::KbSize, ERow::KbPosition, ERow::KbGame, ERow::KbOpacity, ERow::KbReset];
+/// The search keyboard's page: no game beside it, no settings made for kinds of game.
+const SEARCH_KB_ROWS: [ERow; 4] = [ERow::KbSize, ERow::KbPosition, ERow::KbOpacity, ERow::KbReset];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Page {
@@ -219,6 +223,7 @@ impl Editor {
                 };
                 (c, base, controls::mapping_file(paths, Some(stem)))
             }
+            Target::Search => (Controls::search_keyboard(paths), Controls::search_base(paths), controls::search_keyboard_file(paths)),
         };
         Editor {
             target,
@@ -269,13 +274,14 @@ impl Editor {
         match &self.target {
             Target::AllGames => "All games".to_string(),
             Target::Game { name, .. } => name.clone(),
+            Target::Search => "Menu search".to_string(),
         }
     }
 
     fn show_keyboard_page(&mut self) {
         self.back = (self.focus, self.scroll.target);
         self.page = Page::Keyboard;
-        self.rows = KB_ROWS.to_vec();
+        self.rows = if self.target == Target::Search { SEARCH_KB_ROWS.to_vec() } else { KB_ROWS.to_vec() };
         self.focus = 0;
         self.hl.snap(0.0);
         self.scroll.snap(0.0);
@@ -423,7 +429,7 @@ impl Editor {
         if nav & BTN_DOWN != 0 {
             k.opacity = step(&KB_OPACITIES, k.opacity, 1);
         }
-        if nav & BTN_TRIANGLE != 0 {
+        if nav & BTN_TRIANGLE != 0 && self.target != Target::Search {
             k.game = step(&[KbGame::Under, KbGame::Beside], k.game, 1);
         }
         if *k != before {
@@ -571,6 +577,7 @@ impl Editor {
         let heading = match &self.target {
             Target::AllGames => "Ruffle5 controls for every game (a game's own mapping is applied over these)".to_string(),
             Target::Game { stem, name } => format!("{name} ({stem}.swf) — Ruffle5 custom mapping"),
+            Target::Search => "Ruffle5: the menu's search keyboard (applied over the on-screen keyboard for all games)".to_string(),
         };
         let text = self.controls.file_text(&self.base, &heading);
         let what = if self.keyboard_only { "Keyboard settings" } else { "Controls" };
@@ -657,7 +664,8 @@ impl Editor {
             KbGame::Under if pr_centre_below(panel) => g.y + g.h * 0.2,
             KbGame::Under => g.bottom() - g.h * 0.2,
         };
-        scene.text(ui, Face::SemiBold, 18.0, "Game", g.cx(), centred(label_y, 18.0), INK.with_alpha(0.75), Align::Center, 0.0);
+        let what = if self.target == Target::Search { "Menu" } else { "Game" };
+        scene.text(ui, Face::SemiBold, 18.0, what, g.cx(), centred(label_y, 18.0), INK.with_alpha(0.75), Align::Center, 0.0);
         let solid = k.opacity as f32 / 100.0;
         let pr = map(panel);
         scene.rect(pr, 5.0, NIGHT.with_alpha(0.95 * solid));
@@ -668,6 +676,7 @@ impl Editor {
         scene.stroke(r, 10.0, 1.5, WHITE.with_alpha(0.3));
         let caption = match k.game {
             KbGame::Beside => format!("Keyboard {:.0} x {:.0}, the game {:.0} x {:.0}", panel.w, panel.h, game.w, game.h),
+            KbGame::Under if self.target == Target::Search => format!("Keyboard {:.0} x {:.0}, over the menu", panel.w, panel.h),
             KbGame::Under => format!("Keyboard {:.0} x {:.0}, over the game", panel.w, panel.h),
         };
         scene.text(ui, Face::Regular, 19.0, &caption, r.x, r.y - 14.0, INK.with_alpha(0.6), Align::Left, 0.0);
@@ -685,10 +694,17 @@ impl Editor {
                 KbGame::Under => fit_in(Rect::new(0.0, 0.0, W, H), self.aspect),
             };
             scene.gradient_v(game, 12.0, BLUE_6, BLUE_9);
-            scene.text(ui, Face::Display, 44.0, "Your game", game.cx(), centred(game.cy(), 44.0), INK.with_alpha(0.55), Align::Center, 0.0);
+            let what = if self.target == Target::Search { "The menu" } else { "Your game" };
+            scene.text(ui, Face::Display, 44.0, what, game.cx(), centred(game.cy(), 44.0), INK.with_alpha(0.55), Align::Center, 0.0);
         }
-        osk.draw(ui, scene, "Keyboard");
-        let hints = [(Glyph::Chip("L1 R1"), "Move"), (Glyph::DPad(1), "Size"), (Glyph::DPad(0), "Background"), (Glyph::Triangle, "Under / beside"), (Glyph::Circle, "Back")];
+        let search = self.target == Target::Search;
+        if search {
+            osk.draw_typed(ui, scene, "Search", "pyongyang", "type to search");
+        } else {
+            osk.draw(ui, scene, "Keyboard");
+        }
+        let all = [(Glyph::Chip("L1 R1"), "Move"), (Glyph::DPad(1), "Size"), (Glyph::DPad(0), "Background"), (Glyph::Triangle, "Under / beside"), (Glyph::Circle, "Back")];
+        let hints: Vec<(Glyph, &str)> = all.iter().copied().filter(|(g, _)| !(search && *g == Glyph::Triangle)).collect();
         let w = hints_width(ui, &hints, 1.0) + 56.0;
         // at the top while the keyboard is in the lower half, else at the bottom
         let y = if panel.cy() > H * 0.5 { 32.0 } else { H - 32.0 - 60.0 };
@@ -696,7 +712,11 @@ impl Editor {
         scene.rect(pill, 30.0, NIGHT.with_alpha(0.92));
         scene.stroke(pill, 30.0, 1.5, ORANGE.with_alpha(0.4));
         draw_hints(ui, scene, &hints, pill.right() - 28.0, pill.cy());
-        let label = format!("{}, {}, {}, {}", k.size.label(), k.position.label().to_lowercase(), k.game.label().to_lowercase(), opacity_label(k.opacity).to_lowercase());
+        let label = if search {
+            format!("{}, {}, {}", k.size.label(), k.position.label().to_lowercase(), opacity_label(k.opacity).to_lowercase())
+        } else {
+            format!("{}, {}, {}, {}", k.size.label(), k.position.label().to_lowercase(), k.game.label().to_lowercase(), opacity_label(k.opacity).to_lowercase())
+        };
         scene.text(ui, Face::SemiBold, 22.0, &label, W * 0.5, if y < H * 0.5 { pill.bottom() + 38.0 } else { pill.y - 20.0 }, ORANGE, Align::Center, 0.0);
     }
 
@@ -826,6 +846,7 @@ impl Editor {
                     let base_name = match self.target {
                         Target::AllGames => "the built-in defaults",
                         Target::Game { .. } => "the controls for all games",
+                        Target::Search => "the on-screen keyboard for all games",
                     };
                     let note = format!("Orange values differ from {base_name}.");
                     scene.text(ui, Face::Regular, 21.0, &note, SIDE.x + 32.0, SIDE.bottom() - 36.0, INK.with_alpha(0.6), Align::Left, 0.0);
@@ -987,6 +1008,43 @@ mod tests {
         assert_eq!(e.save(noop).as_deref(), Some("Keyboard settings saved"));
         let c = Controls::base_game(&paths);
         assert_eq!(c.keyboard, PRESETS[PRESETS.len() - 1].1, "every game gets them");
+    }
+
+    #[test]
+    fn the_search_keyboard_starts_from_the_one_for_all_games_and_keeps_its_own() {
+        let paths = paths("kbsearch");
+        // the keyboard for all games: small, beside the game
+        let mut all = Editor::open_keyboard(&paths, Target::AllGames, None);
+        all.controls.keyboard = KeyboardPrefs { size: KbSize::Small, position: KbPos::BottomRight, game: KbGame::Beside, opacity: 100 };
+        all.dirty = true;
+        all.save(noop);
+        // the search keyboard follows it (over the menu, never beside) until it has its own
+        let s = Controls::search_keyboard(&paths).keyboard;
+        assert_eq!((s.size, s.position, s.game), (KbSize::Small, KbPos::BottomRight, KbGame::Under));
+        let mut e = Editor::open_keyboard(&paths, Target::Search, None);
+        assert_eq!(e.rows, SEARCH_KB_ROWS.to_vec(), "no game beside it, no settings for kinds of game");
+        assert_eq!(e.title(), "Menu search");
+        e.focus = SEARCH_KB_ROWS.iter().position(|r| *r == ERow::KbSize).unwrap();
+        e.update(0.016, BTN_LEFT);
+        assert_eq!(e.controls.keyboard.size, KbSize::Medium);
+        assert!(e.update(0.016, BTN_CIRCLE));
+        assert_eq!(e.save(noop).as_deref(), Some("Keyboard settings saved"));
+        let text = std::fs::read_to_string(controls::search_keyboard_file(&paths)).unwrap();
+        assert!(text.contains("keyboard_size = medium") && !text.contains("keyboard_position") && !text.contains("keyboard_game"), "only what differs: {text}");
+        assert_eq!(Controls::search_keyboard(&paths).keyboard.size, KbSize::Medium);
+        // the games' keyboard is untouched; a change to it still reaches what the search keyboard did not change
+        assert_eq!(Controls::base_game(&paths).keyboard.size, KbSize::Small);
+        let mut all = Editor::open_keyboard(&paths, Target::AllGames, None);
+        all.controls.keyboard.position = KbPos::Top;
+        all.dirty = true;
+        all.save(noop);
+        let s = Controls::search_keyboard(&paths).keyboard;
+        assert_eq!((s.size, s.position), (KbSize::Medium, KbPos::Top));
+        // Triangle in its preview does not put it beside anything
+        let mut e = Editor::open_keyboard(&paths, Target::Search, None);
+        e.update(0.016, BTN_SQUARE);
+        e.update(0.016, BTN_TRIANGLE);
+        assert_eq!(e.controls.keyboard.game, KbGame::Under);
     }
 
     #[test]

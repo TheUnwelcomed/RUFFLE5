@@ -169,7 +169,7 @@ pub fn parse_list(html: &str, page: u32) -> Page {
             last = last.max(n);
         }
     }
-    Page { more: last > page && !items.is_empty(), total: None, items }
+    Page { more: last > page && !items.is_empty(), total: None, items, elsewhere: None }
 }
 
 pub fn search(client: &Client, words: &str, page: u32) -> Result<Page, Error> {

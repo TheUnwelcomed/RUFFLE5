@@ -442,6 +442,15 @@ pub fn movie_stem(movie_path: &str) -> String {
     }
 }
 
+/// 1.000.033: the menu's search keyboard (L2 in Games and Flash Browser) has settings of its own:
+/// those of the on-screen keyboard for all games, then this file's (Settings > Controls & Sound >
+/// Search keyboard). Only its size, place and background count: it is drawn over the menu.
+pub const SEARCH_KEYBOARD_FILE: &str = "_Menu Search.keyboard.txt";
+
+pub fn search_keyboard_file(paths: &Paths) -> String {
+    format!("{}/{SEARCH_KEYBOARD_FILE}", paths.mappings)
+}
+
 /// The mapping file the editor writes for a movie (or for all games, `stem` None).
 pub fn mapping_file(paths: &Paths, stem: Option<&str>) -> String {
     match stem {
@@ -487,6 +496,21 @@ impl Controls {
     pub fn base_game(paths: &Paths) -> Controls {
         let mut c = Controls::base_all(paths);
         c.layer(&mapping_file(paths, None));
+        c
+    }
+
+    /// What the search keyboard starts from: the all-games settings, over the menu (never beside).
+    pub fn search_base(paths: &Paths) -> Controls {
+        let mut c = Controls::base_game(paths);
+        c.keyboard.game = KbGame::Under;
+        c
+    }
+
+    /// The search keyboard's settings: `search_base`, then its own file.
+    pub fn search_keyboard(paths: &Paths) -> Controls {
+        let mut c = Controls::search_base(paths);
+        c.layer(&search_keyboard_file(paths));
+        c.keyboard.game = KbGame::Under;
         c
     }
 

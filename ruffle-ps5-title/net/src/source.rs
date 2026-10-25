@@ -113,6 +113,33 @@ pub struct Page {
     pub total: Option<u64>,
     /// A next page exists.
     pub more: bool,
+    /// 1.000.033: a Flashpoint search that found nothing, asked again without its platform: what
+    /// the archive has for the same words on its other platforms (Err: that question failed).
+    pub elsewhere: Option<Result<Elsewhere, String>>,
+}
+
+/// What an archive has for the words of a search that found nothing, on other platforms.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Elsewhere {
+    /// The first entries, in the archive's title order.
+    pub entries: Vec<Other>,
+    /// How many there are in all, when the archive says.
+    pub total: Option<u64>,
+}
+
+/// One entry of `Elsewhere`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Other {
+    pub title: String,
+    /// Its platforms as the archive names them ("Flash", "HTML5"), its primary one first.
+    pub platforms: Vec<String>,
+}
+
+impl Other {
+    /// Listed by `source`: an entry of the same archive on the platform that list searches.
+    pub fn in_list(&self, source: Source) -> bool {
+        matches!(source, Source::Flashpoint | Source::FlashpointFlash) && self.platforms.iter().any(|p| p == source.plays())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

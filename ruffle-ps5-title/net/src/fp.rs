@@ -24,12 +24,21 @@
 //! "standalone" (in Ruffle's web player when "webhosted"), with that address as the movie and its
 //! proxy serving the game data's `content/<host>/<path>`; Ruffle5 plays the movie from the
 //! unpacked game data as if from that address, the files it loads read from `content/` (src/game.rs).
+//!
+//! How the words match (FlashpointProject/FPA-Rust a9b8cd2, the archive's search library, which
+//! the launcher 0.13.x uses: `crates/flashpoint-archive/src/game/search.rs`, `parse_user_input`
+//! and the clauses it builds): `!Flash` is the platform; every other word must be found, as a
+//! piece of text (`LIKE '%word%'`), in the title, an alternate title, the developer, the publisher
+//! or the series — not in the tags or the description. Each list asks for one platform, so a word
+//! that names a game of the other platform finds nothing there (1.000.032, Shockwave only: no
+//! "Pyongyang Racer", a Flash game). 1.000.033: a search that finds nothing is asked again without
+//! the platform, and the list says what the archive has and on which platform (`Page::elsewhere`).
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use serde_json::Value;
 
 use crate::http::{Client, Error};
-use crate::source::{clip, html_text, search_words, Archive, Files, Item, Page, RemoteFile};
+use crate::source::{clip, html_text, search_words, Archive, Elsewhere, Files, Item, Other, Page, RemoteFile};
 use crate::url::{decode_percent, encode_component, encode_path};
 
 /// Results per page (the API takes up to 100).
@@ -44,14 +53,53 @@ pub const LEGACY: &str = "https://infinity.flashpointarchive.org/Flashpoint/Lega
 pub const SHOCKWAVE: &str = "Shockwave";
 pub const FLASH: &str = "Flash";
 
+/// How many entries of other platforms a search that found nothing asks for.
+pub const OTHERS: u32 = 6;
+
+/// The words as Flashpoint's search gets them. 1.000.033: an apostrophe splits a word ("dexter's"
+/// -> "dexter", "s"), so a title written with ’ is found as one written with ' (each word is
+/// looked for as a piece of text; see the top of this file).
+pub fn words(text: &str) -> Vec<String> {
+    search_words(&text.replace('\'', " "))
+}
+
 /// The search: every entry of the platform, or those matching the words.
-pub fn query(platform: &str, words: &str) -> String {
-    let w = search_words(words);
+pub fn query(platform: &str, text: &str) -> String {
+    let w = words(text);
     if w.is_empty() {
         format!("platform:{platform}")
     } else {
         format!("!{platform} {}", w.join(" "))
     }
+}
+
+/// The same words without a platform: what a search that found nothing asks next.
+pub fn any_platform_url(text: &str) -> Option<String> {
+    let w = words(text);
+    (!w.is_empty()).then(|| format!("{API}?query={}&limit={OTHERS}&page=1&sort=title", encode_component(&w.join(" "))))
+}
+
+/// The answer to `any_platform_url`: each entry's title and platforms (its primary one first).
+pub fn parse_elsewhere(v: &Value) -> Result<Elsewhere, Error> {
+    if let Some(e) = v.get("error").and_then(Value::as_str) {
+        return Err(Error::Other(format!("Flashpoint search: {e}")));
+    }
+    let games = v.get("games").and_then(Value::as_array).ok_or_else(|| Error::Other("Flashpoint search: no \"games\" in the answer".into()))?;
+    let entries = games
+        .iter()
+        .filter_map(|g| {
+            let title = text(g, "title").map(|t| html_text(&t))?;
+            let mut platforms: Vec<String> = text(g, "primaryPlatform").into_iter().collect();
+            for p in g.get("platforms").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                let p = p.trim();
+                if !p.is_empty() && !platforms.iter().any(|q| q == p) {
+                    platforms.push(p.to_string());
+                }
+            }
+            Some(Other { title, platforms })
+        })
+        .collect();
+    Ok(Elsewhere { entries, total: v.get("total").and_then(Value::as_u64) })
 }
 
 pub fn search_url(platform: &str, words: &str, page: u32) -> String {
@@ -108,12 +156,19 @@ pub fn parse_search(v: &Value, page: u32) -> Result<Page, Error> {
         Some(p) => (page.max(1) as u64) < p && !games.is_empty(),
         None => games.len() as u32 == ROWS,
     };
-    Ok(Page { items, total, more })
+    Ok(Page { items, total, more, elsewhere: None })
 }
 
 pub fn search(client: &Client, platform: &str, words: &str, page: u32) -> Result<Page, Error> {
     let v = client.get_json(&search_url(platform, words, page))?;
-    parse_search(&v, page)
+    let mut found = parse_search(&v, page)?;
+    // nothing for these words on this platform: what the archive has for them, and where
+    if found.items.is_empty() && page <= 1 {
+        if let Some(url) = any_platform_url(words) {
+            found.elsewhere = Some(client.get_json(&url).and_then(|v| parse_elsewhere(&v)).map_err(|e| e.to_string()));
+        }
+    }
+    Ok(found)
 }
 
 /// Milliseconds since 1970 of an ISO date and time as JavaScript's Date reads it: digits below the
@@ -462,5 +517,36 @@ mod tests {
         assert_eq!(pick_movie(&mixed, "content/a/missing.dcr"), Ok(0));
         assert!(pick_movie(&mixed, "content/a/index.html").unwrap_err().contains("2 movies"));
         assert!(pick_movie(&names[..2], "content/www.example.com/x.swf").unwrap_err().contains("no Flash movie"));
+    }
+
+    /// The archive's answer to the same words without a platform, in the shape of its answers
+    /// (`primaryPlatform`, `platforms` as in the 2026-10-24 probe).
+    const ANY_PLATFORM: &str = r#"{"total":3,"pages":1,"page":1,"games":[
+        {"id":"p-1","title":"Pyongyang Racer","primaryPlatform":"Flash","platforms":["Flash"]},
+        {"id":"p-2","title":"Racer &amp; Co","primaryPlatform":"HTML5","platforms":["HTML5","Flash"]},
+        {"id":"p-3","title":"","platforms":["Java"]}]}"#;
+
+    #[test]
+    fn a_search_that_found_nothing_is_asked_again_without_its_platform() {
+        // what is asked: the words alone, a few entries
+        assert_eq!(any_platform_url("Pyongyang!").as_deref(), Some("https://flashpointarchive.org/api/search?query=pyongyang&limit=6&page=1&sort=title"));
+        assert_eq!(any_platform_url("  !! "), None, "no words: nothing to ask");
+        // an apostrophe splits a word: titles write ' and ’
+        assert_eq!(words("Dexter's Lab"), vec!["dexter", "s", "lab"]);
+        assert_eq!(words("Dexter\u{2019}s Lab"), vec!["dexter", "s", "lab"]);
+        assert_eq!(query(SHOCKWAVE, "Dexter's Lab"), "!Shockwave dexter s lab");
+        // the answer: titles and platforms, the primary one first; an entry without a title skipped
+        let v: Value = serde_json::from_str(ANY_PLATFORM).unwrap();
+        let e = parse_elsewhere(&v).unwrap();
+        assert_eq!(e.total, Some(3));
+        assert_eq!(e.entries.len(), 2);
+        assert_eq!((e.entries[0].title.as_str(), e.entries[0].platforms.clone()), ("Pyongyang Racer", vec!["Flash".to_string()]));
+        assert_eq!((e.entries[1].title.as_str(), e.entries[1].platforms.clone()), ("Racer & Co", vec!["HTML5".to_string(), "Flash".to_string()]));
+        // which of Ruffle5's lists has each
+        use crate::source::Source;
+        assert!(e.entries[0].in_list(Source::FlashpointFlash) && !e.entries[0].in_list(Source::Flashpoint));
+        assert!(e.entries[1].in_list(Source::FlashpointFlash), "a Flash version among its platforms");
+        assert!(!e.entries[0].in_list(Source::InternetArchive), "another archive's list never");
+        assert!(parse_elsewhere(&serde_json::json!({"error": "bad query"})).is_err());
     }
 }

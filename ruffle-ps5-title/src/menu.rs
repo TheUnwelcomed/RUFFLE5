@@ -30,7 +30,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::badges::{self, Badges, Live, BADGES};
-use crate::input::{BTN_CIRCLE, BTN_CROSS, BTN_DOWN, BTN_L1, BTN_L2, BTN_LEFT, BTN_OPTIONS, BTN_R1, BTN_RIGHT, BTN_SQUARE, BTN_TRIANGLE, BTN_UP};
+use crate::input::{BTN_CIRCLE, BTN_CROSS, BTN_DOWN, BTN_L1, BTN_L2, BTN_LEFT, BTN_OPTIONS, BTN_R1, BTN_R2, BTN_RIGHT, BTN_SQUARE, BTN_TRIANGLE, BTN_UP};
 use crate::keyboard::Osk;
 use crate::library::{now_secs, Library};
 use crate::paths::{self, Paths};
@@ -112,6 +112,50 @@ pub enum Kind {
     Shockwave,
 }
 
+/// 1.000.033: what the shelves show, R2 changing it (Games, Favorites and Recent alike; for the
+/// session, All at each start). Each game is in one of the four after All: an animation in
+/// Animations, the others by what plays them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Category {
+    All,
+    Flash,
+    /// Director games without a Shockwave 3D cast member.
+    Shockwave,
+    /// Director games with one (src/dir3d.rs).
+    Shockwave3d,
+    /// Movies known to be animations (`Game::animation`), Flash or Shockwave.
+    Animations,
+}
+
+impl Category {
+    pub const ALL: [Category; 5] = [Category::All, Category::Flash, Category::Shockwave, Category::Shockwave3d, Category::Animations];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Category::All => "All",
+            Category::Flash => "Flash",
+            Category::Shockwave => "Shockwave",
+            Category::Shockwave3d => "Shockwave 3D",
+            Category::Animations => "Animations",
+        }
+    }
+
+    pub fn holds(self, g: &Game) -> bool {
+        match self {
+            Category::All => true,
+            Category::Flash => g.kind == Kind::Flash && !g.animation,
+            Category::Shockwave => g.kind == Kind::Shockwave && !g.three_d && !g.animation,
+            Category::Shockwave3d => g.kind == Kind::Shockwave && g.three_d && !g.animation,
+            Category::Animations => g.animation,
+        }
+    }
+
+    fn next(self) -> Category {
+        let i = Self::ALL.iter().position(|&c| c == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+}
+
 pub struct Game {
     pub kind: Kind,
     /// The movie to open (for a Shockwave folder: the one its projector starts).
@@ -140,6 +184,11 @@ pub struct Game {
     pub folder: Option<String>,
     /// 1.000.028: fetched by the Online tab (its folder's online.txt names the movie).
     pub online: bool,
+    /// 1.000.033: a Director game with a Shockwave 3D cast member (src/dir3d.rs).
+    pub three_d: bool,
+    /// 1.000.033: an animation, not a game: its source says so (Flashpoint's Animations library,
+    /// online.txt `kind = Animation`), or it is in a folder named Animations in the games folder.
+    pub animation: bool,
     thumb_png: Option<Vec<u8>>,
     pub thumb: Option<ImageId>,
     pub accent: Color,
@@ -156,6 +205,8 @@ pub enum Action {
     EditAllControls,
     /// 1.000.031: Settings > On-screen keyboard (for all games).
     EditKeyboard,
+    /// 1.000.033: Settings > Search keyboard.
+    EditSearchKeyboard,
     Quit,
     Rescan,
     ClearRecent,
@@ -197,6 +248,11 @@ pub struct Menu {
     hold_armed: bool,
     search: String,
     osk: Osk,
+    /// 1.000.033: the shelves' category (R2) and what is known of the Director files (3D or not).
+    category: Category,
+    dir3d: crate::dir3d::Cache,
+    /// The folders (1.000.033: the search keyboard takes the all-games keyboard settings).
+    paths: Paths,
     settings_page: SettingsPage,
     badge_focus: usize,
     badge_scroll: Smooth,
@@ -280,6 +336,9 @@ impl Menu {
             hold_armed: true,
             search: String::new(),
             osk: Osk::new(),
+            category: Category::All,
+            dir3d: crate::dir3d::Cache::load(&format!("{}/shockwave3d.txt", paths.data)),
+            paths: paths.clone(),
             settings_page: SettingsPage { cat: 0, row: 0, in_rows: false },
             badge_focus: 0,
             badge_scroll: Smooth::default(),
@@ -310,9 +369,13 @@ impl Menu {
     /// Look (again) for games in the folders.
     pub fn scan(&mut self, paths: &Paths) {
         self.report.clear();
-        let mut games = Vec::new();
-        let dirs = scan_roots(&paths.games);
-        for dir in &dirs {
+        let mut games: Vec<Game> = Vec::new();
+        // 1.000.033: a folder named Animations in one of these holds animations, each listed as a
+        // game is (a movie, or a folder of its own), sorted into Animations
+        let mut dirs: std::collections::VecDeque<(String, bool)> = scan_roots(&paths.games).into_iter().map(|d| (d, false)).collect();
+        while let Some((dir, animations)) = dirs.pop_front() {
+            let dir = &dir;
+            let first = games.len();
             let Ok(entries) = std::fs::read_dir(dir) else {
                 if dir == &paths.games {
                     self.report.push(format!("menu: cannot list {dir}"));
@@ -332,6 +395,8 @@ impl Menu {
                     let stem = n.rsplit_once('.').map(|(s, _)| s).unwrap_or(&n);
                     let thumb = [format!("{dir}/{stem}.png"), format!("{dir}/{stem}.PNG")].into_iter().find(|p| std::path::Path::new(p).is_file());
                     games.push(Self::director_game(paths, &full, stem, &full, None, thumb));
+                } else if !animations && n.eq_ignore_ascii_case("animations") && std::path::Path::new(&full).is_dir() {
+                    dirs.push_back((full.clone(), true));
                 } else if !n.starts_with('.') && std::path::Path::new(&full).is_dir() {
                     // A game in its own folder (V4: or in the one folder inside it, as unzipping
                     // into a folder of the same name leaves it). Skipped folders are logged for
@@ -363,9 +428,22 @@ impl Menu {
                     }
                 }
             }
+            if animations {
+                for g in &mut games[first..] {
+                    g.animation = true;
+                }
+            }
         }
         // The same file seen twice (a USB drive's root and its ruffle5 folder): keep one.
         games.dedup_by(|a, b| a.path == b.path);
+        // 1.000.033: which Director games have Shockwave 3D (each file read once, then by its size
+        // and time from shockwave3d.txt)
+        let mut three_d = 0;
+        for g in games.iter_mut().filter(|g| g.kind == Kind::Shockwave) {
+            g.three_d = self.dir3d.game(&g.path, g.folder.is_some(), &mut self.report);
+            three_d += g.three_d as usize;
+        }
+        self.dir3d.save();
         // Two games with one key would share saves, a cover and play time: those get their path's
         // hash added; every other game keeps the key it always had.
         let keys: Vec<String> = games.iter().map(|g| g.key.clone()).collect();
@@ -375,7 +453,14 @@ impl Menu {
             }
         }
         games.sort_by_key(|g| g.name.to_lowercase());
-        self.report.push(format!("menu: {} game(s) in {} and USB drives", games.len(), paths.games));
+        self.report.push(format!(
+            "menu: {} game(s) in {} and USB drives: {} Flash, {} Shockwave, {three_d} of them Shockwave 3D; {} animation(s)",
+            games.len(),
+            paths.games,
+            games.iter().filter(|g| g.kind == Kind::Flash).count(),
+            games.iter().filter(|g| g.kind == Kind::Shockwave).count(),
+            games.iter().filter(|g| g.animation).count()
+        ));
         self.lifts = vec![Smooth::default(); games.len()];
         self.spare_images.extend(self.games.iter().filter_map(|g| g.thumb));
         self.games = games;
@@ -478,6 +563,9 @@ impl Menu {
             if let Some(t) = online.get("title").filter(|t| !t.is_empty()) {
                 g.name = t.clone();
             }
+            // 1.000.033: what its source called it (Flashpoint: Game, or Animation for its
+            // Animations library)
+            g.animation = online.get("kind").is_some_and(|k| k.eq_ignore_ascii_case("animation"));
             g.online = true;
             games.push(g);
             return true;
@@ -532,6 +620,8 @@ impl Menu {
             mapping,
             folder: None,
             online: false,
+            three_d: false,
+            animation: false,
             thumb_png,
             thumb: None,
             accent,
@@ -581,6 +671,8 @@ impl Menu {
             mapping,
             folder: None,
             online: false,
+            three_d: false,
+            animation: false,
             thumb_png,
             thumb: None,
             accent,
@@ -691,10 +783,27 @@ impl Menu {
         t
     }
 
+    /// The search keyboard, as its settings have it (1.000.033; it kept the defaults before): those
+    /// of the on-screen keyboard for all games, then its own (Settings > Controls & Sound > Search
+    /// keyboard). Where it was moved to with L1 / R1 stays for the session unless they changed.
+    fn open_search(&mut self) {
+        let prefs = crate::controls::Controls::search_keyboard(&self.paths).keyboard;
+        if prefs != self.osk.prefs() {
+            self.osk.set_prefs(prefs);
+        }
+        self.osk.set_open(true);
+        sounds::play(Sfx::Select);
+    }
+
     fn compute_visible(&mut self, tab: Tab, library: &Library) {
+        self.visible = self.shelf_games(tab, library, self.category);
+    }
+
+    /// The games a shelf shows in `category`, with the search, in its order.
+    fn shelf_games(&self, tab: Tab, library: &Library, category: Category) -> Vec<usize> {
         let q = self.search.to_lowercase();
-        let matches = |g: &Game| q.is_empty() || g.name.to_lowercase().contains(&q) || g.file.to_lowercase().contains(&q);
-        self.visible = match tab {
+        let matches = |g: &Game| category.holds(g) && (q.is_empty() || g.name.to_lowercase().contains(&q) || g.file.to_lowercase().contains(&q));
+        match tab {
             Tab::Games => (0..self.games.len()).filter(|&i| matches(&self.games[i])).collect(),
             Tab::Favorites => (0..self.games.len()).filter(|&i| library.get(&self.games[i].key).favorite && matches(&self.games[i])).collect(),
             Tab::Recent => {
@@ -704,7 +813,7 @@ impl Menu {
                 v
             }
             _ => Vec::new(),
-        };
+        }
     }
 
     /// The focused game (on a shelf tab), as an index into `games`.
@@ -874,6 +983,16 @@ impl Menu {
         match tab {
             Tab::Games | Tab::Favorites | Tab::Recent => {
                 let shelf = tab.shelf().unwrap_or(0);
+                // 1.000.033: R2 changes the category
+                if pressed & BTN_R2 != 0 && !self.games.is_empty() {
+                    self.category = self.category.next();
+                    sounds::play(Sfx::Tab);
+                    self.focus[shelf] = 0;
+                    self.scroll.snap(0.0);
+                    self.shelf_anim = 0.0;
+                    self.stage_game = None;
+                    self.compute_visible(tab, library);
+                }
                 let n = self.visible.len();
                 if n > 0 {
                     let f = &mut self.focus[shelf];
@@ -915,8 +1034,7 @@ impl Menu {
                     }
                 }
                 if pressed & BTN_L2 != 0 {
-                    self.osk.set_open(true);
-                    sounds::play(Sfx::Select);
+                    self.open_search();
                 }
             }
             Tab::Badges => {
@@ -941,8 +1059,7 @@ impl Menu {
             Tab::Online => {
                 self.online.update(dt, nav, pressed, &self.search, self.osk.is_open());
                 if pressed & BTN_L2 != 0 {
-                    self.osk.set_open(true);
-                    sounds::play(Sfx::Select);
+                    self.open_search();
                 }
             }
         }
@@ -1055,6 +1172,7 @@ impl Menu {
                 return Some(match act {
                     Act::EditAllControls => Action::EditAllControls,
                     Act::EditKeyboard => Action::EditKeyboard,
+                    Act::EditSearchKeyboard => Action::EditSearchKeyboard,
                     Act::Rescan => Action::Rescan,
                     Act::ClearRecent => {
                         library.clear_recent();
@@ -1134,6 +1252,9 @@ impl Menu {
             Tab::Games | Tab::Favorites | Tab::Recent => {
                 if self.visible.is_empty() {
                     self.draw_empty(ui, scene, tab);
+                    if !self.games.is_empty() {
+                        self.draw_categories(ui, scene, tab, library);
+                    }
                 } else {
                     self.draw_stage(ui, scene, library);
                     self.draw_shelf(ui, scene, tab, library);
@@ -1148,7 +1269,7 @@ impl Menu {
         if self.hold > CLOSE_DELAY {
             draw_hold_bar(ui, scene, self.hold, CLOSE_DELAY, CLOSE_HOLD, "Keep holding to close Ruffle5", Glyph::Circle, HOLD_BAR_Y);
         }
-        self.osk.draw(ui, scene, "Search");
+        self.osk.draw_typed(ui, scene, "Search", &self.search, "type to search");
         if let Some((gi, t)) = self.confirm_delete {
             self.draw_confirm_delete(ui, scene, gi, t);
         }
@@ -1271,7 +1392,7 @@ impl Menu {
         let game = &self.games[gi];
         let (name, file, size, info, thumb, accent, key, stem, mapping) =
             (game.name.clone(), game.file.clone(), game.size, game.info.clone(), game.thumb, game.accent, game.key.clone(), game.stem.clone(), game.mapping);
-        let (kind, director) = (game.kind, game.director.clone());
+        let (kind, director, three_d, animation) = (game.kind, game.director.clone(), game.three_d, game.animation);
         let rec = library.get(&key);
 
         // The picture: large, floating a little over its own colours; it settles in when the
@@ -1322,11 +1443,17 @@ impl Menu {
         scene.push_opacity(come);
         let mx = MARGIN - 28.0 * (1.0 - come);
         ribbon_fold(scene, Rect::new(mx + 2.0, STAGE_KICKER_Y - 12.0, 28.0 * come.max(0.2), 6.0), ORANGE, 1.0);
-        let kicker = match (kind, rec.favorite) {
-            (Kind::Flash, false) => "FLASH GAME",
-            (Kind::Flash, true) => "FAVORITE FLASH GAME",
-            (Kind::Shockwave, false) => "SHOCKWAVE GAME",
-            (Kind::Shockwave, true) => "FAVORITE SHOCKWAVE GAME",
+        let kicker = match (kind, three_d, animation, rec.favorite) {
+            (Kind::Flash, _, true, false) => "FLASH ANIMATION",
+            (Kind::Flash, _, true, true) => "FAVORITE FLASH ANIMATION",
+            (Kind::Shockwave, _, true, false) => "SHOCKWAVE ANIMATION",
+            (Kind::Shockwave, _, true, true) => "FAVORITE SHOCKWAVE ANIMATION",
+            (Kind::Flash, _, false, false) => "FLASH GAME",
+            (Kind::Flash, _, false, true) => "FAVORITE FLASH GAME",
+            (Kind::Shockwave, false, false, false) => "SHOCKWAVE GAME",
+            (Kind::Shockwave, false, false, true) => "FAVORITE SHOCKWAVE GAME",
+            (Kind::Shockwave, true, false, false) => "SHOCKWAVE 3D GAME",
+            (Kind::Shockwave, true, false, true) => "FAVORITE SHOCKWAVE 3D GAME",
         };
         scene.text(ui, Face::SemiBold, 18.0, kicker, mx + 40.0, STAGE_KICKER_Y, ORANGE, Align::Left, 4.0);
         let headline = ui.fit(Face::Display, 88.0, &name, 1080.0);
@@ -1369,7 +1496,25 @@ impl Menu {
         scene.pop_opacity();
     }
 
+    /// 1.000.033: the categories, each with how many games of the shelf it holds, the current one
+    /// lit; R2 changes it (drawn as Flash Browser's sources are).
+    fn draw_categories(&self, ui: &mut Ui, scene: &mut Scene, tab: Tab, library: &Library) {
+        let mut x = RIGHT;
+        for c in Category::ALL.iter().rev() {
+            let on = *c == self.category;
+            let label = format!("{} {}", c.name(), self.shelf_games(tab, library, *c).len());
+            let w = ui.measure(Face::SemiBold, 20.0, &label, 0.0) + 36.0;
+            x -= w;
+            let r = Rect::new(x, SHELF_HEAD_Y - 30.0, w, 40.0);
+            scene.rect(r, 20.0, if on { ORANGE } else { NIGHT.with_alpha(0.8) });
+            scene.text(ui, Face::SemiBold, 20.0, &label, r.cx(), centred(r.cy(), 20.0), if on { ON_ORANGE } else { INK.with_alpha(0.7) }, Align::Center, 0.0);
+            x -= 10.0;
+        }
+        draw_glyph(ui, scene, Glyph::Chip("R2"), x - 52.0, SHELF_HEAD_Y - 10.0, 26.0);
+    }
+
     fn draw_shelf(&mut self, ui: &mut Ui, scene: &mut Scene, tab: Tab, library: &Library) {
+        self.draw_categories(ui, scene, tab, library);
         let head = scene.text(ui, Face::SemiBold, 30.0, tab.name(), MARGIN, SHELF_HEAD_Y, INK, Align::Left, 0.0);
         let count = if self.search.is_empty() { self.visible.len().to_string() } else { format!("{} matching \u{201c}{}\u{201d}", self.visible.len(), self.search) };
         scene.text(ui, Face::Regular, 18.0, &count, MARGIN + head + 12.0, SHELF_HEAD_Y, BLUE_2, Align::Left, 0.0);
@@ -1449,8 +1594,32 @@ impl Menu {
     fn draw_empty(&mut self, ui: &mut Ui, scene: &mut Scene, tab: Tab) {
         scene.gradient_h(Rect::new(0.0, 150.0, 1400.0, 700.0), 0.0, NIGHT.with_alpha(0.86), NIGHT.with_alpha(0.0));
         ribbon_fold(scene, Rect::new(MARGIN + 2.0, STAGE_KICKER_Y - 12.0, 28.0, 6.0), ORANGE, 1.0);
+        let cat = self.category;
+        let in_cat = if cat == Category::All { String::new() } else { format!("{} ", cat.name()) };
         let (kicker, title, lines): (&str, &str, Vec<String>) = if !self.search.is_empty() {
-            ("NO MATCHES", "Nothing found", vec![format!("No game is called \u{201c}{}\u{201d}.", self.search), "Circle clears the search.".to_string()])
+            let first = if cat == Category::Animations {
+                format!("No animation is called \u{201c}{}\u{201d}.", self.search)
+            } else {
+                format!("No {in_cat}game is called \u{201c}{}\u{201d}.", self.search)
+            };
+            let mut lines = vec![first, "Circle clears the search.".to_string()];
+            if cat != Category::All {
+                lines.push("R2 changes the category.".to_string());
+            }
+            ("NO MATCHES", "Nothing found", lines)
+        } else if cat != Category::All && !self.games.is_empty() {
+            let shelf = match tab {
+                Tab::Favorites => "among your favorites",
+                Tab::Recent => "among the games played lately",
+                _ => "in your games",
+            };
+            let mut lines = vec![if cat == Category::Animations { format!("No animations {shelf}.") } else { format!("No {in_cat}games {shelf}.") }];
+            if cat == Category::Animations {
+                lines.push("Flashpoint's animations are sorted here when Flash Browser gets them; your own go in a folder".to_string());
+                lines.push(format!("named Animations in {}, each movie (or folder) in it one animation.", self.games_dir));
+            }
+            lines.push("R2 changes the category.".to_string());
+            ("NOTHING IN THIS CATEGORY", cat.name(), lines)
         } else {
             match tab {
                 Tab::Favorites => ("NO FAVORITES YET", "Favorites", vec!["Square on a game in Games makes it a favorite.".to_string()]),
@@ -1611,6 +1780,9 @@ impl Menu {
                     hints.push((Glyph::Chip("OPTIONS"), "Delete"));
                 }
                 hints.push((Glyph::Chip("L2"), "Search"));
+                if !self.games.is_empty() {
+                    hints.push((Glyph::Chip("R2"), "Category"));
+                }
             }
             Tab::Settings => {
                 if self.settings_page.in_rows {
@@ -1637,6 +1809,49 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn games_are_sorted_into_flash_shockwave_and_shockwave_3d() {
+        let root = std::env::temp_dir().join(format!("ruffle5-menu-cats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let games = root.join("games");
+        let mk = |rel: &str, body: &[u8]| {
+            let p = games.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        mk("bounce.swf", b"FWS\x08\x15\0\0\0\x30\0\x01\x00\x0c\x01\x00");
+        mk("trick.dcr", &crate::dir3d::sample::movie(false));
+        mk("race.dcr", &crate::dir3d::sample::movie(true));
+        // Paul Blart's layout: the folder starts a loader; its 3D movie is beside it
+        mk("Paul Blart Mall Cop/gameloader.dcr", &crate::dir3d::sample::movie(false));
+        mk("Paul Blart Mall Cop/paul_blart.dcr", &crate::dir3d::sample::movie(true));
+        // animations: the Animations folder's movies and folders, and what Flashpoint called one
+        mk("animations/Cartoon.swf", b"FWS\x08\x15\0\0\0\x30\0\x01\x00\x0c\x01\x00");
+        mk("animations/Toon Folder/toon.swf", b"FWS\x08\x15\0\0\0\x30\0\x01\x00\x0c\x01\x00");
+        mk("Old One/online.txt", b"site = flashpointarchive.org\nid = bbbb-2\ntitle = Old One\nmovie = old one.swf\nkind = Animation\n");
+        mk("Old One/old one.swf", b"FWS\x08\x15\0\0\0\x30\0\x01\x00\x0c\x01\x00");
+        let p = |s: &str| {
+            let d = root.join(s);
+            std::fs::create_dir_all(&d).unwrap();
+            d.to_string_lossy().into_owned()
+        };
+        let paths = Paths::new(&p("data"), &p("games"), &p("maps"));
+        let menu = Menu::new(&paths);
+        let library = Library::load(&root.join("data/library.txt").to_string_lossy(), &root.join("data/session.txt").to_string_lossy());
+        let names = |c: Category| -> Vec<String> { menu.shelf_games(Tab::Games, &library, c).into_iter().map(|i| menu.games[i].name.clone()).collect() };
+        assert_eq!(names(Category::All).len(), 7, "{:?}", menu.report);
+        assert_eq!(names(Category::Flash), ["Bounce"]);
+        assert_eq!(names(Category::Shockwave), ["Trick"]);
+        assert_eq!(names(Category::Shockwave3d), ["Paul Blart Mall Cop", "Race"]);
+        assert_eq!(names(Category::Animations), ["Cartoon", "Old One", "Toon Folder"]);
+        assert!(menu.report.iter().any(|l| l.contains("4 Flash, 3 Shockwave, 2 of them Shockwave 3D; 3 animation(s)")), "{:?}", menu.report);
+        // R2 goes round them
+        let mut c = Category::All;
+        let seen: Vec<&str> = (0..6).map(|_| { let n = c.name(); c = c.next(); n }).collect();
+        assert_eq!(seen, ["All", "Flash", "Shockwave", "Shockwave 3D", "Animations", "All"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn director_folders_are_found_one_level_down_and_skips_are_logged() {

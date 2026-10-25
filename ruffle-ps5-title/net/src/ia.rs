@@ -123,7 +123,7 @@ pub fn parse_search(v: &Value, page: u32) -> Result<Page, Error> {
         Some(t) => shown < t && !docs.is_empty(),
         None => docs.len() as u32 == ROWS,
     };
-    Ok(Page { items, total, more })
+    Ok(Page { items, total, more, elsewhere: None })
 }
 
 pub fn search(client: &Client, words: &str, page: u32) -> Result<Page, Error> {
