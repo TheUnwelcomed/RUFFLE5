@@ -1,4 +1,4 @@
-//! PS5_RUFFLE_CONTROLS_V3 — what each pad button does, from text files in "Custom Mappings".
+//! PS5_RUFFLE_CONTROLS_V4 — what each pad button does, from text files in "Custom Mappings".
 //!
 //! Flash games have no common control scheme: one wants Space to jump, the next wants Z, a third
 //! A/S/D or the mouse. So the mapping is data, layered, generic first and the game's own last:
@@ -32,7 +32,15 @@
 //! cursor = auto            # auto (shown while the pointer moves, hidden after cursor_hide seconds) | on | off
 //! cursor_hide = 3
 //! cursor_scale = 1.75
+//! keyboard_size = large    # the on-screen keyboard: large | medium | small | mini
+//! keyboard_position = bottom   # bottom | bottom-left | left | top-left | top | top-right | right | bottom-right
+//! keyboard_game = under    # under (the keyboard covers the game) | beside (the game shrinks out of its way)
+//! keyboard_opacity = 100   # 100 | 80 | 60 | 40: how solid the keyboard's background is
 //! ```
+//!
+//! V4 (1.000.031): the on-screen keyboard's own settings (`keyboard_*`), per game or for all games
+//! like everything else here; the controls editor has them as a submenu (Settings › On-screen
+//! keyboard for all games, the quick menu's Keyboard for this game for one).
 //!
 //! Buttons: cross circle square triangle l1 r1 l2 r2 l3 r3 options touchpad up down left right.
 //! Keys: a single character (letters, digits, - = [ ] \ ; ' , . / `), or space enter escape(esc)
@@ -209,6 +217,147 @@ impl CursorMode {
     }
 }
 
+/// The on-screen keyboard's size (src/keyboard.rs draws each).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KbSize {
+    Large,
+    Medium,
+    Small,
+    Mini,
+}
+
+impl KbSize {
+    pub const ALL: [KbSize; 4] = [KbSize::Large, KbSize::Medium, KbSize::Small, KbSize::Mini];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            KbSize::Large => "large",
+            KbSize::Medium => "medium",
+            KbSize::Small => "small",
+            KbSize::Mini => "mini",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            KbSize::Large => "Large",
+            KbSize::Medium => "Medium",
+            KbSize::Small => "Small",
+            KbSize::Mini => "Mini",
+        }
+    }
+
+    fn parse(s: &str) -> Option<KbSize> {
+        KbSize::ALL.into_iter().find(|k| k.name() == s)
+    }
+}
+
+/// Where the on-screen keyboard opens. `ALL` goes clockwise round the screen from the bottom (the
+/// way the hands of a clock go: bottom, left, top, right); L1 on the open keyboard moves it along.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KbPos {
+    Bottom,
+    BottomLeft,
+    Left,
+    TopLeft,
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+}
+
+impl KbPos {
+    pub const ALL: [KbPos; 8] = [KbPos::Bottom, KbPos::BottomLeft, KbPos::Left, KbPos::TopLeft, KbPos::Top, KbPos::TopRight, KbPos::Right, KbPos::BottomRight];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            KbPos::Bottom => "bottom",
+            KbPos::BottomLeft => "bottom-left",
+            KbPos::Left => "left",
+            KbPos::TopLeft => "top-left",
+            KbPos::Top => "top",
+            KbPos::TopRight => "top-right",
+            KbPos::Right => "right",
+            KbPos::BottomRight => "bottom-right",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            KbPos::Bottom => "Bottom",
+            KbPos::BottomLeft => "Bottom left",
+            KbPos::Left => "Left",
+            KbPos::TopLeft => "Top left",
+            KbPos::Top => "Top",
+            KbPos::TopRight => "Top right",
+            KbPos::Right => "Right",
+            KbPos::BottomRight => "Bottom right",
+        }
+    }
+
+    fn parse(s: &str) -> Option<KbPos> {
+        let s = s.replace(['_', ' '], "-");
+        KbPos::ALL.into_iter().find(|k| k.name() == s)
+    }
+
+    /// The next place clockwise (L1 on the open keyboard).
+    pub fn next(self) -> KbPos {
+        let i = KbPos::ALL.iter().position(|p| *p == self).unwrap_or(0);
+        KbPos::ALL[(i + 1) % KbPos::ALL.len()]
+    }
+
+    /// The place across the screen (R1 on the open keyboard: bottom and top swap, as before).
+    pub fn opposite(self) -> KbPos {
+        let i = KbPos::ALL.iter().position(|p| *p == self).unwrap_or(0);
+        KbPos::ALL[(i + 4) % KbPos::ALL.len()]
+    }
+}
+
+/// What the game does while the on-screen keyboard is open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KbGame {
+    /// The keyboard is drawn over the game.
+    Under,
+    /// The game is shown smaller, in the part of the screen the keyboard leaves free.
+    Beside,
+}
+
+impl KbGame {
+    pub fn name(self) -> &'static str {
+        match self {
+            KbGame::Under => "under",
+            KbGame::Beside => "beside",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            KbGame::Under => "Under the keyboard",
+            KbGame::Beside => "Beside it (smaller)",
+        }
+    }
+}
+
+/// The background opacities the keyboard offers, in percent.
+pub const KB_OPACITIES: [u8; 4] = [100, 80, 60, 40];
+
+/// The on-screen keyboard's settings for a game.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KeyboardPrefs {
+    pub size: KbSize,
+    pub position: KbPos,
+    pub game: KbGame,
+    /// 40..=100 (`KB_OPACITIES`).
+    pub opacity: u8,
+}
+
+impl Default for KeyboardPrefs {
+    /// As the keyboard was before it had settings: large, at the bottom, over the game, solid.
+    fn default() -> Self {
+        KeyboardPrefs { size: KbSize::Large, position: KbPos::Bottom, game: KbGame::Under, opacity: 100 }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Controls {
     pub bindings: HashMap<Button, Vec<Action>>,
@@ -218,6 +367,8 @@ pub struct Controls {
     pub cursor: CursorMode,
     pub cursor_hide: f64,
     pub cursor_scale: f32,
+    /// The on-screen keyboard's size and place (V4).
+    pub keyboard: KeyboardPrefs,
     /// What happened while loading: files found or not, lines applied, lines refused.
     pub report: Vec<String>,
     /// The file that gave the game its own mapping, if one did (for the menu to say so).
@@ -234,6 +385,7 @@ impl PartialEq for Controls {
             && self.cursor == other.cursor
             && self.cursor_hide == other.cursor_hide
             && self.cursor_scale == other.cursor_scale
+            && self.keyboard == other.keyboard
     }
 }
 
@@ -267,6 +419,7 @@ impl Default for Controls {
             cursor: CursorMode::Auto,
             cursor_hide: 3.0,
             cursor_scale: 1.75,
+            keyboard: KeyboardPrefs::default(),
             report: Vec::new(),
             source: None,
         }
@@ -433,6 +586,28 @@ impl Controls {
                 self.cursor_scale = value.parse::<f32>().map_err(|_| "expected a number")?.clamp(0.5, 8.0);
                 Ok(format!("cursor_scale = {}", self.cursor_scale))
             }
+            "keyboard_size" => {
+                self.keyboard.size = KbSize::parse(value).ok_or("expected large, medium, small or mini")?;
+                Ok(format!("keyboard_size = {}", self.keyboard.size.name()))
+            }
+            "keyboard_position" => {
+                self.keyboard.position = KbPos::parse(value).ok_or("expected bottom, bottom-left, left, top-left, top, top-right, right or bottom-right")?;
+                Ok(format!("keyboard_position = {}", self.keyboard.position.name()))
+            }
+            "keyboard_game" => {
+                self.keyboard.game = match value {
+                    "under" | "covered" => KbGame::Under,
+                    "beside" | "smaller" | "shrink" => KbGame::Beside,
+                    _ => return Err("expected under or beside".into()),
+                };
+                Ok(format!("keyboard_game = {}", self.keyboard.game.name()))
+            }
+            "keyboard_opacity" => {
+                let v = value.trim_end_matches('%').trim().parse::<u32>().map_err(|_| "expected a percentage")?;
+                // the nearest of the offered steps
+                self.keyboard.opacity = KB_OPACITIES.into_iter().min_by_key(|o| (*o as i64 - v as i64).abs()).unwrap_or(100);
+                Ok(format!("keyboard_opacity = {}", self.keyboard.opacity))
+            }
             _ => Err("unknown setting".into()),
         }
     }
@@ -450,6 +625,17 @@ impl Controls {
         out.push(format!(
             "left_stick = {:?}, right_stick = {:?}, pointer_speed = {}, cursor = {:?} (hide after {} s, scale {})",
             self.left_stick, self.right_stick, self.pointer_speed, self.cursor, self.cursor_hide, self.cursor_scale
+        ));
+        let k = &self.keyboard;
+        out.push(format!(
+            "keyboard: {} at the {}, the game {}, {}% opaque",
+            k.size.name(),
+            k.position.name(),
+            match k.game {
+                KbGame::Under => "under it",
+                KbGame::Beside => "beside it",
+            },
+            k.opacity
         ));
         out
     }
@@ -480,6 +666,19 @@ impl Controls {
         }
         if self.cursor_scale != base.cursor_scale {
             out.push(format!("cursor_scale = {}", self.cursor_scale));
+        }
+        let (k, b) = (&self.keyboard, &base.keyboard);
+        if k.size != b.size {
+            out.push(format!("keyboard_size = {}", k.size.name()));
+        }
+        if k.position != b.position {
+            out.push(format!("keyboard_position = {}", k.position.name()));
+        }
+        if k.game != b.game {
+            out.push(format!("keyboard_game = {}", k.game.name()));
+        }
+        if k.opacity != b.opacity {
+            out.push(format!("keyboard_opacity = {}", k.opacity));
         }
         out
     }
@@ -868,5 +1067,46 @@ mod tests {
         // an existing mapping is not overwritten
         assert_eq!(std::fs::read_to_string(mapping_file(&paths, Some("keep"))).unwrap(), "l1 = z\n");
         assert!(report.iter().any(|l| l.contains("already exists")));
+    }
+
+    #[test]
+    fn keyboard_settings_parse_layer_and_write_back() {
+        let paths = temp_paths("keyboard");
+        // for every game, then one game's own
+        std::fs::write(mapping_file(&paths, None), "keyboard_size = small\nkeyboard_position = bottom-right\n").unwrap();
+        std::fs::write(mapping_file(&paths, Some("rpg")), "keyboard_game = beside\nkeyboard_opacity = 75%\nkeyboard_position = Top_Left\n").unwrap();
+        let c = Controls::load(&paths, &format!("{}/rpg.swf", paths.games));
+        assert_eq!(c.keyboard, KeyboardPrefs { size: KbSize::Small, position: KbPos::TopLeft, game: KbGame::Beside, opacity: 80 });
+        // another game gets only the all-games lines
+        let other = Controls::load(&paths, &format!("{}/other.swf", paths.games));
+        assert_eq!(other.keyboard, KeyboardPrefs { size: KbSize::Small, position: KbPos::BottomRight, ..KeyboardPrefs::default() });
+        // the editor writes only what differs from what the game would get anyway
+        let base = Controls::base_game(&paths);
+        let lines = c.diff_lines(&base);
+        assert!(lines.contains(&"keyboard_position = top-left".to_string()), "{lines:?}");
+        assert!(lines.contains(&"keyboard_game = beside".to_string()));
+        assert!(lines.contains(&"keyboard_opacity = 80".to_string()));
+        assert!(!lines.iter().any(|l| l.starts_with("keyboard_size")), "{lines:?}");
+        let mut again = base.clone();
+        again.apply(&c.file_text(&base, "rpg"), "rpg");
+        assert_eq!(again.keyboard, c.keyboard);
+        // a wrong value is refused and leaves the setting as it was
+        let mut d = Controls::default();
+        assert!(d.set("keyboard_size", "huge").is_err());
+        assert!(d.set("keyboard_position", "middle").is_err());
+        assert_eq!(d.keyboard, KeyboardPrefs::default());
+        // L1 goes round all eight places, clockwise: from the bottom to the left
+        let mut p = KbPos::Bottom;
+        for _ in 0..8 {
+            p = p.next();
+        }
+        assert_eq!(p, KbPos::Bottom);
+        assert_eq!(KbPos::Bottom.next(), KbPos::BottomLeft);
+        assert_eq!(KbPos::Left.next(), KbPos::TopLeft);
+        assert_eq!(KbPos::Top.next(), KbPos::TopRight);
+        assert_eq!(KbPos::Right.next(), KbPos::BottomRight);
+        assert_eq!(KbPos::Bottom.opposite(), KbPos::Top);
+        assert_eq!(KbPos::Left.opposite(), KbPos::Right);
+        assert_eq!(KbPos::BottomRight.opposite(), KbPos::TopLeft);
     }
 }

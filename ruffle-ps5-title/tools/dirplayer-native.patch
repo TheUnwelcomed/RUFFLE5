@@ -6813,10 +6813,10 @@ index 00000000..3b07843f
 +}
 diff --git a/vm-rust/src/rendering_gpu/softgl/programs.rs b/vm-rust/src/rendering_gpu/softgl/programs.rs
 new file mode 100644
-index 00000000..10a9db06
+index 00000000..fa7731e8
 --- /dev/null
 +++ b/vm-rust/src/rendering_gpu/softgl/programs.rs
-@@ -0,0 +1,913 @@
+@@ -0,0 +1,931 @@
 +//! PS5_RUFFLE_DIRPLAYER_NATIVE: the GLSL programs of `webgl2/scene3d.rs`, ported to Rust: the
 +//! 3D model shader, the particle billboard shader, the post-process (bloom / colour) shader and
 +//! the #inker outline shader. A linked program is recognised by what its source declares.
@@ -6912,9 +6912,25 @@ index 00000000..10a9db06
 +
 +struct U<'a>(&'a HashMap<Rc<str>, Vec<f32>>);
 +
++/// A uniform's values (one map lookup per uniform, however many elements are read), 0 where unset.
++struct Vals<'a>(&'a [f32]);
++
++impl Vals<'_> {
++    #[inline]
++    fn at(&self, i: usize) -> f32 {
++        self.0.get(i).copied().unwrap_or(0.0)
++    }
++    fn v3_at(&self, el: usize) -> [f32; 3] {
++        [self.at(el * 3), self.at(el * 3 + 1), self.at(el * 3 + 2)]
++    }
++}
++
 +impl U<'_> {
++    fn vals(&self, name: &str) -> Vals<'_> {
++        Vals(self.0.get(name).map(|v| v.as_slice()).unwrap_or(&[]))
++    }
 +    fn get(&self, name: &str, i: usize) -> f32 {
-+        self.0.get(name).and_then(|v| v.get(i)).copied().unwrap_or(0.0)
++        self.vals(name).at(i)
 +    }
 +    fn f(&self, name: &str) -> f32 {
 +        self.get(name, 0)
@@ -6923,23 +6939,23 @@ index 00000000..10a9db06
 +        self.get(name, 0) as i32
 +    }
 +    fn v2(&self, name: &str) -> [f32; 2] {
-+        [self.get(name, 0), self.get(name, 1)]
++        let v = self.vals(name);
++        [v.at(0), v.at(1)]
 +    }
 +    fn v3(&self, name: &str) -> [f32; 3] {
-+        [self.get(name, 0), self.get(name, 1), self.get(name, 2)]
++        self.vals(name).v3_at(0)
 +    }
 +    fn v4(&self, name: &str) -> [f32; 4] {
-+        [self.get(name, 0), self.get(name, 1), self.get(name, 2), self.get(name, 3)]
++        let v = self.vals(name);
++        [v.at(0), v.at(1), v.at(2), v.at(3)]
 +    }
 +    fn m4(&self, name: &str) -> [f32; 16] {
++        let v = self.vals(name);
 +        let mut m = [0.0; 16];
 +        for (k, e) in m.iter_mut().enumerate() {
-+            *e = self.get(name, k);
++            *e = v.at(k);
 +        }
 +        m
-+    }
-+    fn v3_at(&self, name: &str, el: usize) -> [f32; 3] {
-+        [self.get(name, el * 3), self.get(name, el * 3 + 1), self.get(name, el * 3 + 2)]
 +    }
 +}
 +
@@ -7150,14 +7166,14 @@ index 00000000..10a9db06
 +
 +impl Main3d {
 +    fn new(u: &U, samplers: &[Option<SamplerTex>]) -> Main3d {
-+        let mut bones = vec![[0.0f32; 16]; 96];
-+        if let Some(b) = u.0.get("u_bone_matrices") {
-+            for (i, m) in bones.iter_mut().enumerate() {
-+                for k in 0..16 {
-+                    m[k] = b.get(i * 16 + k).copied().unwrap_or(0.0);
-+                }
-+            }
-+        }
++        let skinning = u.i("u_skinning_enabled");
++        // The bone palette only when the draw skins (it is 96 matrices; most draws do not).
++        let bones = if skinning > 0 {
++            let b = u.vals("u_bone_matrices");
++            (0..96).map(|i| std::array::from_fn(|k| b.at(i * 16 + k))).collect()
++        } else {
++            Vec::new()
++        };
 +        let mut light_pos = [[0.0; 3]; 8];
 +        let mut light_color = [[0.0; 3]; 8];
 +        let mut light_atten = [[0.0; 3]; 8];
@@ -7165,20 +7181,22 @@ index 00000000..10a9db06
 +        let mut light_type = [0; 8];
 +        let mut light_spot_angle = [0.0; 8];
 +        let mut light_spot_exp = [0.0; 8];
++        let (lp, lc, la, ld) = (u.vals("u_light_pos"), u.vals("u_light_color"), u.vals("u_light_atten"), u.vals("u_light_dir"));
++        let (lt, lsa, lse) = (u.vals("u_light_type"), u.vals("u_light_spot_angle"), u.vals("u_light_spot_exp"));
 +        for i in 0..8 {
-+            light_pos[i] = u.v3_at("u_light_pos", i);
-+            light_color[i] = u.v3_at("u_light_color", i);
-+            light_atten[i] = u.v3_at("u_light_atten", i);
-+            light_dir[i] = u.v3_at("u_light_dir", i);
-+            light_type[i] = u.get("u_light_type", i) as i32;
-+            light_spot_angle[i] = u.get("u_light_spot_angle", i);
-+            light_spot_exp[i] = u.get("u_light_spot_exp", i);
++            light_pos[i] = lp.v3_at(i);
++            light_color[i] = lc.v3_at(i);
++            light_atten[i] = la.v3_at(i);
++            light_dir[i] = ld.v3_at(i);
++            light_type[i] = lt.at(i) as i32;
++            light_spot_angle[i] = lsa.at(i);
++            light_spot_exp[i] = lse.at(i);
 +        }
 +        Main3d {
 +            model: u.m4("u_model"),
 +            view: u.m4("u_view"),
 +            projection: u.m4("u_projection"),
-+            skinning: u.i("u_skinning_enabled"),
++            skinning,
 +            bones,
 +            tex_transform: u.m4("u_tex_transform"),
 +            wrap_transform: u.m4("u_wrap_transform"),
@@ -7732,10 +7750,10 @@ index 00000000..10a9db06
 +}
 diff --git a/vm-rust/src/rendering_gpu/softgl/raster.rs b/vm-rust/src/rendering_gpu/softgl/raster.rs
 new file mode 100644
-index 00000000..380e7424
+index 00000000..42267185
 --- /dev/null
 +++ b/vm-rust/src/rendering_gpu/softgl/raster.rs
-@@ -0,0 +1,970 @@
+@@ -0,0 +1,972 @@
 +//! PS5_RUFFLE_DIRPLAYER_NATIVE: the software rasteriser: vertex fetch, primitive assembly,
 +//! clipping to the view volume in homogeneous coordinates, viewport transform, face culling,
 +//! triangle / line / point rasterisation with perspective-correct varyings, polygon offset,
@@ -7817,6 +7835,8 @@ index 00000000..380e7424
 +pub struct Frag<'a> {
 +    pub v: [f32; MAXV],
 +    pub q: f32,
++    /// 1 / q (0 when q is 0), computed once for the varyings and their derivatives.
++    iq: f32,
 +    grads: Option<&'a Grads>,
 +    pub front: bool,
 +}
@@ -7827,7 +7847,7 @@ index 00000000..380e7424
 +    pub fn deriv(&self, i: usize) -> (f32, f32) {
 +        match self.grads {
 +            Some(g) if self.q != 0.0 => {
-+                let inv = 1.0 / self.q;
++                let inv = self.iq;
 +                ((g.ax[i] - self.v[i] * g.qx) * inv, (g.ay[i] - self.v[i] * g.qy) * inv)
 +            }
 +            _ => (0.0, 0.0),
@@ -8608,9 +8628,9 @@ index 00000000..380e7424
 +                };
 +                if pass {
 +                    let q = a.q + g.qx * dx + g.qy * dy;
-+                    let mut f = Frag { v: [0.0; MAXV], q, grads: Some(g), front: t.front };
++                    let iq = if q != 0.0 { 1.0 / q } else { 0.0 };
++                    let mut f = Frag { v: [0.0; MAXV], q, iq, grads: Some(g), front: t.front };
 +                    if q != 0.0 {
-+                        let iq = 1.0 / q;
 +                        for i in 0..nv {
 +                            f.v[i] = (a.vq[i] + g.ax[i] * dx + g.ay[i] * dy) * iq;
 +                        }
@@ -8656,7 +8676,7 @@ index 00000000..380e7424
 +            continue;
 +        }
 +        let q = wa.q + (wb.q - wa.q) * t;
-+        let mut f = Frag { v: [0.0; MAXV], q, grads: None, front: true };
++        let mut f = Frag { v: [0.0; MAXV], q, iq: 0.0, grads: None, front: true };
 +        if q != 0.0 {
 +            for i in 0..nv {
 +                f.v[i] = (wa.vq[i] + (wb.vq[i] - wa.vq[i]) * t) / q;
@@ -8678,7 +8698,7 @@ index 00000000..380e7424
 +    let half = pt.half;
 +    let nv = p.interp();
 +    let depth_test = rs.depth_test && b.depth.is_some();
-+    let mut f = Frag { v: [0.0; MAXV], q: w.q, grads: None, front: true };
++    let mut f = Frag { v: [0.0; MAXV], q: w.q, iq: 0.0, grads: None, front: true };
 +    f.v[..nv].copy_from_slice(&pt.v[..nv]);
 +    let mut frags = 0;
 +    for py in pt.rect[1].max(b.y0)..pt.rect[3].min(b.y1) {
@@ -9867,10 +9887,10 @@ index 00000000..be9a7471
 +}
 diff --git a/vm-rust/src/rendering_gpu/softgl/texture.rs b/vm-rust/src/rendering_gpu/softgl/texture.rs
 new file mode 100644
-index 00000000..39f33c35
+index 00000000..38f16854
 --- /dev/null
 +++ b/vm-rust/src/rendering_gpu/softgl/texture.rs
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,272 @@
 +//! PS5_RUFFLE_DIRPLAYER_NATIVE: 2D texture sampling as OpenGL ES 3.0 §3.8.10–3.8.11 defines it
 +//! for the filters and wrap modes the 3D renderer sets: the level of detail from the texture
 +//! coordinates' screen derivatives, NEAREST / LINEAR within a level, the four mipmap filters
@@ -10039,17 +10059,53 @@ index 00000000..39f33c35
 +        let x1 = wrap(i0.wrapping_add(1), l.w, self.wrap_s);
 +        let r0 = wrap(j0, l.h, self.wrap_t) * l.w;
 +        let r1 = wrap(j0.wrapping_add(1), l.h, self.wrap_t) * l.w;
-+        let p00 = texel(l, r0 + x0);
-+        let p10 = texel(l, r0 + x1);
-+        let p01 = texel(l, r1 + x0);
-+        let p11 = texel(l, r1 + x1);
-+        let mut out = [0.0f32; 4];
-+        for k in 0..4 {
-+            let top = p00[k] + (p10[k] - p00[k]) * a;
-+            let bot = p01[k] + (p11[k] - p01[k]) * a;
-+            out[k] = top + (bot - top) * b;
-+        }
-+        out
++        bilerp(l, [r0 + x0, r0 + x1, r1 + x0, r1 + x1], a, b)
++    }
++}
++
++/// The bilinear blend of texels i[0] (x0, y0), i[1] (x1, y0), i[2] (x0, y1), i[3] (x1, y1) with
++/// weights a (along x) and b (along y): per channel, top = p00 + (p10 - p00) a, bottom likewise,
++/// top + (bottom - top) b, on the texels as 0..1 floats.
++#[cfg(not(target_arch = "x86_64"))]
++#[inline(always)]
++fn bilerp(l: &Level, i: [i32; 4], a: f32, b: f32) -> [f32; 4] {
++    let (p00, p10, p01, p11) = (texel(l, i[0]), texel(l, i[1]), texel(l, i[2]), texel(l, i[3]));
++    let mut out = [0.0f32; 4];
++    for k in 0..4 {
++        let top = p00[k] + (p10[k] - p00[k]) * a;
++        let bot = p01[k] + (p11[k] - p01[k]) * a;
++        out[k] = top + (bot - top) * b;
++    }
++    out
++}
++
++/// The same with the four channels in one SSE2 register (x86-64's baseline): the same
++/// operations in the same order per channel, so the same results bit for bit.
++#[cfg(target_arch = "x86_64")]
++#[inline(always)]
++fn bilerp(l: &Level, i: [i32; 4], a: f32, b: f32) -> [f32; 4] {
++    use std::arch::x86_64::*;
++    // SAFETY: SSE2 is part of x86-64. Each texel index is in its level (see `texel`), so the
++    // 4-byte reads are inside the level's data.
++    unsafe {
++        let base = l.data.as_ptr();
++        let k = _mm_set1_ps(1.0 / 255.0);
++        let z = _mm_setzero_si128();
++        let load = |idx: i32| -> __m128 {
++            debug_assert!((idx as usize) * 4 + 4 <= l.data.len());
++            let px = (base.add(idx as usize * 4) as *const i32).read_unaligned();
++            let v = _mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128(px), z), z);
++            _mm_mul_ps(_mm_cvtepi32_ps(v), k)
++        };
++        let (p00, p10, p01, p11) = (load(i[0]), load(i[1]), load(i[2]), load(i[3]));
++        let va = _mm_set1_ps(a);
++        let vb = _mm_set1_ps(b);
++        let top = _mm_add_ps(p00, _mm_mul_ps(_mm_sub_ps(p10, p00), va));
++        let bot = _mm_add_ps(p01, _mm_mul_ps(_mm_sub_ps(p11, p01), va));
++        let out = _mm_add_ps(top, _mm_mul_ps(_mm_sub_ps(bot, top), vb));
++        let mut r = [0.0f32; 4];
++        _mm_storeu_ps(r.as_mut_ptr(), out);
++        r
 +    }
 +}
 +

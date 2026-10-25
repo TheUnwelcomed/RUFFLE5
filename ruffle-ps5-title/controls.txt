@@ -28,6 +28,16 @@
 #   l3 = a           r3 = s           options = enter  touchpad = click
 #   left_stick = dpad      right_stick = mouse      pointer_speed = 1100
 #   cursor = auto          cursor_hide = 3          cursor_scale = 1.75
+#   keyboard_size = large  keyboard_position = bottom  keyboard_game = under  keyboard_opacity = 100
+#
+# The on-screen keyboard (1.000.031; the editor's "On-screen keyboard" page, Settings > Controls &
+# Sound > On-screen keyboard for every game, the quick menu's Keyboard for this game for one):
+#   keyboard_size      large | medium | small | mini (mini: no title, no button hints)
+#   keyboard_position  where it opens: bottom | bottom-left | left | top-left | top | top-right |
+#                      right | bottom-right (on the open keyboard L1 moves it on, R1 across)
+#   keyboard_game      under (the keyboard covers the game) | beside (the game is shown smaller in
+#                      the part of the screen the keyboard leaves free while it is open)
+#   keyboard_opacity   100 | 80 | 60 | 40: how solid its background is
 #
 # Examples — uncomment what the game needs:
 #cross = space, enter       # Cross presses Space and Enter at once (menus that want Enter, games that want Space)
@@ -45,3 +55,6 @@
 #pointer_speed = 1600       # faster stick pointer
 #cursor = on                # pointer always drawn (auto = drawn while it moves, hidden after cursor_hide seconds)
 #cursor_scale = 2.5         # a bigger pointer
+#keyboard_size = small      # an RPG or turn-based game: a small keyboard in a corner...
+#keyboard_position = bottom-right
+#keyboard_game = beside     # ...and the game beside it, none of it hidden

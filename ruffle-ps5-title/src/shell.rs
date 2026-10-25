@@ -27,6 +27,12 @@
 //! same scaling pass draws it into a rectangle of the display (`picture_rect`: whole multiples,
 //! fitted, or stretched), sharp (nearest) or smooth (bilinear), black around it, the pointer and
 //! the overlay over it.
+//!
+//! V4 (1.000.031): `set_game_area` — while the on-screen keyboard is open beside a game
+//! (src/keyboard.rs `game_area`), the game is shown in a rectangle of the display instead of all of
+//! it: a Flash game's frame goes through the scaling texture (also at 4K) and its stage, without the
+//! letterbox around it (`GameArea::crop`), is scaled into the rectangle; a Director stage is fitted
+//! into it. Black around it, the pointer and the overlay over it as before.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::cursor::{Cursor, CursorPainter, SharedCursor};
@@ -98,6 +104,8 @@ struct Offscreen {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     bind: wgpu::BindGroup,
+    /// The part of the texture the blit shows ([u, v, w, h], `Blit::crop`).
+    crop: wgpu::Buffer,
     width: u32,
     height: u32,
 }
@@ -105,6 +113,8 @@ struct Offscreen {
 const BLIT_SHADER: &str = r#"
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
+// the part of the texture shown: [u, v, w, h] (all of it: 0, 0, 1, 1)
+@group(0) @binding(2) var<uniform> crop: vec4<f32>;
 
 var<private> CORNERS: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
     vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0),
@@ -120,7 +130,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
     let xy = CORNERS[vi];
     var out: VsOut;
     out.pos = vec4<f32>(xy, 0.0, 1.0);
-    out.uv = vec2<f32>((xy.x + 1.0) * 0.5, 1.0 - (xy.y + 1.0) * 0.5);
+    out.uv = crop.xy + vec2<f32>((xy.x + 1.0) * 0.5, 1.0 - (xy.y + 1.0) * 0.5) * crop.zw;
     return out;
 }
 
@@ -154,8 +164,61 @@ struct Picture {
     texture: wgpu::Texture,
     smooth: wgpu::BindGroup,
     sharp: wgpu::BindGroup,
+    /// Always all of it (written once, `Blit::crop_buffer`); kept with the bind groups that use it.
+    #[allow(dead_code)]
+    crop: wgpu::Buffer,
     width: u32,
     height: u32,
+}
+
+/// All of a frame, as a `GameArea::crop`.
+pub const FULL_FRAME: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+/// Where a game is shown while the on-screen keyboard is beside it (`Display::set_game_area`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GameArea {
+    /// The rectangle of the display, [x, y, w, h] in display pixels: whole pixels, inside it.
+    pub rect: [f32; 4],
+    /// The part of the game's frame scaled into it, [u, v, w, h] in 0..1: a Flash stage without the
+    /// letterbox around it, or `FULL_FRAME`.
+    pub crop: [f32; 4],
+}
+
+impl GameArea {
+    /// From a rectangle in UI units (1920x1080) on a `dw` x `dh` display.
+    pub fn from_ui(r: crate::ui::Rect, crop: [f32; 4], dw: u32, dh: u32) -> GameArea {
+        let (dw, dh) = (dw.max(1) as f32, dh.max(1) as f32);
+        let (sx, sy) = (dw / crate::ui::W, dh / crate::ui::H);
+        let x = (r.x * sx).round().clamp(0.0, dw - 1.0);
+        let y = (r.y * sy).round().clamp(0.0, dh - 1.0);
+        let w = (r.w * sx).round().clamp(1.0, dw - x);
+        let h = (r.h * sy).round().clamp(1.0, dh - y);
+        let [u, v, cw, ch] = crop;
+        let crop = if cw > 0.0 && ch > 0.0 && u >= 0.0 && v >= 0.0 && u + cw <= 1.0 + 1e-4 && v + ch <= 1.0 + 1e-4 { crop } else { FULL_FRAME };
+        GameArea { rect: [x, y, w, h], crop }
+    }
+
+    /// Where the whole frame lands at this scale, [x, y, w, h] in display pixels (it may reach past
+    /// the display): the area the pointer's coordinates span (src/cursor.rs `area`).
+    pub fn frame_rect(&self) -> [f32; 4] {
+        let [x, y, w, h] = self.rect;
+        let [u, v, cw, ch] = self.crop;
+        let (fw, fh) = (w / cw.max(1e-6), h / ch.max(1e-6));
+        [x - u * fw, y - v * fh, fw, fh]
+    }
+}
+
+/// Where a `width` x `height` picture (a Director stage) goes: `picture_rect` on the whole
+/// `dw` x `dh` display, or fitted the same way into the game area.
+pub fn stage_rect(width: u32, height: u32, dw: u32, dh: u32, fit: Fit, area: Option<GameArea>) -> [f32; 4] {
+    match area {
+        None => picture_rect(width, height, dw, dh, fit),
+        Some(a) => {
+            let [ax, ay, aw, ah] = a.rect;
+            let [x, y, w, h] = picture_rect(width, height, aw as u32, ah as u32, fit);
+            [ax + x, ay + y, w, h]
+        }
+    }
 }
 
 /// Where a `width` x `height` picture goes on a `dw` x `dh` display: [x, y, w, h] in display pixels.
@@ -175,6 +238,14 @@ pub fn picture_rect(width: u32, height: u32, dw: u32, dh: u32, fit: Fit) -> [f32
     };
     let (rw, rh) = (rw.round().min(dw), rh.round().min(dh));
     [((dw - rw) / 2.0).floor(), ((dh - rh) / 2.0).floor(), rw, rh]
+}
+
+fn crop_bytes(crop: [f32; 4]) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    for (i, f) in crop.iter().enumerate() {
+        b[i * 4..i * 4 + 4].copy_from_slice(&f.to_ne_bytes());
+    }
+    b
 }
 
 impl Blit {
@@ -200,6 +271,16 @@ impl Blit {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(16),
+                    },
                     count: None,
                 },
             ],
@@ -269,7 +350,7 @@ impl Blit {
         Blit { pipeline, layout, sampler, nearest }
     }
 
-    fn bind(&self, device: &wgpu::Device, view: &wgpu::TextureView, sampler: &wgpu::Sampler) -> wgpu::BindGroup {
+    fn bind(&self, device: &wgpu::Device, view: &wgpu::TextureView, sampler: &wgpu::Sampler, crop: &wgpu::Buffer) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blit"),
             layout: &self.layout,
@@ -282,12 +363,25 @@ impl Blit {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: crop.as_entire_binding(),
+                },
             ],
         })
     }
 
-    fn encode(&self, device: &wgpu::Device, bind: &wgpu::BindGroup, target: &wgpu::TextureView) -> wgpu::CommandBuffer {
-        self.encode_into(device, bind, target, None)
+    /// The uniform with the part of the texture a bind group shows, holding `FULL_FRAME` from the
+    /// next submit on.
+    fn crop_buffer(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Buffer {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blit crop"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buffer, 0, &crop_bytes(FULL_FRAME));
+        buffer
     }
 
     /// The scaling pass, into `rect` ([x, y, w, h] in the target's pixels) or all of it; the rest
@@ -313,6 +407,11 @@ impl Blit {
             });
             pass.set_pipeline(&self.pipeline);
             if let Some([x, y, w, h]) = rect {
+                // the viewport must lie inside the target
+                let size = target.texture().size();
+                let (tw, th) = (size.width as f32, size.height as f32);
+                let (x, y) = (x.clamp(0.0, tw), y.clamp(0.0, th));
+                let (w, h) = (w.min(tw - x), h.min(th - y));
                 if w >= 1.0 && h >= 1.0 {
                     pass.set_viewport(x, y, w, h, 0.0, 1.0);
                 }
@@ -340,6 +439,8 @@ pub struct Display {
     offscreen: Mutex<Option<Offscreen>>,
     picture: Mutex<Option<Picture>>,
     capture: Mutex<Capture>,
+    /// V4: where the game is shown while the on-screen keyboard is beside it; None: all of the display.
+    game_area: Mutex<Option<GameArea>>,
     pub stats: FrameStats,
     lost_logged: AtomicU8,
 }
@@ -373,6 +474,7 @@ impl Display {
             offscreen: Mutex::new(None),
             picture: Mutex::new(None),
             capture: Mutex::new(Capture::Idle),
+            game_area: Mutex::new(None),
             stats: FrameStats::default(),
             lost_logged: AtomicU8::new(0),
         }))
@@ -393,6 +495,18 @@ impl Display {
         if let Ok(mut o) = self.overlay.lock() {
             *o = scene;
         }
+    }
+
+    /// Show the game in `area` of the display from the next frame on (the on-screen keyboard beside
+    /// it), or on all of it again (None).
+    pub fn set_game_area(&self, area: Option<GameArea>) {
+        if let Ok(mut a) = self.game_area.lock() {
+            *a = area;
+        }
+    }
+
+    pub fn game_area(&self) -> Option<GameArea> {
+        self.game_area.lock().ok().and_then(|a| *a)
     }
 
     /// Ask for the next game frame to be read back (a cover picture).
@@ -461,6 +575,7 @@ impl Display {
 
     /// Free the scaling texture (a game ended).
     pub fn release_offscreen(&self) {
+        self.set_game_area(None);
         if let Ok(mut o) = self.offscreen.lock() {
             *o = None;
         }
@@ -515,24 +630,13 @@ impl Display {
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("blit"),
-                layout: &self.blit.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.blit.sampler),
-                    },
-                ],
-            });
+            let crop = Blit::crop_buffer(&self.device, &self.queue);
+            let bind = self.blit.bind(&self.device, &view, &self.blit.sampler, &crop);
             *slot = Some(Offscreen {
                 texture,
                 view,
                 bind,
+                crop,
                 width,
                 height,
             });
@@ -647,9 +751,10 @@ impl Display {
                     view_formats: &[],
                 });
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                let smooth = self.blit.bind(&self.device, &view, &self.blit.sampler);
-                let sharp = self.blit.bind(&self.device, &view, &self.blit.nearest);
-                *slot = Some(Picture { texture, smooth, sharp, width, height });
+                let crop = Blit::crop_buffer(&self.device, &self.queue);
+                let smooth = self.blit.bind(&self.device, &view, &self.blit.sampler, &crop);
+                let sharp = self.blit.bind(&self.device, &view, &self.blit.nearest, &crop);
+                *slot = Some(Picture { texture, smooth, sharp, crop, width, height });
             }
             if let Some(p) = slot.as_ref() {
                 self.queue.write_texture(
@@ -682,7 +787,7 @@ impl Display {
         let mut buffers = Vec::new();
         match slot.as_ref() {
             Some(p) => {
-                let rect = picture_rect(p.width, p.height, self.width, self.height, fit);
+                let rect = stage_rect(p.width, p.height, self.width, self.height, fit, self.game_area());
                 buffers.push(self.blit.encode_into(&self.device, if smooth { &p.smooth } else { &p.sharp }, &view, Some(rect)));
             }
             None => {
@@ -775,7 +880,8 @@ impl RenderTarget for ShellTarget {
 
     fn get_next_texture(&mut self) -> Option<Self::Frame> {
         let d = &self.display;
-        let direct = self.width == d.width && self.height == d.height && !d.capture_wanted();
+        // V4: a game shown in part of the display goes through the texture too
+        let direct = self.width == d.width && self.height == d.height && !d.capture_wanted() && d.game_area().is_none();
         if direct {
             let st = d.acquire()?;
             let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -803,7 +909,9 @@ impl RenderTarget for ShellTarget {
                         let swap_view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
                         if let Ok(slot) = d.offscreen.lock() {
                             if let Some(off) = slot.as_ref() {
-                                buffers.push(d.blit.encode(device, &off.bind, &swap_view));
+                                let area = d.game_area();
+                                queue.write_buffer(&off.crop, 0, &crop_bytes(area.map(|a| a.crop).unwrap_or(FULL_FRAME)));
+                                buffers.push(d.blit.encode_into(device, &off.bind, &swap_view, area.map(|a| a.rect)));
                             }
                         }
                         FrameStats::add(&d.stats.overlay_us, t);
@@ -827,5 +935,35 @@ impl RenderTarget for ShellTarget {
         }
         FrameStats::add(&d.stats.present_us, t);
         index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::Rect;
+
+    #[test]
+    fn a_game_area_on_the_display() {
+        // UI units to a 4K display: doubled, whole pixels
+        let a = GameArea::from_ui(Rect::new(10.25, 20.0, 785.8, 442.0), FULL_FRAME, 3840, 2160);
+        assert_eq!(a.rect, [21.0, 40.0, 1572.0, 884.0]);
+        // never past the display's edge
+        let a = GameArea::from_ui(Rect::new(1900.0, 1000.0, 400.0, 400.0), FULL_FRAME, 1920, 1080);
+        assert!(a.rect[0] + a.rect[2] <= 1920.0 && a.rect[1] + a.rect[3] <= 1080.0, "{:?}", a.rect);
+        // a crop outside the frame is not used
+        assert_eq!(GameArea::from_ui(Rect::new(0.0, 0.0, 100.0, 100.0), [0.5, 0.0, 0.8, 1.0], 1920, 1080).crop, FULL_FRAME);
+        // the pointer's area: the whole frame around the stage that fills the rectangle
+        let a = GameArea { rect: [100.0, 50.0, 400.0, 300.0], crop: [0.125, 0.0, 0.75, 1.0] };
+        let [x, y, w, h] = a.frame_rect();
+        assert!((x - (100.0 - 0.125 * 400.0 / 0.75)).abs() < 1e-3 && y == 50.0, "{x} {y}");
+        assert!((w - 400.0 / 0.75).abs() < 1e-3 && h == 300.0, "{w} {h}");
+        // a Director stage fitted into the area as it is into the display
+        let a = GameArea { rect: [0.0, 0.0, 1280.0, 720.0], crop: FULL_FRAME };
+        assert_eq!(stage_rect(640, 480, 3840, 2160, Fit::Fit, Some(a)), [160.0, 0.0, 960.0, 720.0]);
+        assert_eq!(stage_rect(640, 480, 3840, 2160, Fit::Fit, None), picture_rect(640, 480, 3840, 2160, Fit::Fit));
+        let a = GameArea { rect: [1000.0, 100.0, 1280.0, 960.0], crop: FULL_FRAME };
+        assert_eq!(stage_rect(640, 480, 3840, 2160, Fit::Whole, Some(a)), [1000.0, 100.0, 1280.0, 960.0], "a whole multiple (2x) fits exactly");
+        assert_eq!(crop_bytes(FULL_FRAME)[12..16], 1.0f32.to_ne_bytes());
     }
 }

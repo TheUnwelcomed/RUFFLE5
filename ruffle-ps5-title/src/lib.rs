@@ -76,6 +76,17 @@
 //! lightmap named "...LightingMap" behind an empty first texture slot was taken for the diffuse
 //! texture (DirPlayer fix in the patch).
 //!
+//! 1.000.031 (2026-10-25): the on-screen keyboard's own settings, per game or for every game in the
+//! mapping files (`keyboard_size`, `keyboard_position`, `keyboard_game`, `keyboard_opacity`):
+//! four sizes, eight places, the game under it or shown smaller beside it (src/shell.rs V4: the
+//! game's frame drawn into the free part of the screen, a Flash stage without its letterbox), and
+//! how solid it is; ready-made settings for kinds of game (typing a name, RPG and turn-based, typing
+//! games, a key now and then). The editor's keyboard page (Settings › On-screen keyboard, the quick
+//! menu's Keyboard for this game, a row of each controls editor) has a map of the screen and a
+//! full-size preview. L1 on the open keyboard moves it on round the screen, R1 across. Shockwave 3D:
+//! fewer uniform lookups per draw, the bone palette only for skinned draws, and the texture blend
+//! in SSE2 (the same pixels, bit for bit, on the Supersonic RC replay).
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -83,7 +94,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.030";
+pub const APP_VERSION: &str = "1.000.031";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 
@@ -427,6 +438,7 @@ fn run_app(gpu: gpu::Gpu, paths: paths::Paths) -> Result<(), String> {
                     }
                 }
                 Some(menu::Action::EditAllControls) => editor = Some(editor::Editor::open(&app.paths, editor::Target::AllGames, None)),
+                Some(menu::Action::EditKeyboard) => editor = Some(editor::Editor::open_keyboard(&app.paths, editor::Target::AllGames, None)),
                 Some(menu::Action::Rescan) => {
                     rescan(&mut app);
                     let found = format!("{} game(s) found", app.menu.games.len());

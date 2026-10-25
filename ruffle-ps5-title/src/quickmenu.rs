@@ -1,6 +1,6 @@
 //! PS5_RUFFLE_QUICKMENU_V1 — the in-game quick menu: holding OPTIONS (or Esc on a USB keyboard)
-//! pauses the game behind a card with Resume, Restart, Volume, Controls, Take cover picture,
-//! FPS counter and Back to games.
+//! pauses the game behind a card with Resume, Restart, Volume, Controls, Keyboard (1.000.031: the
+//! on-screen keyboard's settings for this game), Take cover picture, FPS counter and Back to games.
 //!
 //! After Ruffle-Flash-PS5's quick menu (src/quickmenu.rs, GPL-3.0, by ZiZc3), drawn on the GPU over
 //! the paused game's last frame (Ruffle keeps drawing it), not on a CPU copy of it.
@@ -21,16 +21,18 @@ enum Item {
     Restart,
     Volume,
     Controls,
+    Keyboard,
     Cover,
     Fps,
     Library,
 }
 
-const ITEMS: [(Item, &str); 7] = [
+const ITEMS: [(Item, &str); 8] = [
     (Item::Resume, "Resume"),
     (Item::Restart, "Restart game"),
     (Item::Volume, "Volume"),
     (Item::Controls, "Controls for this game"),
+    (Item::Keyboard, "Keyboard for this game"),
     (Item::Cover, "Take cover picture"),
     (Item::Fps, "FPS counter"),
     (Item::Library, "Back to games"),
@@ -45,6 +47,8 @@ pub enum Action {
     /// The new game volume, 0..=10.
     Volume(u8),
     Controls,
+    /// The on-screen keyboard's settings for this game.
+    Keyboard,
     Cover,
     Fps(bool),
     Library,
@@ -141,6 +145,7 @@ impl QuickMenu {
                         Item::Resume => Action::Resume,
                         Item::Restart => Action::Restart,
                         Item::Controls => Action::Controls,
+                        Item::Keyboard => Action::Keyboard,
                         Item::Cover => Action::Cover,
                         _ => Action::Library,
                     };

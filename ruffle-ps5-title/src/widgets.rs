@@ -289,10 +289,15 @@ pub fn draw_glyph(ui: &mut Ui, scene: &mut Scene, glyph: Glyph, x: f32, cy: f32,
 
 /// A row of [glyph label] hints ending at `right`, centred on `cy`.
 pub fn draw_hints(ui: &mut Ui, scene: &mut Scene, hints: &[(Glyph, &str)], right: f32, cy: f32) {
-    let h = 30.0;
-    let size = 22.0;
-    let gap = 10.0;
-    let between = 36.0;
+    draw_hints_scaled(ui, scene, hints, right, cy, 1.0);
+}
+
+/// Each hint's width and the row's, for `draw_hints_scaled` at `scale`.
+fn hint_widths(ui: &mut Ui, hints: &[(Glyph, &str)], scale: f32) -> (Vec<f32>, f32) {
+    let h = 30.0 * scale;
+    let size = 22.0 * scale;
+    let gap = 10.0 * scale;
+    let between = 36.0 * scale;
     let mut widths = Vec::new();
     let mut total = 0.0;
     for (i, (glyph, label)) in hints.iter().enumerate() {
@@ -301,9 +306,24 @@ pub fn draw_hints(ui: &mut Ui, scene: &mut Scene, hints: &[(Glyph, &str)], right
         widths.push(w);
         total += w;
         if i + 1 < hints.len() {
-            total += if hints[i + 1].1.is_empty() || label.is_empty() { 6.0 } else { between };
+            total += if hints[i + 1].1.is_empty() || label.is_empty() { 6.0 * scale } else { between };
         }
     }
+    (widths, total)
+}
+
+/// How wide `draw_hints_scaled` draws `hints`.
+pub fn hints_width(ui: &mut Ui, hints: &[(Glyph, &str)], scale: f32) -> f32 {
+    hint_widths(ui, hints, scale).1
+}
+
+/// `draw_hints` at `scale` times its size (the smaller on-screen keyboards).
+pub fn draw_hints_scaled(ui: &mut Ui, scene: &mut Scene, hints: &[(Glyph, &str)], right: f32, cy: f32, scale: f32) {
+    let h = 30.0 * scale;
+    let size = 22.0 * scale;
+    let gap = 10.0 * scale;
+    let between = 36.0 * scale;
+    let (widths, total) = hint_widths(ui, hints, scale);
     let mut x = right - total;
     for (i, (glyph, label)) in hints.iter().enumerate() {
         draw_glyph(ui, scene, *glyph, x, cy, h);
@@ -313,7 +333,7 @@ pub fn draw_hints(ui: &mut Ui, scene: &mut Scene, hints: &[(Glyph, &str)], right
         }
         x += widths[i];
         if i + 1 < hints.len() {
-            x += if hints[i + 1].1.is_empty() || label.is_empty() { 6.0 } else { between };
+            x += if hints[i + 1].1.is_empty() || label.is_empty() { 6.0 * scale } else { between };
         }
     }
 }

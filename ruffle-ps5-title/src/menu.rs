@@ -154,6 +154,8 @@ pub enum Action {
     Added(String),
     EditControls(usize),
     EditAllControls,
+    /// 1.000.031: Settings > On-screen keyboard (for all games).
+    EditKeyboard,
     Quit,
     Rescan,
     ClearRecent,
@@ -1034,6 +1036,7 @@ impl Menu {
                 sounds::play(Sfx::Select);
                 return Some(match act {
                     Act::EditAllControls => Action::EditAllControls,
+                    Act::EditKeyboard => Action::EditKeyboard,
                     Act::Rescan => Action::Rescan,
                     Act::ClearRecent => {
                         library.clear_recent();

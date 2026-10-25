@@ -19,7 +19,10 @@
 //!   * sound: DirPlayer's mixer (`native_audio`), drained by a thread on its own AudioOut port;
 //!   * the quick menu (hold OPTIONS), the controls editor, the on-screen keyboard (L2), covers, the
 //!     FPS counter and play time work as in a Flash game. The frame-time lines in the log use the
-//!     same `[Game]` format ("game" is the frame's Lingo, "draw" rendering the stage).
+//!     same `[Game]` format ("game" is the frame's Lingo, "draw" rendering the stage);
+//!   * 1.000.031: the keyboard with the game's own settings, and when they put the game beside it,
+//!     the stage is fitted into the part of the screen the keyboard leaves free (src/shell.rs
+//!     `stage_rect`), the pointer's area with it.
 //!
 //! Everything DirPlayer does runs on this thread, inside its executor (`block_on`): its helper tasks
 //! (loading casts, timeouts) only move while this loop awaits it. 1.000.022: that executor is
@@ -35,7 +38,7 @@ use crate::game::{self, GameEnd, Session, AUTO_COVER_AFTER, FADE_IN, FADE_OUT, P
 use crate::input::BTN_OPTIONS;
 use crate::keyboard::Osk;
 use crate::quickmenu::{self, QuickMenu};
-use crate::shell::{picture_rect, Fit};
+use crate::shell::{picture_rect, stage_rect, Fit, GameArea, FULL_FRAME};
 use crate::ui::{Align, Face, Rect, Scene, W};
 use crate::widgets::{self, centred, draw_hold_bar, ease, Glyph, BLACK, INK, NIGHT, ORANGE};
 use crate::{say, App};
@@ -404,6 +407,7 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
     for line in controls.summary() {
         say(&format!("       {line}"));
     }
+    let kb_prefs = controls.keyboard;
     app.input.set_controls(controls);
     app.input.game = true;
     app.input.mouse_speed = s.mouse_multiplier();
@@ -438,6 +442,9 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
     let mut quick: Option<QuickMenu> = None;
     let mut editor: Option<Editor> = None;
     let mut osk = Osk::new();
+    osk.set_prefs(kb_prefs);
+    // where the stage is shown while the keyboard is beside it (None: all of the display)
+    let mut game_area: Option<GameArea> = None;
     let mut hold = 0.0f32;
     let mut options_armed = true;
     let mut session = Session::default();
@@ -502,7 +509,9 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
                     toast_msg = Some((msg, 0.0));
                     app.badges.stats.controls += 1;
                 }
-                app.input.set_controls(Controls::load(&app.paths, &controls_path));
+                let controls = Controls::load(&app.paths, &controls_path);
+                osk.set_prefs(controls.keyboard);
+                app.input.set_controls(controls);
                 app.menu.refresh_mappings();
             } else {
                 editor = Some(ed);
@@ -522,7 +531,13 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
                     quick = Some(q);
                 }
                 quickmenu::Action::Controls => {
-                    editor = Some(Editor::open(&app.paths, Target::Game { stem: stem.clone(), name: name.clone() }, Some(&controls_path)));
+                    let aspect = stage_w as f32 / stage_h.max(1) as f32;
+                    editor = Some(Editor::open(&app.paths, Target::Game { stem: stem.clone(), name: name.clone() }, Some(&controls_path)).over_game(aspect));
+                    quick = Some(q);
+                }
+                quickmenu::Action::Keyboard => {
+                    let aspect = stage_w as f32 / stage_h.max(1) as f32;
+                    editor = Some(Editor::open_keyboard(&app.paths, Target::Game { stem: stem.clone(), name: name.clone() }, Some(&controls_path)).over_game(aspect));
                     quick = Some(q);
                 }
                 quickmenu::Action::Resume => {
@@ -638,7 +653,7 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
                 (stage_w, stage_h) = (w, h);
                 say(&format!("     the stage is now {w}x{h}"));
                 app.input.set_viewport(w, h);
-                app.input.set_area(Some(picture_rect(w, h, dw, dh, fit)));
+                app.input.set_area(Some(stage_rect(w, h, dw, dh, fit, game_area)));
             }
             upload = Some((w, h));
             drawn += 1;
@@ -718,6 +733,19 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
             app.input.set_cursor_visible(false);
         }
         spent[2] += ms(t);
+
+        // ---- where the stage is shown: all of the display, or beside the keyboard ----
+        let kb = editor.as_ref().and_then(|e| e.keyboard_preview()).unwrap_or(&osk);
+        let area = if kb.beside() {
+            kb.game_area(stage_w as f32 / stage_h.max(1) as f32).map(|r| GameArea::from_ui(r, FULL_FRAME, dw, dh))
+        } else {
+            None
+        };
+        if area != game_area {
+            app.display.set_game_area(area);
+            app.input.set_area(Some(stage_rect(stage_w, stage_h, dw, dh, fit, area)));
+            game_area = area;
+        }
 
         // ---- shown: every loop (the overlay and the pointer move even when the stage does not) ----
         let pic = upload.map(|(w, h)| (&picture[..], w, h));

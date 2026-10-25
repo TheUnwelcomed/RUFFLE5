@@ -111,6 +111,7 @@ pub enum Row {
     DummyExternalInterface,
     SpoofSite,
     AllControls,
+    KeyboardLayout,
     AutoKeyboard,
     MouseSpeed,
     Volume,
@@ -132,7 +133,7 @@ pub enum Row {
 pub const CATEGORIES: [(&str, &[Row]); 6] = [
     ("Display", &[Row::Resolution, Row::Quality, Row::ScaleMode, Row::Letterbox, Row::Align, Row::ForceScale, Row::ForceAlign]),
     ("Player", &[Row::FrameRate, Row::PlayerVersion, Row::Runtime, Row::LoadBehavior, Row::MaxExecution, Row::DummyExternalInterface, Row::SpoofSite]),
-    ("Controls & Sound", &[Row::AllControls, Row::AutoKeyboard, Row::MouseSpeed, Row::Volume, Row::UiSounds]),
+    ("Controls & Sound", &[Row::AllControls, Row::KeyboardLayout, Row::AutoKeyboard, Row::MouseSpeed, Row::Volume, Row::UiSounds]),
     ("App", &[Row::AnimatedBackground, Row::Screensaver, Row::FpsCounter, Row::AutoCovers, Row::Badges]),
     ("Library", &[Row::Rescan, Row::ClearRecent, Row::KeepOnline]),
     ("About", &[Row::Version, Row::CreatedBy, Row::Credits]),
@@ -154,6 +155,8 @@ pub fn category_help(name: &str) -> &'static str {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Act {
     EditAllControls,
+    /// 1.000.031: the on-screen keyboard's settings for all games.
+    EditKeyboard,
     Rescan,
     ClearRecent,
 }
@@ -162,6 +165,7 @@ impl Row {
     pub fn action(self) -> Option<Act> {
         match self {
             Row::AllControls => Some(Act::EditAllControls),
+            Row::KeyboardLayout => Some(Act::EditKeyboard),
             Row::Rescan => Some(Act::Rescan),
             Row::ClearRecent => Some(Act::ClearRecent),
             _ => None,
@@ -190,6 +194,7 @@ impl Row {
             Row::DummyExternalInterface => "Dummy External Interface",
             Row::SpoofSite => "Pretend to be on",
             Row::AllControls => "Controls for all games",
+            Row::KeyboardLayout => "On-screen keyboard",
             Row::AutoKeyboard => "Keyboard for text boxes",
             Row::MouseSpeed => "USB mouse speed",
             Row::Volume => "Game volume",
@@ -236,6 +241,7 @@ impl Row {
             Row::DummyExternalInterface => "Tells games the web page they expect is there, answering its calls with nothing. Some games wait for it and will not start without it.",
             Row::SpoofSite => "Makes a game believe it runs on this site. Many games only start on the site they were made for.",
             Row::AllControls => "What each button does in every game. A game's own mapping (Triangle on it in Games) starts from these. Saved in Custom Mappings.",
+            Row::KeyboardLayout => "Its size, where it opens, and whether the game moves out of its way, for every game; ready-made settings for kinds of game. A game's own (quick menu: Keyboard for this game) start from these. Saved in Custom Mappings.",
             Row::AutoKeyboard => "Opens the on-screen keyboard by itself when a game's text box wants typing (a name, a code).",
             Row::MouseSpeed => "How fast a USB mouse moves the pointer in games.",
             Row::Volume => "Volume of every game's sound and music.",
@@ -284,6 +290,7 @@ impl Row {
             Row::DummyExternalInterface => on(s.dummy_external_interface),
             Row::SpoofSite => SPOOF_SITES[s.spoof_site as usize].0.to_string(),
             Row::AllControls => "Edit".to_string(),
+            Row::KeyboardLayout => "Edit".to_string(),
             Row::AutoKeyboard => on(s.auto_keyboard),
             Row::MouseSpeed => MOUSE_SPEEDS[s.mouse_speed as usize].to_string(),
             Row::Volume => format!("{}%", s.volume as u32 * 10),

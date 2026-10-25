@@ -12,6 +12,12 @@
 //! (src/keyboard.rs), and a game's text box does too. Saves are flushed every 3 s and when the quick
 //! menu opens; the play time is kept every 30 s in case the console is switched off.
 //!
+//! 1.000.031: the keyboard opens with the game's own settings (size, place, background; src/controls.rs
+//! `keyboard_*`), and when they put the game beside it, the frame is shown in the part of the screen
+//! the keyboard leaves free (src/shell.rs `set_game_area`): Ruffle's stage without its letterbox
+//! (`stage_crop`), the pointer's area moved with it. The quick menu's Keyboard for this game opens
+//! the editor on those settings; its full-size preview moves the paused game the same way.
+//!
 //! Every 5 s the log gets the frame-time lines in Ruffle-Flash-PS5's format, so the two can be
 //! compared on the same game:
 //!   [Game] 5 s: N ticks, N frames drawn, N read back, N readbacks failed, root frame .., playing ..
@@ -23,6 +29,7 @@
 
 use crate::controls::Controls;
 use crate::editor::{Editor, Target};
+use crate::shell::{GameArea, FULL_FRAME};
 use crate::input::BTN_OPTIONS;
 use crate::keyboard::Osk;
 use crate::quickmenu::{self, QuickMenu};
@@ -199,6 +206,7 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
     for line in controls.summary() {
         say(&format!("       {line}"));
     }
+    let kb_prefs = controls.keyboard;
     app.input.set_controls(controls);
     app.input.game = true;
     app.input.mouse_speed = s.mouse_multiplier();
@@ -348,6 +356,9 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
     let mut quick: Option<QuickMenu> = None;
     let mut editor: Option<Editor> = None;
     let mut osk = Osk::new();
+    osk.set_prefs(kb_prefs);
+    // where the game is shown while the keyboard is beside it (None: all of the display)
+    let mut game_area: Option<GameArea> = None;
     let mut keyboard_request: Option<(bool, Instant)> = None;
     let mut auto_opened = false;
     let mut hold = 0.0f32;
@@ -410,6 +421,7 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
                     app.badges.stats.controls += 1;
                 }
                 let controls = Controls::load(&app.paths, &path);
+                osk.set_prefs(controls.keyboard);
                 app.input.set_controls(controls);
                 app.menu.refresh_mappings();
             } else {
@@ -430,7 +442,13 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
                     quick = Some(q);
                 }
                 quickmenu::Action::Controls => {
-                    editor = Some(Editor::open(&app.paths, Target::Game { stem: stem.clone(), name: name.clone() }, Some(&path)));
+                    let aspect = crop_aspect(stage_crop(&player, size), size);
+                    editor = Some(Editor::open(&app.paths, Target::Game { stem: stem.clone(), name: name.clone() }, Some(&path)).over_game(aspect));
+                    quick = Some(q);
+                }
+                quickmenu::Action::Keyboard => {
+                    let aspect = crop_aspect(stage_crop(&player, size), size);
+                    editor = Some(Editor::open_keyboard(&app.paths, Target::Game { stem: stem.clone(), name: name.clone() }, Some(&path)).over_game(aspect));
                     quick = Some(q);
                 }
                 quickmenu::Action::Resume => {
@@ -619,11 +637,26 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
         }
         spent[3] += ms(t);
 
-        // ---- draw: when the game changed, the overlay is up, or the pointer moved ----
+        // ---- where the game is shown: all of the display, or beside the keyboard ----
+        let kb = editor.as_ref().and_then(|e| e.keyboard_preview()).unwrap_or(&osk);
+        let area = if kb.beside() {
+            let crop = stage_crop(&player, size);
+            kb.game_area(crop_aspect(crop, size)).map(|r| GameArea::from_ui(r, crop, dw, dh))
+        } else {
+            None
+        };
+        let area_moved = area != game_area;
+        if area_moved {
+            app.display.set_game_area(area);
+            app.input.set_area(area.map(|a| a.frame_rect()));
+            game_area = area;
+        }
+
+        // ---- draw: when the game changed, the overlay is up, the pointer or the game moved ----
         let t = Instant::now();
         let mut rendered = false;
         if let Ok(mut p) = player.lock() {
-            if p.needs_render() || overlay_busy || app.input.moved || capture_pending {
+            if p.needs_render() || overlay_busy || app.input.moved || capture_pending || area_moved {
                 p.render();
                 rendered = true;
             }
@@ -743,6 +776,29 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
     end
 }
 
+/// Where Ruffle puts the stage in its `size` frame, as a part of it ([u, v, w, h] in 0..1): the
+/// stage's view matrix applied to its view bounds — the movie's area when Ruffle letterboxes it
+/// (Zoom to Fit, centred), else the whole frame (a game drawing outside its area is not cut).
+fn stage_crop(player: &std::sync::Arc<std::sync::Mutex<ruffle_core::Player>>, size: (u32, u32)) -> [f32; 4] {
+    let Ok(mut p) = player.lock() else {
+        return FULL_FRAME;
+    };
+    let r = p.mutate_with_update_context(|ctx| ctx.stage.view_matrix() * ctx.stage.view_bounds());
+    let (fw, fh) = (size.0.max(1) as f64, size.1.max(1) as f64);
+    // whole pixels of the frame (the bounds come through twips: 0.05 px off at the edges)
+    let (x0, x1) = (r.x_min.to_pixels().round().clamp(0.0, fw), r.x_max.to_pixels().round().clamp(0.0, fw));
+    let (y0, y1) = (r.y_min.to_pixels().round().clamp(0.0, fh), r.y_max.to_pixels().round().clamp(0.0, fh));
+    if x1 - x0 < 1.0 || y1 - y0 < 1.0 {
+        return FULL_FRAME;
+    }
+    [(x0 / fw) as f32, (y0 / fh) as f32, ((x1 - x0) / fw) as f32, ((y1 - y0) / fh) as f32]
+}
+
+/// The shape (width / height) of the `crop` of a `size` frame.
+fn crop_aspect(crop: [f32; 4], size: (u32, u32)) -> f32 {
+    (crop[2] * size.0.max(1) as f32) / (crop[3] * size.1.max(1) as f32).max(1e-3)
+}
+
 /// Resume the paused game: playing again, the paused time not counted.
 fn resume(player: &std::sync::Arc<std::sync::Mutex<ruffle_core::Player>>, paused_for: &mut Duration, paused_at: &mut Option<Instant>) {
     if let Some(at) = paused_at.take() {
@@ -752,4 +808,40 @@ fn resume(player: &std::sync::Arc<std::sync::Mutex<ruffle_core::Player>>, paused
         p.set_is_playing(true);
     }
     crate::say("game: resumed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ruffle_render::backend::null::NullRenderer;
+    use ruffle_render::backend::ViewportDimensions;
+
+    fn player(letterbox: Letterbox, scale: StageScaleMode) -> std::sync::Arc<std::sync::Mutex<ruffle_core::Player>> {
+        // test-swf/bounce.swf: an 800x600 movie
+        let movie = SwfMovieData::from_data(include_bytes!("../test-swf/bounce.swf"), "file:///bounce.swf".to_string(), None, None).unwrap();
+        let p = PlayerBuilder::new()
+            .with_renderer(NullRenderer::new(ViewportDimensions { width: 1920, height: 1080, scale_factor: 1.0 }))
+            .with_movie(movie)
+            .with_viewport_dimensions(1920, 1080, 1.0)
+            .with_scale_mode(scale, true)
+            .with_letterbox(letterbox)
+            .with_fullscreen(true)
+            .build();
+        p.lock().unwrap().tick(ruffle_core::FloatDuration::from_millis(20.0));
+        p
+    }
+
+    #[test]
+    fn the_stage_crop_is_the_letterboxed_movie() {
+        // Zoom to Fit, letterboxed: 800x600 on 1920x1080 is 1440x1080 from x 240
+        let crop = stage_crop(&player(Letterbox::On, StageScaleMode::ShowAll), (1920, 1080));
+        let want = [240.0 / 1920.0, 0.0, 1440.0 / 1920.0, 1.0];
+        assert!(crop.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4), "{crop:?}");
+        assert!((crop_aspect(crop, (1920, 1080)) - 4.0 / 3.0).abs() < 1e-3);
+        // the cover's crop agrees (src/covers.rs)
+        assert_eq!(crate::covers::movie_area(1920, 1080, 800, 600), (240, 0, 1440, 1080));
+        // no letterbox, or a scale mode the game sizes itself to: the whole frame (nothing cut)
+        assert_eq!(stage_crop(&player(Letterbox::Off, StageScaleMode::ShowAll), (1920, 1080)), FULL_FRAME);
+        assert_eq!(stage_crop(&player(Letterbox::On, StageScaleMode::NoScale), (1920, 1080)), FULL_FRAME);
+    }
 }

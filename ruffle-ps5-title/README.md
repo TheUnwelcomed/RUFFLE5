@@ -309,7 +309,8 @@ runs the same code on the build server against the three sites and packs what th
 **Settings**: *Display* — Resolution (4K / 1080p), quality, scale mode, letterbox, alignment;
 *Player* — frame rate, Flash Player version, runtime, load behaviour, script time limit, dummy
 ExternalInterface, a pretend site for sitelocked games; *Controls & Sound* — controls for all
-games (the editor), keyboard for text boxes, USB mouse speed, game volume, menu sounds; *App* — animated
+games (the editor), the on-screen keyboard (its size and place for every game), keyboard for text
+boxes, USB mouse speed, game volume, menu sounds; *App* — animated
 background, screensaver, FPS counter, automatic covers, badges; *Library* — rescan, clear recent,
 keep online games; *About*.
 
@@ -317,8 +318,9 @@ keep online games; *About*.
 
 | pad | |
 |---|---|
-| OPTIONS, held (or Esc on a USB keyboard) | the quick menu: resume, restart, volume, controls, take a cover picture, FPS counter, back to games |
+| OPTIONS, held (or Esc on a USB keyboard) | the quick menu: resume, restart, volume, controls, keyboard, take a cover picture, FPS counter, back to games |
 | L2 (by default) | the on-screen keyboard (a text box in the game opens it too) |
+| on the keyboard | d-pad picks a key, Cross types it, Square deletes, Triangle types a space, L1 moves it on round the screen, R1 across it, Circle closes it |
 
 A game without a picture gets one from its own frame after 8 seconds (Settings › App).
 
@@ -343,6 +345,34 @@ Controls & Sound › Controls for all games** the one for every game. Pick a but
 does (Cross sets it, Square adds or removes a key so one button can press up to four, Triangle
 resets a row). Leaving saves a file to Custom Mappings written like the shipped presets: a comment,
 then only the lines that differ.
+
+### The on-screen keyboard (1.000.031)
+
+Its own settings, per game or for every game, like the rest of the controls: **Settings › Controls
+& Sound › On-screen keyboard** (every game), **Keyboard for this game** in the quick menu, or the
+**On-screen keyboard ›** row at the end of either controls editor.
+
+| setting | |
+|---|---|
+| Made for | ready-made settings for kinds of game (below); "Your own" when the rows say something else |
+| Size | Large (804 x 594 of the 1920 x 1080 screen, as before), Medium (659 x 496), Small (518 x 396), Mini (384 x 240: no title, no button hints) |
+| Opens at | bottom, bottom left, left, top left, top, top right, right, bottom right |
+| The game | under the keyboard (it keeps the whole screen) or beside it (while the keyboard is open the game is shown smaller in the part of the screen the keyboard leaves free, none of it hidden) |
+| Background | solid, 80, 60 or 40% (the game shows through where it is under the keyboard) |
+
+| made for | size, place, the game, background |
+|---|---|
+| Typing a name or a code | Large, bottom, under, solid (the keyboard as before) |
+| RPG and turn-based | Small, bottom right, beside, solid: the map, the menus and the question stay in view |
+| Typing games | Medium, bottom, beside, solid: the words to type above the keys |
+| A key now and then | Mini, top right, under, 60%: one key from time to time, the game keeps the screen |
+
+The page shows a map of the screen with the keyboard and the game where they will be; **Square**
+shows the keyboard at full size where it will open (in a game, the paused game moves out of its way
+as it will), where L1 / R1 move it, Left / Right size it, Up / Down set its background and Triangle
+puts the game under it or beside it. With the game beside it, a Flash game's stage is shown without
+Ruffle's letterbox around it, so it gets as much of the free part as its shape allows; a Director
+stage is fitted the same way. The menu's search keyboard stays as it was.
 
 The files are layered, generic first: the defaults; `controls.txt` in the title folder (all
 comments); `Custom Mappings/_All Games.controls.txt`; the game's own
