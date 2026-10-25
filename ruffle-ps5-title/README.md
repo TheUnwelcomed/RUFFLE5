@@ -190,9 +190,9 @@ Chromium: kerning inside words, the "top" baseline, the font box); DirPlayer's o
 each frame, so `mouseEnter` / `mouseLeave` / `mouseWithin` reach the movie; a `go` told to a
 film-loop sprite (`tell sprite(n)` … `go 1`) moves that loop's playhead, not the movie's (Battle
 Blitz's START button); what a
-movie asks of a browser — a message box, `gotoNetPage`, the Flash bridge, a Shockwave 3D render —
-is answered as no browser here can (a notice shown in the game, a refusal the movie sees, a grey
-3D picture) instead of stopping the title; `setPref` / `getPref` keep their files in the game's
+movie asks of a browser — a message box, `gotoNetPage`, the Flash bridge —
+is answered as no browser here can (a notice shown in the game, a refusal the movie sees) instead of
+stopping the title; `setPref` / `getPref` keep their files in the game's
 saves folder; a file a movie asks for is found whatever the case of its name, as on Windows. A game
 from Flashpoint starts as Flashpoint starts it: its launch command is parsed as DirPlayer's web front
 end parses it (`parse_launch_command`, a port of its `launchCommand.js`) — the projector's
@@ -204,6 +204,49 @@ game data (`http://host/path` → `content/host/path`, `set_web_root`); nothing 
 `dcr-probe/` (at the repository root) runs a movie in DirPlayer on a PC or server and saves the
 stage as PNGs — for checking a game before it goes on the console (`DCR_PROBE_LAUNCH`,
 `DCR_PROBE_ADDRESS` and `DCR_PROBE_WEBROOT` start it as a Flashpoint game).
+
+### Shockwave 3D (1.000.030)
+
+DirPlayer is pinned to its `cham/w3d-fullscreen` branch (b9b9466: its main plus the Shockwave 3D
+work — W3D scenes, cameras, lightmaps, motions, Havok). On the web DirPlayer draws 3D cast members
+with WebGL2; the patch adds `rendering_gpu/softgl`, a software WebGL2, and compiles the same
+renderer (`webgl2/scene3d.rs`, `mesh3d.rs`, `context.rs`, unchanged but for their imports) a
+second time against it:
+
+* `gl.rs` is the part of WebGL2 the renderer calls, with web_sys' names and signatures; `state.rs`
+  its objects and state (buffers, vertex arrays, 2D textures with mipmaps, framebuffers with depth
+  renderbuffers, depth test, culling, scissor, blending, colour mask, polygon offset, clears, blits,
+  `copyTexSubImage2D`); `raster.rs` the pipeline (clipping in homogeneous coordinates, top-left
+  fill rule, perspective-correct varyings, depth, blending); `texture.rs` sampling as GL ES 3.0
+  §3.8 defines it (level of detail from the coordinates' derivatives, the mipmap filters, the
+  wrap modes);
+* GLSL is not compiled: the renderer's four programs (the model program, particles, post-process,
+  outlines) are recognised by their source and run by Rust ports (`programs.rs`); each source's
+  fingerprint is kept, so a DirPlayer update that changes one is reported in the log; the model
+  program lights per vertex, as Director's own (IFX) renderer did;
+* the CPU compositor (`rendering.rs`) puts each 3D sprite where DirPlayer's WebGL compositor does:
+  a pass per camera in the sprite's camera list, overlays, the sprite's ink and blend,
+  directToStage sprites last, `world.image` when a script asks for it;
+* a draw is set up on the game's thread (vertex shading, clipping, triangle setup) and its pixels
+  written later, with the draws before it, in row bands by up to 8 threads (`pool.rs`: the work
+  CPUs the CPU layout leaves the game, `src/cpu.rs`); every band keeps the draws' order.
+
+It was checked by recording a game's WebGL calls and replaying them in Chromium's WebGL2 with
+DirPlayer's GLSL (`dcr-probe/softgl-replay/`): on a Supersonic RC frame, with depth rounded as the
+browser's 16-bit depth buffer rounds it, 99.95% of the pixels are within 32 levels of the browser's
+and the mean difference is 0.15 levels (the rest: per-vertex against per-pixel lighting on curved
+surfaces, and edge pixels). The software keeps depth as f32, so it does not show the z-fighting
+the 16-bit buffer gives the web build (staircase-edged black shapes at a distance).
+
+One DirPlayer fix in the patch, found that way: a lightmap behind an empty first texture slot
+(Director's lightmap-only layout) is a lightmap, also when it is named "...LightingMap" — Supersonic
+RC's ceiling slabs had their lightmap atlas taken for the diffuse texture and sampled far outside
+its islands (black slabs, on the web too) — and whether a mesh's second UV set is pre-centered is
+decided by the coordinates its faces use, not by vertices no face uses.
+
+ruffle.log gets a "Shockwave 3D" line every 5 s: 3D sprite frames, triangles and pixels per frame,
+and the milliseconds a frame takes (in all, setting up the draws, writing the pixels) on how many
+threads.
 
 ## The menu
 

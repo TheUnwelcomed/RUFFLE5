@@ -7,7 +7,9 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DP_URL=https://github.com/igorlira/dirplayer-rs.git
-DP_REV=68376fbb4494a6bbad4c70081ecdcb99814a74c9
+# The cham/w3d-fullscreen branch head (2026-09-09): main as of 68376fb plus the Shockwave 3D work
+# (W3D scenes, cameras, lightmaps, motions) that Ruffle5's software 3D renderer draws.
+DP_REV=b9b9466628721d810a0bd5fde8e3228ab04b73ed
 DEST="${1:-$HERE/vendor/dirplayer}"
 PATCH="$HERE/tools/dirplayer-native.patch"
 MARK=PS5_RUFFLE_DIRPLAYER_NATIVE

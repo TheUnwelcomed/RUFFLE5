@@ -332,6 +332,10 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
 
     // ---- the movie ----
     give_fonts();
+    // Shockwave 3D (1.000.030): DirPlayer's 3D renderer draws in software; its pixels are written
+    // by this many threads (the work CPUs the CPU layout left, at most 8; the first game sets it).
+    let threads_3d = crate::cpu::work_cpus().unwrap_or(4).clamp(1, 8);
+    vm_rust::rendering_gpu::softgl::set_threads(threads_3d);
     let mut player = NativePlayer::new();
     // setPref / getPref (a browser's localStorage on the web): files in the game's saves folder
     let prefs = format!("{}/prefs", app.paths.saves(&key));
@@ -768,6 +772,21 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
                 per(matte_mpx),
                 per(matte_ms)
             ));
+            // Shockwave 3D: what the software 3D renderer drew in the window, per 3D sprite frame.
+            let (f3, tris3, px3) = vm_rust::rendering_gpu::softgl::take_stats();
+            let (setup_ms, pixels_ms, all_ms) = vm_rust::rendering_gpu::softgl::take_times();
+            if f3 > 0 {
+                let per3 = |v: f64| v / f3 as f64;
+                say(&format!(
+                    "[Game] Shockwave 3D: {f3} sprite frames, {} triangles and {} pixels per frame; ms per frame: {:.1} in all, {:.1} draw setup, {:.1} pixels on {} threads",
+                    tris3 / f3,
+                    px3 / f3,
+                    per3(all_ms),
+                    per3(setup_ms),
+                    per3(pixels_ms),
+                    vm_rust::rendering_gpu::softgl::threads()
+                ));
+            }
             (ticks, steps, drawn) = (0, 0, 0);
             spent = [0.0; 3];
             last_stats = Instant::now();

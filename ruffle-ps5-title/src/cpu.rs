@@ -24,6 +24,17 @@ const CPU_WHICH_PID: i32 = 2;
 const ERANGE: i32 = 34;
 
 static AUDIO_CPU: AtomicI32 = AtomicI32::new(-1);
+/// CPUs the title's work runs on (after the sound's core), 0 while unknown.
+static WORK_CPUS: AtomicI32 = AtomicI32::new(0);
+
+/// How many CPUs the game's work may use: the mask `init` left the process, or None when the
+/// console gave none.
+pub fn work_cpus() -> Option<usize> {
+    match WORK_CPUS.load(Ordering::Relaxed) {
+        n if n > 0 => Some(n as usize),
+        _ => None,
+    }
+}
 
 fn missing(name: &std::ffi::CStr) -> bool {
     unsafe { ps5_import_missing(name.as_ptr()) != 0 }
@@ -40,6 +51,7 @@ pub fn init() -> String {
     if unsafe { scePthreadGetaffinity(pthread_self(), &mut all) } != 0 || all == 0 {
         return "cpus: no CPU mask, layout skipped".into();
     }
+    WORK_CPUS.store(all.count_ones() as i32, Ordering::Relaxed);
     let Some(k) = (0..32).rev().find(|k| all & (3u64 << (2 * k)) == 3u64 << (2 * k)) else {
         return format!("cpus {all:#x}: no whole core free, layout skipped");
     };
@@ -62,6 +74,9 @@ pub fn init() -> String {
         }
     }
     AUDIO_CPU.store(2 * k as i32, Ordering::Relaxed);
+    if rc == 0 {
+        WORK_CPUS.store(rest.count_ones() as i32, Ordering::Relaxed);
+    }
     format!("cpus {all:#x}: sound on CPU {}, the rest on {rest:#x} (rc {rc})", 2 * k)
 }
 

@@ -14,6 +14,10 @@
 //!   18 snap name         save the stage as name.png
 //!   19 eval EXPR         print a Lingo expression's value (dot syntax: `_movie.frameLabel`)
 //!   20 lingo             write every loaded script's Lingo (decompiled) to <out>/lingo/
+//!   21 w3d               list the Shockwave 3D members' scenes (nodes, meshes, textures, shaders);
+//!                        DCR_PROBE_TEXDUMP=<dir> also writes their texture images there
+//!   22 bitmaps           list the bitmap members (size, depth, palette, alpha, how coloured)
+//!   23 sprites           list the sprites on the frame (member, ink, blend, colours, rect)
 //! Keys: Enter Space Left Right Up Down Escape Shift Control Tab Backspace, a..z, 0..9.
 //!
 //! The movie runs as Ruffle5 runs it on the console (src/shockwave.rs): one score frame
@@ -45,6 +49,24 @@
 //!
 //!   dcr-probe --blit-selftest [N]   N random blits (default 20000), each drawn with DirPlayer's
 //!                                   upright fast path and with its pixel loop: they must match.
+//!
+//! Shockwave 3D (the software WebGL2 in the patch, rendering_gpu/softgl): once a second a line gives
+//! the 3D sprite frames drawn, their triangles and pixels, and the milliseconds a 3D frame takes (in
+//! all, setting up its draws, writing its pixels). DIRPLAYER_SOFTGL_THREADS=n: how many threads
+//! write the pixels (default: the machine's CPUs, at most 8).
+//! DIRPLAYER_SOFTGL_TRACE=<frame>:<file>: every WebGL call the 3D renderer makes, from its context's
+//! creation to the end of that 3D sprite frame, written to <file> (one JSON array a line, with the
+//! renderer's notes: which model, which texture names, which layers) and the frame's picture to
+//! <file>.rgba;
+//!
+//!   dcr-probe --softgl-replay <trace> <out> [draws]   draws the trace again in software: <out>.rgba
+//!                                   and <out>.owner (per pixel, the last draw of the frame that
+//!                                   changed it), and the time the draws took;
+//!
+//! softgl-replay/replay.py replays the same trace in Chromium's WebGL2 with DirPlayer's GLSL and
+//! compares the pictures. DIRPLAYER_SOFTGL_PICK=x,y prints what was drawn at a pixel (window
+//! coordinates); DIRPLAYER_SOFTGL_DEPTH_BITS=16 rounds depth as a 16-bit depth buffer stores it
+//! (the WebGL renderer's DEPTH_COMPONENT16), for comparing with the browser.
 //!
 //! At the end (and when the score stays on one frame for 10 s) the probe prints the movie's state:
 //! its name and path, the frame and its label, the labels, every cast library with its file and
@@ -196,6 +218,9 @@ enum Act {
     Snap(String),
     Eval(String),
     Lingo,
+    W3d,
+    Bitmaps,
+    Sprites,
 }
 
 /// A key name as the browser front end would hand it to DirPlayer: (KeyboardEvent.key, keyCode).
@@ -242,6 +267,9 @@ fn parse_script(text: &str) -> Vec<(f64, Act)> {
             (Some("up"), Some(k)) => Some(Act::Up(k.to_string())),
             (Some("snap"), Some(n)) => Some(Act::Snap(n.to_string())),
             (Some("lingo"), _) => Some(Act::Lingo),
+            (Some("w3d"), _) => Some(Act::W3d),
+            (Some("bitmaps"), _) => Some(Act::Bitmaps),
+            (Some("sprites"), _) => Some(Act::Sprites),
             (Some("eval"), Some(_)) => {
                 let rest = item.splitn(3, char::is_whitespace).nth(2).unwrap_or("").trim().to_string();
                 Some(Act::Eval(rest))
@@ -314,7 +342,127 @@ async fn dump(player: &TestPlayer) {
             }
         }
     }
+    // the score's frame scripts (channel 0) and labels: where the playhead can go and what holds it
+    let spans: Vec<String> = vm_rust::player::reserve_player_ref(|p| {
+        let mut out = Vec::new();
+        for sp in p.movie.score.sprite_spans.iter().filter(|sp| sp.channel_number == 0) {
+            let scripts: Vec<String> = sp.scripts.iter().map(|r| format!("member {} of castLib {}", r.cast_member, r.cast_lib)).collect();
+            out.push(format!("frames {}-{}: {}", sp.start_frame, sp.end_frame, scripts.join(", ")));
+        }
+        for l in &p.movie.score.frame_labels {
+            out.push(format!("label {:?} at frame {}", l.label, l.frame_num));
+        }
+        out
+    });
+    for line in spans {
+        println!("[score] {line}");
+    }
     println!("[probe] ---- end of state ----");
+}
+
+/// The Shockwave 3D members and what their scenes hold: nodes, meshes (vertices, faces),
+/// textures, shaders, lights — what a renderer has to draw.
+fn dump_w3d() {
+    use vm_rust::director::chunks::w3d::types::W3dNodeType;
+    let lines: Vec<String> = vm_rust::player::reserve_player_ref(|p| {
+        let mut out = Vec::new();
+        for lib in p.movie.cast_manager.casts.iter() {
+            for (num, m) in lib.members.iter() {
+                let Some(w) = m.member_type.as_shockwave3d() else { continue };
+                let Some(scene) = w.parsed_scene.as_ref() else {
+                    out.push(format!("castLib {} member {} {:?}: no scene", lib.number, num, m.name));
+                    continue;
+                };
+                let count = |t: W3dNodeType| scene.nodes.iter().filter(|n| std::mem::discriminant(&n.node_type) == std::mem::discriminant(&t)).count();
+                let (mut verts, mut faces, mut meshes) = (0usize, 0usize, 0usize);
+                for ms in scene.clod_meshes.values() {
+                    for mesh in ms {
+                        verts += mesh.positions.len();
+                        faces += mesh.faces.len();
+                        meshes += 1;
+                    }
+                }
+                let raw_faces: usize = scene.raw_meshes.iter().map(|r| r.faces.len()).sum();
+                let tex_bytes: usize = scene.texture_images.values().map(|v| v.len()).sum();
+                out.push(format!(
+                    "castLib {} member {} {:?}: nodes {} (models {}, groups {}, lights {}, views {}), model resources {}, clod meshes {} ({} vertices, {} faces), raw meshes {} ({} faces), shaders {}, materials {}, textures {} ({} bytes), lights {}, motions {}, skeletons {}",
+                    lib.number, num, m.name, scene.nodes.len(), count(W3dNodeType::Model), count(W3dNodeType::Group), count(W3dNodeType::Light), count(W3dNodeType::View),
+                    scene.model_resources.len(), meshes, verts, faces, scene.raw_meshes.len(), raw_faces, scene.shaders.len(), scene.materials.len(), scene.texture_images.len(), tex_bytes,
+                    scene.lights.len(), scene.motions.len(), scene.skeletons.len()
+                ));
+                let mut types: std::collections::BTreeMap<String, usize> = Default::default();
+                for sh in &scene.shaders {
+                    *types.entry(format!("{:?} layers {}", sh.shader_type, sh.texture_layers.len())).or_default() += 1;
+                }
+                for (t, n) in types {
+                    out.push(format!("    shader {t}: {n}"));
+                }
+                let dump_dir = std::env::var("DCR_PROBE_TEXDUMP").ok();
+                for (name, img) in scene.texture_images.iter().take(400) {
+                    out.push(format!("    texture {:?}: {} bytes, starts {:02x?}", name, img.len(), &img[..img.len().min(8)]));
+                    if let Some(d) = &dump_dir {
+                        let ext = if img.starts_with(&[0xff, 0xd8]) { "jpg" } else if img.starts_with(&[0x89, 0x50]) { "png" } else { "bin" };
+                        let safe: String = name.to_string().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+                        let _ = std::fs::create_dir_all(d);
+                        let _ = std::fs::write(format!("{d}/{}_{}_{safe}.{ext}", lib.number, num), img);
+                    }
+                }
+            }
+        }
+        out
+    });
+    for l in lines {
+        println!("[w3d] {l}");
+    }
+}
+
+/// Every sprite on the current frame with a member: its member, ink, blend and colours.
+fn dump_sprites() {
+    let lines: Vec<String> = vm_rust::player::reserve_player_ref(|p| {
+        let mut out = Vec::new();
+        let frame = p.movie.current_frame;
+        for ch in p.movie.score.get_sorted_channels(frame) {
+            let Some(sp) = p.movie.score.get_sprite(ch.number as i16) else { continue };
+            let Some(m) = sp.member.as_ref() else { continue };
+            let name = p.movie.cast_manager.find_member_by_ref(m).map(|mm| mm.name.clone()).unwrap_or_default();
+            out.push(format!("{} {}:{} {:?} ink {} blend {} color {:?} bgColor {:?} has_fore {} has_back {} rect {:?}", ch.number, m.cast_lib, m.cast_member, name, sp.ink, sp.blend, sp.color, sp.bg_color, sp.has_fore_color, sp.has_back_color, (sp.loc_h, sp.loc_v, sp.width, sp.height)));
+        }
+        out
+    });
+    for l in lines {
+        println!("[sprites] {l}");
+    }
+}
+
+/// Every bitmap member: size, depth, palette and how coloured its pixels are (max of max-min).
+fn dump_bitmaps() {
+    use vm_rust::player::cast_member::CastMemberType;
+    let lines: Vec<String> = vm_rust::player::reserve_player_ref(|p| {
+        let palettes = p.movie.cast_manager.palettes();
+        let mut out = Vec::new();
+        for lib in p.movie.cast_manager.casts.iter() {
+            for (num, m) in lib.members.iter() {
+                let CastMemberType::Bitmap(b) = &m.member_type else { continue };
+                let Some(bmp) = p.bitmap_manager.get_bitmap(b.image_ref) else { continue };
+                let mut sat = 0u8;
+                let step = ((bmp.width as usize * bmp.height as usize) / 4000).max(1);
+                let mut k = 0usize;
+                for y in 0..bmp.height {
+                    for x in 0..bmp.width {
+                        k += 1;
+                        if k % step != 0 { continue; }
+                        let (r, g, bb, _a) = bmp.get_pixel_color_with_alpha(&palettes, x, y);
+                        sat = sat.max(r.max(g).max(bb) - r.min(g).min(bb));
+                    }
+                }
+                out.push(format!("castLib {} member {} {:?}: {}x{} depth {} (original {}), palette {:?}, use_alpha {}, colour {}", lib.number, num, m.name, bmp.width, bmp.height, bmp.bit_depth, bmp.original_bit_depth, bmp.palette_ref, bmp.use_alpha, sat));
+            }
+        }
+        out
+    });
+    for l in lines {
+        println!("[bitmap] {l}");
+    }
 }
 
 /// Every script the movie has loaded, decompiled by DirPlayer, one file per script.
@@ -560,6 +708,35 @@ fn blit_selftest(n: u32) -> bool {
 fn main() {
     {
         let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("--softgl-replay") {
+            // --softgl-replay <trace.jsonl> <out prefix> [draws]: the trace's frame drawn again in
+            // software; <out>.rgba (rows as GL keeps them) and <out>.owner (i32 per pixel: the
+            // last draw of the frame that changed it, -1 none).
+            let (Some(trace), Some(out)) = (args.get(2), args.get(3)) else {
+                eprintln!("usage: dcr-probe --softgl-replay <trace.jsonl> <out prefix> [draws]");
+                std::process::exit(2)
+            };
+            let stop = args.get(4).and_then(|s| s.parse().ok());
+            let t0 = Instant::now();
+            match vm_rust::rendering_gpu::softgl::replay::replay(trace, stop) {
+                Ok(r) => {
+                    let _ = std::fs::write(format!("{out}.rgba"), &r.pixels);
+                    let owner: Vec<u8> = r.owner.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let _ = std::fs::write(format!("{out}.owner"), owner);
+                    println!("[replay] frame {} {}x{}: {} draws in {:.2} s", r.frame, r.width, r.height, r.draws, t0.elapsed().as_secs_f64());
+                    let (ts, tx, _) = vm_rust::rendering_gpu::softgl::take_times();
+                    println!("[replay] all frames: {ts:.1} ms draw setup, {tx:.1} ms pixels");
+                    for note in vm_rust::rendering_gpu::softgl::take_pick() {
+                        println!("[pick] {note}");
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("[replay] {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         if args.get(1).map(String::as_str) == Some("--blit-selftest") {
             let n = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20_000);
             std::process::exit(if blit_selftest(n) { 0 } else { 1 });
@@ -688,6 +865,9 @@ fn main() {
                     Act::Snap(name) => save(&player, &out, &name),
                     Act::Eval(expr) => show(&player, &expr).await,
                     Act::Lingo => dump_lingo(&out.join("lingo")),
+                    Act::W3d => dump_w3d(),
+                    Act::Bitmaps => dump_bitmaps(),
+                    Act::Sprites => dump_sprites(),
                 }
             }
             // ---- the next score frame once it is due, as the console's loop runs it
@@ -780,6 +960,18 @@ fn main() {
             if now >= next_status {
                 let window = now - status_since;
                 let fr = (steps - window_steps).max(1) as f64;
+                {
+                    let (f3, t3, p3) = vm_rust::rendering_gpu::softgl::take_stats();
+                    let inc = vm_rust::rendering_gpu::softgl::take_incomplete_samples();
+                    if f3 > 0 {
+                        println!("[probe]          3d: {} sprite frames, {} triangles, {} fragments per frame; {} samples of incomplete textures", f3, t3 / f3, p3 / f3, inc);
+                        let (ts, tx, tf) = vm_rust::rendering_gpu::softgl::take_times();
+                        println!("[probe]          3d ms per frame: {:.1} in all, {:.1} draw setup, {:.1} pixels", tf / f3 as f64, ts / f3 as f64, tx / f3 as f64);
+                    }
+                    for l in vm_rust::rendering_gpu::softgl::take_pick().iter().rev().take(12).rev() {
+                        println!("[pick] {l}");
+                    }
+                }
                 println!(
                     "[probe] {now:>6.1} s: frame {}, tempo {tempo}, playing {playing}, {:.1} frames/s, {:.1} draws/s, {} voices, peak {peak:.2}; ms per frame: lingo {:.1} (cpu {:.1}), draw {:.1} (cpu {:.1}); allocs per frame: lingo {} ({} KB, {} >=64K), draw {} ({} KB, {} >=64K)",
                     player.current_frame(),

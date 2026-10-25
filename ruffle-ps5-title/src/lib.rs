@@ -65,6 +65,17 @@
 //! RADV link recipe had bound it to the platform layer's stand-in, which answers every lookup
 //! EAI_FAIL (build-title.sh V10) — and the resolver's lines are in ruffle.log (shell V7).
 //!
+//! 1.000.030 (2026-10-25): Shockwave 3D. DirPlayer moves to its cham/w3d-fullscreen branch
+//! (b9b9466: main plus its Shockwave 3D work), and the patch adds `rendering_gpu/softgl`: DirPlayer's
+//! own WebGL2 3D renderer (scene3d.rs, unchanged but for its imports) runs on a software WebGL2 —
+//! the GL pipeline in Rust, its four GLSL programs ported — and the stage compositor puts each 3D
+//! sprite where DirPlayer's WebGL compositor does. Checked by replaying a game's recorded WebGL
+//! calls in Chromium's WebGL2 with the original GLSL (`dcr-probe --softgl-replay`). The pixels are
+//! written by up to 8 threads (the CPUs the CPU layout leaves the game); ruffle.log gets a
+//! "Shockwave 3D" line with the per-frame times. Supersonic RC: the ceiling slabs drew black — a
+//! lightmap named "...LightingMap" behind an empty first texture slot was taken for the diffuse
+//! texture (DirPlayer fix in the patch).
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -72,7 +83,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.029";
+pub const APP_VERSION: &str = "1.000.030";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 
