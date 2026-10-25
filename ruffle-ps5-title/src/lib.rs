@@ -99,6 +99,8 @@
 //! answers (src/fsutil.rs). ruffle.log keeps the runs before (shell V8: trimmed to its last 512 KB
 //! past 1 MB, each run headed with its date); a watchdog names the step of a game's loop that takes
 //! 5 s or more (src/watchdog.rs). A folder with a Director movie and a .swf plays the movie.
+//! Flash Browser lists the Internet Archive and Flashpoint: Flash Museum's file server refused
+//! the movies (403 Forbidden), so it is no longer a source.
 //!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later

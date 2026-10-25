@@ -1269,7 +1269,7 @@ impl Online {
         self.draw_shelf(ui, scene);
     }
 
-    /// "Internet Archive | Flash Museum | Flashpoint" with the current one lit, at the shelf's head.
+    /// "Internet Archive | Flashpoint" (SOURCES) with the current one lit, at the shelf's head.
     fn draw_source_switch(&self, ui: &mut Ui, scene: &mut Scene) {
         let mut x = crate::menu::RIGHT;
         for (i, s) in SOURCES.iter().enumerate().rev() {

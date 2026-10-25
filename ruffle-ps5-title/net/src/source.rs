@@ -11,7 +11,11 @@ pub enum Source {
     Flashpoint,
 }
 
-pub const SOURCES: [Source; 3] = [Source::InternetArchive, Source::FlashMuseum, Source::Flashpoint];
+/// The sources Flash Browser lists, in its order. 1.000.032: Flash Museum is no longer one of them.
+/// Its file server refused the movies on the console ("403 Forbidden" for games.flashmuseum.net,
+/// 2026-10-25), and Ruffle5 does not try to get around a site refusing it. Its code (src/fm.rs)
+/// stays; games fetched from it before still play (their online.txt names the movie).
+pub const SOURCES: [Source; 2] = [Source::InternetArchive, Source::Flashpoint];
 
 impl Source {
     pub fn name(self) -> &'static str {
@@ -50,7 +54,7 @@ impl Source {
     }
 
     pub fn from_site(s: &str) -> Option<Source> {
-        SOURCES.into_iter().find(|x| x.site() == s.trim())
+        [Source::InternetArchive, Source::FlashMuseum, Source::Flashpoint].into_iter().find(|x| x.site() == s.trim())
     }
 
     /// A page of results: `words` empty lists everything, as [`Source::listing`] says.
