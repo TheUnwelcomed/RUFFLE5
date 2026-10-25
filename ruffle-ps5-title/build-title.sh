@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PS5_RUFFLE_TITLE_BUILD_V6 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
+# PS5_RUFFLE_TITLE_BUILD_V7 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
 # under Games. Phase 3a by default (wgpu on the static RADV clears the display); 3b with --ruffle.
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
@@ -193,10 +193,17 @@ for o in "${OBJS[@]}" "${RUNTIME_OBJS[@]}" "${RUST_LIBS[@]}" "$RADV_ARCHIVE" "$P
     "$NM" -u "$o" 2>/dev/null | grep -oE '\bsce[A-Za-z0-9_]+' || true
 done | sort -u > "$UNDEF"
 PRX_STUB_SOS=()
-for base in libSceVideodec2 libSceAudiodec libSceAgc libSceAgcDriver libSceCommonDialog libSceWebBrowserDialog; do
+# libSceKeyboard / libSceMouse (1.000.023, shell/hid.c V3): imported directly, as Ruffle-Flash-PS5
+# and ProsperoLight do; the SDK's own stub is used when it has one (it has libSceKeyboard, not
+# libSceMouse).
+for base in libSceVideodec2 libSceAudiodec libSceAgc libSceAgcDriver libSceCommonDialog libSceWebBrowserDialog \
+            libSceKeyboard libSceMouse; do
+    case "$base" in libSceKeyboard|libSceMouse) [[ -f "$STUBDIR/$base.so" ]] && continue ;; esac
     csrc="$BUILD/stubs/$base.c"; : > "$csrc"
     while read -r s; do
         case "$base" in
+            libSceKeyboard) [[ "$s" == sceKeyboard* ]] || continue ;;
+            libSceMouse)    [[ "$s" == sceMouse* ]] || continue ;;
             libSceAgcDriver) [[ "$s" == sceAgcDriver* ]] || continue ;;
             libSceAgc)       [[ "$s" == sceAgc* && "$s" != sceAgcDriver* ]] || continue ;;
             libSceVideodec2) [[ "$s" == sceVideodec2* ]] || continue ;;

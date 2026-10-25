@@ -62,6 +62,7 @@ pub const MOUSE_MIDDLE: u32 = 4;
 extern "C" {
     fn ps5_hid_load(which: i32, detail: *mut i32) -> i32;
     fn ps5_hid_sysmodule_rc(which: i32) -> i32;
+    fn ps5_hid_source(which: i32) -> i32;
     fn ps5_hid_init(which: i32) -> i32;
     fn ps5_hid_open(which: i32, user: i32, index: i32) -> i32;
     fn ps5_hid_read(which: i32, handle: i32, data: *mut u8, count: i32) -> i32;
@@ -157,7 +158,7 @@ impl Hid {
             let sysmodule = unsafe { ps5_hid_sysmodule_rc(which) } as u32;
             if rc != 0 {
                 let step = match rc {
-                    -3 => "a system call is not bound",
+                    -3 => "functions not bound: no direct imports, no handle lookup",
                     -1 => "no module handle",
                     -2 => "functions not found",
                     _ => "failed",
@@ -168,7 +169,12 @@ impl Hid {
                 ));
                 continue;
             }
-            hid.report.push(format!("usb {what}: sysmodule load 0x{sysmodule:08x}, module handle {detail}"));
+            let how = match unsafe { ps5_hid_source(which) } {
+                1 => "direct imports".to_string(),
+                2 => format!("module handle {detail}"),
+                _ => "?".to_string(),
+            };
+            hid.report.push(format!("usb {what}: sysmodule load 0x{sysmodule:08x}, functions via {how}"));
             let init = unsafe { ps5_hid_init(which) };
             let mut opened = Vec::new();
             for index in 0..INDEXES {

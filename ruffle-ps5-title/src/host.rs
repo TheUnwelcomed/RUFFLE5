@@ -70,6 +70,11 @@ pub extern "C" fn ps5_hid_sysmodule_rc(_which: i32) -> i32 {
 }
 
 #[no_mangle]
+pub extern "C" fn ps5_hid_source(_which: i32) -> i32 {
+    0
+}
+
+#[no_mangle]
 pub extern "C" fn ps5_hid_init(_which: i32) -> i32 {
     -1
 }

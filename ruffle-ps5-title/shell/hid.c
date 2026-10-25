@@ -1,4 +1,4 @@
-/* PS5_RUFFLE_HID_V2 — a USB keyboard and mouse, for src/hid.rs.
+/* PS5_RUFFLE_HID_V3 — a USB keyboard and mouse, for src/hid.rs.
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * libSceKeyboard and libSceMouse are not loaded for a title. They are system modules: loaded with
@@ -21,6 +21,14 @@
  *     answer (ps5_hid_sysmodule_rc) and the handle lookup's (the `detail` of step -1).
  * Research: reports/PS5 homebrew USB keyboard input.md (2026-10-24).
  *
+ * V3 (1.000.023), after V2 on hardware: both sysmodule loads answered 0 (loading first works), but
+ * sceSysmoduleGetModuleHandleInternal is an import this console leaves unbound ("step -3, 1").
+ * So the functions are now imported directly, as Ruffle-Flash-PS5 (ps5/scripts/ps5_early.c) and
+ * ProsperoLight (hardware-checked keyboard and mouse) do: build-title.sh links stubs for
+ * libSceKeyboard and libSceMouse, and the loader binds the imports once the sysmodule is loaded.
+ * They are read through volatile pointers, since an unbound import reads as NULL. The handle
+ * lookup stays as the second way, for a console that exports it.
+ *
  * The system calls it does use are checked first against the title's import table (build-title.sh
  * links a table of every import; one the console does not export is bound to NULL, and calling it
  * would end the title): `ps5_import_missing`, also used by src/cpu.rs.
@@ -36,6 +44,35 @@ int32_t sceSysmoduleLoadModule(uint16_t id);
  * NULL (build-title.sh links with -z nodynamic-undefined-weak) and step -3 says so. */
 __attribute__((weak)) int32_t sceSysmoduleGetModuleHandleInternal(uint32_t id, int32_t *handle);
 int sceKernelDlsym(int handle, const char *symbol, void **address);
+
+/* Imported directly (build-title.sh: stubs for libSceKeyboard.sprx and libSceMouse.sprx). */
+int sceKeyboardInit(void);
+int sceKeyboardOpen(int user, int type, int index, const void *param);
+int sceKeyboardRead(int handle, void *data, int count);
+int sceKeyboardClose(int handle);
+int sceMouseInit(void);
+int sceMouseOpen(int user, int type, int index, const void *param);
+int sceMouseRead(int handle, void *data, int count);
+int sceMouseClose(int handle);
+
+/* The direct imports for the keyboard (0) or mouse (1); NULL where the loader left one unbound. */
+static void direct_imports(int which, void *fns[4])
+{
+    void *volatile v[4];
+    if (which == 0) {
+        v[0] = (void *)sceKeyboardInit;
+        v[1] = (void *)sceKeyboardOpen;
+        v[2] = (void *)sceKeyboardRead;
+        v[3] = (void *)sceKeyboardClose;
+    } else {
+        v[0] = (void *)sceMouseInit;
+        v[1] = (void *)sceMouseOpen;
+        v[2] = (void *)sceMouseRead;
+        v[3] = (void *)sceMouseClose;
+    }
+    for (int i = 0; i < 4; i++)
+        fns[i] = v[i];
+}
 
 /* From the import table build-title.sh links (import_check.c). */
 int ps5_import_count(void);
@@ -61,13 +98,14 @@ struct hid_api {
     int (*read)(int handle, void *data, int count);
     int (*close)(int handle);
     int32_t sysmodule_rc; /* sceSysmoduleLoadModule's answer; 1 = not called yet */
+    int source;           /* 1 direct imports, 2 the module handle; 0 none yet */
     int loaded;           /* 0 not tried, 1 ready, <0 the step that failed */
     int detail;
 };
 
 static struct hid_api g_hid[2] = {
-    { 0x0106, { "sceKeyboardInit", "sceKeyboardOpen", "sceKeyboardRead", "sceKeyboardClose" }, 0, 0, 0, 0, 1, 0, 0 },
-    { 0x00a9, { "sceMouseInit", "sceMouseOpen", "sceMouseRead", "sceMouseClose" }, 0, 0, 0, 0, 1, 0, 0 },
+    { 0x0106, { "sceKeyboardInit", "sceKeyboardOpen", "sceKeyboardRead", "sceKeyboardClose" }, 0, 0, 0, 0, 1, 0, 0, 0 },
+    { 0x00a9, { "sceMouseInit", "sceMouseOpen", "sceMouseRead", "sceMouseClose" }, 0, 0, 0, 0, 1, 0, 0, 0 },
 };
 
 /* Load both system modules. main() calls this before anything else; ps5_hid_load does it later
@@ -103,9 +141,10 @@ static int32_t sysmodule_handle(uint16_t id, int32_t *rc)
 }
 
 /* 0 when the keyboard (0) or mouse (1) functions are ready; else the failed step (<0):
- *   -3  a system call this needs is not bound (detail: which one, 0..2)
+ *   -3  not bound: sceSysmoduleLoadModule (detail 0), or neither the direct imports nor the
+ *       handle lookup (detail 1)
  *   -1  no handle for the module (detail: the handle lookup's answer)
- *   -2  the module has no such functions (detail: the handle) */
+ *   -2  the module has no such functions (detail: the handle; 0 for the direct imports) */
 int ps5_hid_load(int which, int32_t *detail)
 {
     if (which < 0 || which > 1)
@@ -115,28 +154,43 @@ int ps5_hid_load(int which, int32_t *detail)
         *detail = api->detail;
         return api->loaded > 0 ? 0 : api->loaded;
     }
-    static const char *const needed[] = { "sceSysmoduleLoadModule", "sceSysmoduleGetModuleHandleInternal", "sceKernelDlsym" };
-    for (size_t i = 0; i < sizeof(needed) / sizeof(needed[0]); i++) {
-        if (ps5_import_missing(needed[i]) || (i == 1 && !sceSysmoduleGetModuleHandleInternal)) {
-            api->loaded = -3;
-            api->detail = (int)i;
-            *detail = (int)i;
-            return -3;
-        }
+    if (ps5_import_missing("sceSysmoduleLoadModule")) {
+        api->loaded = -3;
+        api->detail = 0;
+        *detail = 0;
+        return -3;
     }
     if (api->sysmodule_rc == 1)
         api->sysmodule_rc = sceSysmoduleLoadModule(api->sysmodule);
-    int32_t lookup = 0;
-    int32_t handle = sysmodule_handle(api->sysmodule, &lookup);
-    if (handle < 0) {
-        api->loaded = -1;
-        api->detail = lookup;
-        *detail = lookup;
-        return -1;
-    }
     void *fns[4] = { NULL, NULL, NULL, NULL };
-    for (int i = 0; i < 4; i++)
-        sceKernelDlsym(handle, api->names[i], &fns[i]);
+    int32_t handle = 0;
+    /* 1. the direct imports, bound by the loader once the sysmodule is loaded */
+    direct_imports(which, fns);
+    if (fns[0] && fns[1] && fns[2]) {
+        api->source = 1;
+    } else {
+        /* 2. the module's handle (a console that exports the lookup) and its functions */
+        if (!sceSysmoduleGetModuleHandleInternal || ps5_import_missing("sceSysmoduleGetModuleHandleInternal") ||
+            ps5_import_missing("sceKernelDlsym")) {
+            api->loaded = -3;
+            api->detail = 1;
+            *detail = 1;
+            return -3;
+        }
+        int32_t lookup = 0;
+        handle = sysmodule_handle(api->sysmodule, &lookup);
+        if (handle < 0) {
+            api->loaded = -1;
+            api->detail = lookup;
+            *detail = lookup;
+            return -1;
+        }
+        for (int i = 0; i < 4; i++) {
+            fns[i] = NULL;
+            sceKernelDlsym(handle, api->names[i], &fns[i]);
+        }
+        api->source = 2;
+    }
     api->init = (int (*)(void))fns[0];
     api->open = (int (*)(int, int, int, const void *))fns[1];
     api->read = (int (*)(int, void *, int))fns[2];
@@ -151,6 +205,12 @@ int ps5_hid_load(int which, int32_t *detail)
     api->detail = handle;
     *detail = handle;
     return 0;
+}
+
+/* How the keyboard (0) or mouse (1) functions were found: 1 direct imports, 2 module handle. */
+int ps5_hid_source(int which)
+{
+    return which >= 0 && which <= 1 ? g_hid[which].source : 0;
 }
 
 int ps5_hid_init(int which)

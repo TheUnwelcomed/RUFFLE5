@@ -248,6 +248,104 @@ index f1191b9..7233759 100644
                                      "32-bit decode: Out of bounds at y={}, x={}. line_offset={}, result.len()={} (further warnings suppressed)",
                                      y, x, line_offset, result.len()
                                  ).into());
+diff --git a/vm-rust/src/player/bitmap/drawing.rs b/vm-rust/src/player/bitmap/drawing.rs
+index 280387c..03c5c70 100644
+--- a/vm-rust/src/player/bitmap/drawing.rs
++++ b/vm-rust/src/player/bitmap/drawing.rs
+@@ -1,5 +1,54 @@
+ use std::collections::HashMap;
+ 
++/// PS5_RUFFLE_DIRPLAYER_NATIVE: what drawing sprites costs, for the console's frame log (Ruffle5
++/// prints it every 5 s; dcr-probe on a PC). Counters only; no effect on what is drawn. Off the web
++/// only (no clock there).
++pub mod draw_stats {
++    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++    /// copyPixels-style blits, their nanoseconds, destination pixels; matte masks built, their
++    /// nanoseconds, source pixels scanned.
++    pub static COPIES: AtomicU64 = AtomicU64::new(0);
++    pub static COPY_NS: AtomicU64 = AtomicU64::new(0);
++    pub static COPY_PIXELS: AtomicU64 = AtomicU64::new(0);
++    pub static MATTES: AtomicU64 = AtomicU64::new(0);
++    pub static MATTE_NS: AtomicU64 = AtomicU64::new(0);
++    pub static MATTE_PIXELS: AtomicU64 = AtomicU64::new(0);
++
++    #[cfg(not(target_arch = "wasm32"))]
++    pub type Mark = std::time::Instant;
++    #[cfg(target_arch = "wasm32")]
++    pub type Mark = ();
++
++    #[inline]
++    pub fn mark() -> Mark {
++        #[cfg(not(target_arch = "wasm32"))]
++        {
++            std::time::Instant::now()
++        }
++    }
++
++    #[inline]
++    pub fn add(counter: &AtomicU64, ns: &AtomicU64, since: Mark) {
++        counter.fetch_add(1, Relaxed);
++        #[cfg(not(target_arch = "wasm32"))]
++        ns.fetch_add(since.elapsed().as_nanos() as u64, Relaxed);
++        #[cfg(target_arch = "wasm32")]
++        let _ = (ns, since);
++    }
++
++    /// (blits, ms, megapixels, matte masks, ms, megapixels) since the last call.
++    pub fn take() -> (u64, f64, f64, u64, f64, f64) {
++        (
++            COPIES.swap(0, Relaxed),
++            COPY_NS.swap(0, Relaxed) as f64 / 1e6,
++            COPY_PIXELS.swap(0, Relaxed) as f64 / 1e6,
++            MATTES.swap(0, Relaxed),
++            MATTE_NS.swap(0, Relaxed) as f64 / 1e6,
++            MATTE_PIXELS.swap(0, Relaxed) as f64 / 1e6,
++        )
++    }
++}
++
+ use rgb565::Rgb565;
+ 
+ use crate::{
+@@ -2134,6 +2183,21 @@ impl Bitmap {
+         dst_rect: IntRect,
+         src_rect: IntRect,
+         params: &CopyPixelsParams,
++    ) {
++        let started = draw_stats::mark();
++        let area = (dst_rect.width().max(0) as u64) * (dst_rect.height().max(0) as u64);
++        self.copy_pixels_with_params_timed(palettes, src, dst_rect, src_rect, params);
++        draw_stats::COPY_PIXELS.fetch_add(area, std::sync::atomic::Ordering::Relaxed);
++        draw_stats::add(&draw_stats::COPIES, &draw_stats::COPY_NS, started);
++    }
++
++    fn copy_pixels_with_params_timed(
++        &mut self,
++        palettes: &PaletteMap,
++        src: &Bitmap,
++        dst_rect: IntRect,
++        src_rect: IntRect,
++        params: &CopyPixelsParams,
+     ) {
+         // Destination pixels are about to change, so retire anything keyed on the
+         // old contents. The WebGL2 texture cache keys on `bitmap.version`
+@@ -2395,6 +2459,7 @@ impl Bitmap {
+             };
+ 
+         if needs_matte_mask {
++            let matte_started = draw_stats::mark();
+             let width = src.width as usize;
+             let height = src.height as usize;
+ 
+@@ -2451,6 +2516,8 @@ impl Bitmap {
+             }
+ 
+             matte_mask = Some(mask);
++            draw_stats::MATTE_PIXELS.fetch_add((width * height) as u64, std::sync::atomic::Ordering::Relaxed);
++            draw_stats::add(&draw_stats::MATTES, &draw_stats::MATTE_NS, matte_started);
+         }
+ 
+         // ---------------- Fast path: unscaled, unrotated, same-palette 8-bit blit ----------------
 diff --git a/vm-rust/src/player/bytecode/string.rs b/vm-rust/src/player/bytecode/string.rs
 index 7b6a277..70b2b65 100644
 --- a/vm-rust/src/player/bytecode/string.rs
@@ -953,7 +1051,7 @@ index ad5a8a0..98a5357 100644
                          "  ❌ Cannot get sub-prop '{}' from type {}",
                          formatted_key,
 diff --git a/vm-rust/src/player/mod.rs b/vm-rust/src/player/mod.rs
-index 8fef74e..8a030e9 100644
+index 8fef74e..9e1f43f 100644
 --- a/vm-rust/src/player/mod.rs
 +++ b/vm-rust/src/player/mod.rs
 @@ -54,6 +54,22 @@ pub mod console;
@@ -1028,7 +1126,41 @@ index 8fef74e..8a030e9 100644
      let id = unsafe { ACTIVE_PLAYER_ID };
      raw(WithActivePlayer { id, inner: fut });
  }
-@@ -5445,7 +5461,7 @@ async fn run_movie_init_sequence() {
+@@ -4813,7 +4829,10 @@ pub async fn player_call_script_handler_raw_args(
+     // On each BACKWARD jump (a loop iteration) we check elapsed time and, past a
+     // frame's worth, yield a real macrotask so queued input events fire, then
+     // resume. Time-budgeted so ordinary fast compute loops are unaffected.
+-    let mut last_yield_ms = chrono::Utc::now().timestamp_millis();
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: read the clock only when the yield check below first needs it
++    // (after 4096 polled backward jumps), not on every handler call: a clock read per call was
++    // ~9% of a fighting game's frame on Linux, and the console's clock is no cheaper.
++    let mut last_yield_ms: i64 = i64::MIN;
+     // Count backward jumps to distinguish a TIGHT busy-wait (thousands of
+     // iterations/ms — `repeat while keyPressed`) from a heavy COMPUTE loop (a
+     // few iterations, each doing real work — the game's `drawmap`/water
+@@ -4882,7 +4901,9 @@ pub async fn player_call_script_handler_raw_args(
+                         if backjumps >= 4096 {
+                             backjumps = 0;
+                             let now = chrono::Utc::now().timestamp_millis();
+-                            if now - last_yield_ms >= 16 {
++                            if last_yield_ms == i64::MIN {
++                                last_yield_ms = now;
++                            } else if now - last_yield_ms >= 16 {
+                                 last_yield_ms = now;
+                                 let _ = timeout(
+                                     Duration::from_millis(1),
+@@ -5188,7 +5209,9 @@ pub async fn player_call_script_handler_raw_args(
+                     if backjumps >= 4096 {
+                         backjumps = 0;
+                         let now = chrono::Utc::now().timestamp_millis();
+-                        if now - last_yield_ms >= 16 {
++                        if last_yield_ms == i64::MIN {
++                            last_yield_ms = now;
++                        } else if now - last_yield_ms >= 16 {
+                             last_yield_ms = now;
+                             let _ = timeout(
+                                 Duration::from_millis(1),
+@@ -5445,7 +5468,7 @@ async fn run_movie_init_sequence() {
      dispatch_system_event_to_timeouts(BuiltInSymbol::PrepareMovie, &vec![]).await;
  
      if let Err(err) = player_invoke_global_event(Symbol::builtin(BuiltInSymbol::PrepareMovie), &vec![]).await {

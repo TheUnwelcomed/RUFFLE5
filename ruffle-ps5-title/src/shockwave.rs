@@ -194,11 +194,89 @@ impl Drop for DcrAudio {
 }
 
 /// Play Director game `gi` of the menu's list until it is left.
+/// What the console's CPU, clock and memory cost, measured once (the first Shockwave game of a run)
+/// and logged: dcr-probe's `bench` prints the same on a PC, so the two can be compared when a
+/// Director game is slower here than there. About half a second.
+pub fn bench() -> String {
+    use std::hint::black_box;
+    let ns = |t: Instant, n: f64| t.elapsed().as_nanos() as f64 / n;
+    // the clock (Instant: CLOCK_MONOTONIC; SystemTime: CLOCK_REALTIME, what chrono::Utc::now reads)
+    let n = 20_000.0;
+    let t = Instant::now();
+    for _ in 0..20_000 {
+        black_box(Instant::now());
+    }
+    let mono = ns(t, n);
+    let t = Instant::now();
+    for _ in 0..20_000 {
+        black_box(std::time::SystemTime::now());
+    }
+    let wall = ns(t, n);
+    // integer work (xorshift)
+    let t = Instant::now();
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    for _ in 0..20_000_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+    }
+    black_box(x);
+    let int_ns = ns(t, 20e6);
+    // small allocations (Lingo makes ~65 000 a frame), then 1 MiB ones written in full
+    let t = Instant::now();
+    for i in 0..100_000u32 {
+        black_box(Box::new([i as u8; 48]));
+    }
+    let small = ns(t, 100_000.0);
+    let t = Instant::now();
+    for _ in 0..20 {
+        black_box(vec![1u8; 1 << 20]);
+    }
+    let big_us = ns(t, 20.0) / 1000.0;
+    // memory: read-modify-write passes over a buffer that fits L2, L3, and one that does not
+    let mut bw = Vec::new();
+    for kib in [64usize, 1024, 8192] {
+        let mut buf = vec![1u32; kib * 256];
+        let passes = (32 * 1024 / kib).max(4);
+        let t = Instant::now();
+        let mut sum = 0u64;
+        for _ in 0..passes {
+            for v in buf.iter_mut() {
+                *v = v.wrapping_add(1);
+                sum = sum.wrapping_add(*v as u64);
+            }
+        }
+        black_box(sum);
+        let mb = (kib * passes) as f64 / 1024.0;
+        bw.push(format!("{kib} KiB {:.0} MB/s", mb / t.elapsed().as_secs_f64()));
+    }
+    // a blit like DirPlayer's: 600x400 RGBA, per-pixel f32 blend, 10 passes
+    let src = vec![0x80u8; 600 * 400 * 4];
+    let mut dst = vec![0x40u8; 600 * 400 * 4];
+    let t = Instant::now();
+    for pass in 0..10 {
+        let a = 0.25 + pass as f32 * 0.05;
+        for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            for k in 0..3 {
+                d[k] = (s[k] as f32 * a + d[k] as f32 * (1.0 - a)) as u8;
+            }
+        }
+    }
+    black_box(&dst);
+    let blit = ns(t, 10.0 * 600.0 * 400.0);
+    format!(
+        "bench: clock {mono:.0} ns (monotonic), {wall:.0} ns (realtime); int {int_ns:.2} ns/op; alloc 48 B {small:.0} ns, 1 MiB {big_us:.0} us; memory {}; blend {blit:.1} ns/px",
+        bw.join(", ")
+    )
+}
+
 pub fn play(app: &mut App, gi: usize) -> GameEnd {
     let Some(g) = app.menu.games.get(gi) else {
         return GameEnd::Menu;
     };
     let (name, thumb, accent) = (g.name.clone(), g.thumb, g.accent);
+    static BENCHED: std::sync::Once = std::sync::Once::new();
+    BENCHED.call_once(|| say(&format!("shockwave {}", bench())));
     // DirPlayer reads the movie on this thread: show the loading screen for a moment first.
     let shown = Instant::now();
     let mut events = Vec::new();
@@ -601,6 +679,18 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
                 steps as f64 / window,
                 d.presents as f64 / window,
                 native_audio::playing()
+            ));
+            let (copies, copy_ms, copy_mpx, mattes, matte_ms, matte_mpx) =
+                vm_rust::player::bitmap::drawing::draw_stats::take();
+            let per = |v: f64| v / drawn.max(1) as f64;
+            say(&format!(
+                "[Game] Shockwave draw per stage: {:.0} blits ({:.2} Mpx) {:.1} ms, of which {:.0} matte masks ({:.2} Mpx) {:.1} ms",
+                per(copies as f64),
+                per(copy_mpx),
+                per(copy_ms),
+                per(mattes as f64),
+                per(matte_mpx),
+                per(matte_ms)
             ));
             (ticks, steps, drawn) = (0, 0, 0);
             spent = [0.0; 3];

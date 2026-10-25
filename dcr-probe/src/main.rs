@@ -19,13 +19,52 @@
 //! Sound goes nowhere, but it is mixed as the console would (`native_audio::mix`, in step with the
 //! clock), so a sound's end reaches the movie as it would there; the status line counts the voices.
 //!
+//! DCR_PROBE_BENCH=1 first prints the CPU / clock / memory benchmark Ruffle5 logs on the console.
+//!
+//! The status line also gives the milliseconds a score frame takes (lingo) and, with
+//! DCR_PROBE_RENDER=1 set, what rendering the stage after every frame takes (draw), as on the console.
+//!
 //! At the end (and when the score stays on one frame for 10 s) the probe prints the movie's state:
 //! its name and path, the frame and its label, the labels, every cast library with its file and
 //! member count, and what each sprite channel shows.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
+
+/// Counts allocations (calls and bytes; and those of 64 KiB or more) so the status line can say
+/// what a score frame and a stage render allocate — memory the console's allocator has to serve.
+struct Counting;
+static ALLOCS: AtomicU64 = AtomicU64::new(0);
+static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static BIG_ALLOCS: AtomicU64 = AtomicU64::new(0);
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        ALLOCS.fetch_add(1, Relaxed);
+        ALLOC_BYTES.fetch_add(l.size() as u64, Relaxed);
+        if l.size() >= 65536 {
+            BIG_ALLOCS.fetch_add(1, Relaxed);
+        }
+        std::alloc::System.alloc(l)
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        std::alloc::System.dealloc(p, l)
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
+        ALLOCS.fetch_add(1, Relaxed);
+        ALLOC_BYTES.fetch_add(n as u64, Relaxed);
+        if n >= 65536 {
+            BIG_ALLOCS.fetch_add(1, Relaxed);
+        }
+        std::alloc::System.realloc(p, l, n)
+    }
+}
+#[global_allocator]
+static GLOBAL: Counting = Counting;
+fn alloc_counts() -> (u64, u64, u64) {
+    (ALLOCS.load(Relaxed), ALLOC_BYTES.load(Relaxed), BIG_ALLOCS.load(Relaxed))
+}
 
 use vm_rust::player::testing::{run_test, StageSnapshot, TestPlayer};
 use vm_rust::player::testing_shared::TestHarness;
@@ -199,7 +238,85 @@ fn dump_lingo(dir: &Path) {
     println!("[probe] lingo: {files} scripts, {handlers} handlers -> {}", dir.display());
 }
 
+/// The same measurements Ruffle5 logs once on the console (ruffle-ps5-title/src/shockwave.rs
+/// `bench`; keep the two identical), printed here with DCR_PROBE_BENCH=1 for comparison.
+fn bench() -> String {
+    use std::hint::black_box;
+    let ns = |t: Instant, n: f64| t.elapsed().as_nanos() as f64 / n;
+    // the clock (Instant: CLOCK_MONOTONIC; SystemTime: CLOCK_REALTIME, what chrono::Utc::now reads)
+    let n = 20_000.0;
+    let t = Instant::now();
+    for _ in 0..20_000 {
+        black_box(Instant::now());
+    }
+    let mono = ns(t, n);
+    let t = Instant::now();
+    for _ in 0..20_000 {
+        black_box(std::time::SystemTime::now());
+    }
+    let wall = ns(t, n);
+    // integer work (xorshift)
+    let t = Instant::now();
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    for _ in 0..20_000_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+    }
+    black_box(x);
+    let int_ns = ns(t, 20e6);
+    // small allocations (Lingo makes ~65 000 a frame), then 1 MiB ones written in full
+    let t = Instant::now();
+    for i in 0..100_000u32 {
+        black_box(Box::new([i as u8; 48]));
+    }
+    let small = ns(t, 100_000.0);
+    let t = Instant::now();
+    for _ in 0..20 {
+        black_box(vec![1u8; 1 << 20]);
+    }
+    let big_us = ns(t, 20.0) / 1000.0;
+    // memory: read-modify-write passes over a buffer that fits L2, L3, and one that does not
+    let mut bw = Vec::new();
+    for kib in [64usize, 1024, 8192] {
+        let mut buf = vec![1u32; kib * 256];
+        let passes = (32 * 1024 / kib).max(4);
+        let t = Instant::now();
+        let mut sum = 0u64;
+        for _ in 0..passes {
+            for v in buf.iter_mut() {
+                *v = v.wrapping_add(1);
+                sum = sum.wrapping_add(*v as u64);
+            }
+        }
+        black_box(sum);
+        let mb = (kib * passes) as f64 / 1024.0;
+        bw.push(format!("{kib} KiB {:.0} MB/s", mb / t.elapsed().as_secs_f64()));
+    }
+    // a blit like DirPlayer's: 600x400 RGBA, per-pixel f32 blend, 10 passes
+    let src = vec![0x80u8; 600 * 400 * 4];
+    let mut dst = vec![0x40u8; 600 * 400 * 4];
+    let t = Instant::now();
+    for pass in 0..10 {
+        let a = 0.25 + pass as f32 * 0.05;
+        for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            for k in 0..3 {
+                d[k] = (s[k] as f32 * a + d[k] as f32 * (1.0 - a)) as u8;
+            }
+        }
+    }
+    black_box(&dst);
+    let blit = ns(t, 10.0 * 600.0 * 400.0);
+    format!(
+        "bench: clock {mono:.0} ns (monotonic), {wall:.0} ns (realtime); int {int_ns:.2} ns/op; alloc 48 B {small:.0} ns, 1 MiB {big_us:.0} us; memory {}; blend {blit:.1} ns/px",
+        bw.join(", ")
+    )
+}
+
 fn main() {
+    if std::env::var_os("DCR_PROBE_BENCH").is_some() {
+        println!("[probe] {}", bench());
+    }
     let args: Vec<String> = std::env::args().collect();
     let mut every = 2.0f64;
     let mut pos: Vec<String> = Vec::new();
@@ -248,6 +365,9 @@ fn main() {
         let (mut mixed_to, mut mix_buf, mut peak) = (t0.elapsed().as_secs_f64(), Vec::<f32>::new(), 0.0f32);
         let mut next_status = 1.0;
         let mut steps = 0u64;
+        let render_each = std::env::var_os("DCR_PROBE_RENDER").is_some();
+        let (mut step_ms, mut draw_ms, mut draws, mut window_steps) = (0.0f64, 0.0f64, 0u64, 0u64);
+        let (mut step_alloc, mut draw_alloc) = ((0u64, 0u64, 0u64), (0u64, 0u64, 0u64));
         let mut todo = script.into_iter().peekable();
         loop {
             let now = t0.elapsed().as_secs_f64();
@@ -282,8 +402,22 @@ fn main() {
                     Act::Lingo => dump_lingo(&out.join("lingo")),
                 }
             }
+            let t_step = Instant::now();
+            let a0 = alloc_counts();
             let playing = player.step_frame().await;
+            let a1 = alloc_counts();
+            step_ms += t_step.elapsed().as_secs_f64() * 1000.0;
+            step_alloc = (step_alloc.0 + a1.0 - a0.0, step_alloc.1 + a1.1 - a0.1, step_alloc.2 + a1.2 - a0.2);
             steps += 1;
+            // DCR_PROBE_RENDER=1: render the stage after every frame, as the console does, and time it
+            if render_each {
+                let t_draw = Instant::now();
+                let _ = player.snapshot_stage();
+                let a2 = alloc_counts();
+                draw_ms += t_draw.elapsed().as_secs_f64() * 1000.0;
+                draw_alloc = (draw_alloc.0 + a2.0 - a1.0, draw_alloc.1 + a2.1 - a1.1, draw_alloc.2 + a2.2 - a1.2);
+                draws += 1;
+            }
             // the speaker the console would have: mix what has played since the last frame
             let now_s = t0.elapsed().as_secs_f64();
             let frames = ((now_s - mixed_to) * 48_000.0) as usize;
@@ -297,10 +431,27 @@ fn main() {
             let now = t0.elapsed().as_secs_f64();
             if now >= next_status {
                 println!(
-                    "[probe] {now:>6.1} s: frame {}, playing {playing}, {steps} steps, {} voices, peak {peak:.2}",
+                    "[probe] {now:>6.1} s: frame {}, playing {playing}, {steps} steps, {} voices, peak {peak:.2}; ms per frame: lingo {:.1}, draw {:.1}; allocs per frame: lingo {} ({} KB, {} >=64K), draw {} ({} KB, {} >=64K)",
                     player.current_frame(),
-                    vm_rust::player::native_audio::playing()
+                    vm_rust::player::native_audio::playing(),
+                    step_ms / (steps - window_steps).max(1) as f64,
+                    draw_ms / draws.max(1) as f64,
+                    step_alloc.0 / (steps - window_steps).max(1),
+                    step_alloc.1 / 1024 / (steps - window_steps).max(1),
+                    step_alloc.2 / (steps - window_steps).max(1),
+                    draw_alloc.0 / draws.max(1),
+                    draw_alloc.1 / 1024 / draws.max(1),
+                    draw_alloc.2 / draws.max(1)
                 );
+                let (copies, copy_ms, copy_mpx, mattes, matte_ms, matte_mpx) =
+                    vm_rust::player::bitmap::drawing::draw_stats::take();
+                let per = |v: f64| v / draws.max(1) as f64;
+                println!(
+                    "[probe]          draw per frame: {:.0} blits ({:.2} Mpx) {:.1} ms, of which {:.0} matte masks ({:.2} Mpx) {:.1} ms",
+                    per(copies as f64), per(copy_mpx), per(copy_ms), per(mattes as f64), per(matte_mpx), per(matte_ms)
+                );
+                (step_ms, draw_ms, draws, window_steps) = (0.0, 0.0, 0, steps);
+                (step_alloc, draw_alloc) = ((0, 0, 0), (0, 0, 0));
                 peak = 0.0;
                 next_status += 1.0;
             }
