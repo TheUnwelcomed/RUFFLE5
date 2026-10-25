@@ -16,13 +16,24 @@
 //!   20 lingo             write every loaded script's Lingo (decompiled) to <out>/lingo/
 //! Keys: Enter Space Left Right Up Down Escape Shift Control Tab Backspace, a..z, 0..9.
 //!
+//! The movie runs as Ruffle5 runs it on the console (src/shockwave.rs): one score frame
+//! (`run_native_frame`, DirPlayer's per-frame steps for a native host) when the tempo says it is due,
+//! then the stage rendered, then the rest of a 60 Hz display refresh. The status line gives frames
+//! and renders a second, the milliseconds a frame (lingo) and a render (draw) take — wall time and
+//! this thread's CPU time — and what they allocate; a second line what the render's blits cost.
+//!
 //! Sound goes nowhere, but it is mixed as the console would (`native_audio::mix`, in step with the
 //! clock), so a sound's end reaches the movie as it would there; the status line counts the voices.
 //!
 //! DCR_PROBE_BENCH=1 first prints the CPU / clock / memory benchmark Ruffle5 logs on the console.
+//! DCR_PROBE_FAST=1: no waiting for the display refresh (frames still at most at the tempo).
+//! DCR_PROBE_COMPARE=1: every stage rendered a second time without DirPlayer's upright blit fast
+//! path and compared byte for byte (=2: with it, to check a render repeats exactly).
+//! DCR_PROBE_PROF=1: a sampling profile of the renders, written to <out>/prof.txt.
+//! With an LD_PRELOAD shim exporting `shim_clock_calls`, the clock reads a frame and a render make.
 //!
-//! The status line also gives the milliseconds a score frame takes (lingo) and, with
-//! DCR_PROBE_RENDER=1 set, what rendering the stage after every frame takes (draw), as on the console.
+//!   dcr-probe --blit-selftest [N]   N random blits (default 20000), each drawn with DirPlayer's
+//!                                   upright fast path and with its pixel loop: they must match.
 //!
 //! At the end (and when the score stays on one frame for 10 s) the probe prints the movie's state:
 //! its name and path, the frame and its label, the labels, every cast library with its file and
@@ -46,10 +57,10 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         if l.size() >= 65536 {
             BIG_ALLOCS.fetch_add(1, Relaxed);
         }
-        std::alloc::System.alloc(l)
+        unsafe { std::alloc::System.alloc(l) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
-        std::alloc::System.dealloc(p, l)
+        unsafe { std::alloc::System.dealloc(p, l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
         ALLOCS.fetch_add(1, Relaxed);
@@ -57,11 +68,106 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         if n >= 65536 {
             BIG_ALLOCS.fetch_add(1, Relaxed);
         }
-        std::alloc::System.realloc(p, l, n)
+        unsafe { std::alloc::System.realloc(p, l, n) }
     }
 }
 #[global_allocator]
 static GLOBAL: Counting = Counting;
+/// DCR_PROBE_PROF=1: a sampling profile of the stage render — SIGPROF every 250 us of CPU time
+/// records where the render thread is (its instruction pointer) while `PROF_ON` is set; the
+/// addresses are written to <out>/prof.txt at the end (symbolize with addr2line -f -i -C).
+mod prof {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    pub static PROF_ON: AtomicBool = AtomicBool::new(false);
+    const N: usize = 1 << 20;
+    static mut PCS: [u64; N] = [0; N];
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    #[repr(C)]
+    struct Timeval {
+        s: i64,
+        us: i64,
+    }
+    #[repr(C)]
+    struct Itimer {
+        interval: Timeval,
+        value: Timeval,
+    }
+    #[repr(C)]
+    struct Sigaction {
+        handler: usize,
+        mask: [u64; 16],
+        flags: i32,
+        restorer: usize,
+    }
+    unsafe extern "C" {
+        fn sigaction(sig: i32, act: *const Sigaction, old: *mut Sigaction) -> i32;
+        fn setitimer(which: i32, new: *const Itimer, old: *mut Itimer) -> i32;
+    }
+    extern "C" fn on_prof(_sig: i32, _info: *mut u8, ctx: *mut u8) {
+        if !PROF_ON.load(Ordering::Relaxed) || ctx.is_null() {
+            return;
+        }
+        let rip = unsafe { *(ctx.add(168) as *const u64) };
+        let i = COUNT.fetch_add(1, Ordering::Relaxed);
+        if i < N {
+            unsafe { PCS[i] = rip };
+        }
+    }
+    pub fn start() {
+        unsafe {
+            let act = Sigaction { handler: on_prof as *const () as usize, mask: [0; 16], flags: 0x4 | 0x10000000, restorer: 0 };
+            sigaction(27, &act, std::ptr::null_mut());
+            let t = Itimer { interval: Timeval { s: 0, us: 250 }, value: Timeval { s: 0, us: 250 } };
+            setitimer(2, &t, std::ptr::null_mut());
+        }
+    }
+    pub fn dump(path: &std::path::Path) {
+        let n = COUNT.load(Ordering::Relaxed).min(N);
+        // the executable's load address (PIE), from /proc/self/maps
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        let exe = std::fs::read_link("/proc/self/exe").unwrap_or_default();
+        let base = maps
+            .lines()
+            .find(|l| l.ends_with(exe.to_str().unwrap_or("?")))
+            .and_then(|l| u64::from_str_radix(l.split('-').next().unwrap_or("0"), 16).ok())
+            .unwrap_or(0);
+        let mut text = format!("base {base:x} samples {n}\n");
+        for i in 0..n {
+            let pc = unsafe { PCS[i] };
+            text += &format!("{:x}\n", pc.wrapping_sub(base));
+        }
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// This thread's CPU time in ms (CLOCK_THREAD_CPUTIME_ID): a frame's work without waits.
+fn thread_cpu_ms() -> f64 {
+    #[repr(C)]
+    struct Ts {
+        s: i64,
+        ns: i64,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(id: i32, ts: *mut Ts) -> i32;
+    }
+    let mut ts = Ts { s: 0, ns: 0 };
+    unsafe { clock_gettime(3, &mut ts) };
+    ts.s as f64 * 1000.0 + ts.ns as f64 / 1e6
+}
+
+/// clock_gettime calls so far, when an LD_PRELOAD shim exporting `shim_clock_calls` is loaded.
+fn clock_calls() -> u64 {
+    unsafe extern "C" {
+        fn dlsym(handle: *mut std::ffi::c_void, name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+    }
+    static F: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let f = *F.get_or_init(|| unsafe { dlsym(std::ptr::null_mut(), c"shim_clock_calls".as_ptr()) as usize });
+    if f == 0 {
+        return 0;
+    }
+    let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(f) };
+    f()
+}
 fn alloc_counts() -> (u64, u64, u64) {
     (ALLOCS.load(Relaxed), ALLOC_BYTES.load(Relaxed), BIG_ALLOCS.load(Relaxed))
 }
@@ -313,7 +419,139 @@ fn bench() -> String {
     )
 }
 
+/// `dcr-probe --blit-selftest N`: N random upright blits onto a 32-bit bitmap — indexed and
+/// RGBA sources, every ink the fast path takes and some it does not, masks, mattes, #blend, rects
+/// partly off both bitmaps — each drawn with DirPlayer's upright fast path and with its pixel
+/// loop; the two results must be the same bytes.
+fn blit_selftest(n: u32) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    use vm_rust::player::bitmap::bitmap::{BuiltInPalette, Bitmap, PaletteRef};
+    use vm_rust::player::bitmap::drawing::{draw_stats, CopyPixelsParams};
+    use vm_rust::player::bitmap::mask::BitmapMask;
+    use vm_rust::player::bitmap::palette_map::PaletteMap;
+    use vm_rust::player::geometry::IntRect;
+    use vm_rust::player::sprite::ColorRef;
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rnd = move |m: u32| -> u32 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % m.max(1) as u64) as u32
+    };
+    let palettes = PaletteMap::new();
+    let pals = [BuiltInPalette::SystemMac, BuiltInPalette::SystemWin, BuiltInPalette::GrayScale, BuiltInPalette::Web216, BuiltInPalette::Rainbow];
+    let inks = [0u32, 0, 0, 2, 7, 8, 8, 8, 32, 33, 35, 36, 36, 36, 37, 39, 40, 41, 5, 9];
+    let (mut taken, mut failed) = (0u32, 0u32);
+    for t in 0..n {
+        let (dw, dh) = (1 + rnd(90) as u16, 1 + rnd(70) as u16);
+        let mut dst = Bitmap::new(dw, dh, 32, 32, 0, PaletteRef::BuiltIn(BuiltInPalette::SystemMac));
+        for b in dst.data.iter_mut() {
+            *b = rnd(256) as u8;
+        }
+        dst.use_alpha = rnd(3) == 0;
+        let indexed = rnd(3) != 0;
+        let (sw, sh) = (1 + rnd(60) as u16, 1 + rnd(50) as u16);
+        let pal = PaletteRef::BuiltIn(pals[rnd(pals.len() as u32) as usize]);
+        let mut src = if indexed {
+            let orig = [1u8, 2, 4, 8, 8, 8][rnd(6) as usize];
+            let mut b = Bitmap::new(sw, sh, 8, orig, 0, pal);
+            let few = rnd(2) == 0; // few distinct indices: colour-key and matte hits
+            for v in b.data.iter_mut() {
+                *v = if few { [0u8, 255, 3, 17][rnd(4) as usize] } else { rnd(256) as u8 };
+            }
+            b
+        } else {
+            let mut b = Bitmap::new(sw, sh, 32, 32, 0, pal);
+            b.use_alpha = rnd(2) == 0;
+            let few = rnd(2) == 0;
+            for px in b.data.chunks_mut(4) {
+                let c = if few { [(255u8, 255u8, 255u8), (0, 0, 0), (10, 200, 30)][rnd(3) as usize] } else { (rnd(256) as u8, rnd(256) as u8, rnd(256) as u8) };
+                px[0] = c.0;
+                px[1] = c.1;
+                px[2] = c.2;
+                px[3] = [0u8, 255, 255, 128, 1, 254][rnd(6) as usize];
+            }
+            b
+        };
+        src.trim_white_space = rnd(2) == 0;
+        let mask = if rnd(3) == 0 {
+            let (mw, mh) = (1 + rnd(70) as u16, 1 + rnd(60) as u16);
+            let mut m = BitmapMask::new(mw, mh, true);
+            for y in 0..mh {
+                for x in 0..mw {
+                    if rnd(3) == 0 {
+                        m.set_bit(x, y, false);
+                    }
+                }
+            }
+            Some(m)
+        } else {
+            None
+        };
+        let (sl, st) = (rnd(sw as u32 + 6) as i32 - 3, rnd(sh as u32 + 6) as i32 - 3);
+        let (rw, rh) = (1 + rnd(sw as u32 + 4) as i32, 1 + rnd(sh as u32 + 4) as i32);
+        let src_rect = IntRect::from_tuple((sl, st, sl + rw, st + rh));
+        let (dl, dt) = (rnd(dw as u32 + 40) as i32 - 20, rnd(dh as u32 + 40) as i32 - 20);
+        let scaled = rnd(3) == 0;
+        let (ow, oh) = if scaled { (1 + rnd(80) as i32, 1 + rnd(60) as i32) } else { (rw, rh) };
+        let (mut l, mut r, mut tp, mut bt) = (dl, dl + ow, dt, dt + oh);
+        if rnd(5) == 0 {
+            std::mem::swap(&mut l, &mut r);
+        }
+        if rnd(5) == 0 {
+            std::mem::swap(&mut tp, &mut bt);
+        }
+        let dst_rect = IntRect::from_tuple((l, tp, r, bt));
+        let mut params = CopyPixelsParams::default(&src);
+        params.ink = inks[rnd(inks.len() as u32) as usize];
+        params.blend = [100, 100, 100, 50, 0, 85][rnd(6) as usize];
+        params.bg_color = if rnd(2) == 0 { ColorRef::PaletteIndex([0u8, 255, 3, 17][rnd(4) as usize]) } else { [ColorRef::Rgb(255, 255, 255), ColorRef::Rgb(0, 0, 0), ColorRef::Rgb(10, 200, 30)][rnd(3) as usize].clone() };
+        params.color = if rnd(2) == 0 { ColorRef::PaletteIndex(rnd(256) as u8) } else { ColorRef::Rgb(rnd(256) as u8, 0, 0) };
+        params.bg_color_explicit = rnd(10) == 0;
+        params.mask_image = mask.as_ref();
+        params.mask_offset = (rnd(9) as i32 - 4, rnd(9) as i32 - 4);
+        params.floor_rule = rnd(2) == 0;
+        if rnd(6) == 0 {
+            params.original_dst_rect = Some(IntRect::from_tuple((dl, dt, dl + 1 + rnd(80) as i32, dt + 1 + rnd(60) as i32)));
+        }
+        if rnd(8) == 0 {
+            params.rotation = [90.0, 45.0, 180.0, 13.0][rnd(4) as usize];
+        }
+        let mut a = dst.clone();
+        let before = draw_stats::FAST_BLITS.load(Relaxed);
+        draw_stats::FAST_PATHS.store(true, Relaxed);
+        a.copy_pixels_with_params(&palettes, &src, dst_rect.clone(), src_rect.clone(), &params);
+        let took = draw_stats::FAST_BLITS.load(Relaxed) > before;
+        let mut b = dst.clone();
+        draw_stats::FAST_PATHS.store(false, Relaxed);
+        b.copy_pixels_with_params(&palettes, &src, dst_rect, src_rect, &params);
+        draw_stats::FAST_PATHS.store(true, Relaxed);
+        taken += took as u32;
+        if a.data != b.data {
+            failed += 1;
+            if failed <= 10 {
+                let k = a.data.iter().zip(b.data.iter()).position(|(x, y)| x != y).unwrap_or(0) / 4;
+                println!(
+                    "[selftest] #{t} differs (fast path {took}): {} src {}/{} alpha {} trim {} ink {} blend {} mask {} src_rect {:?} dst_rect {:?} dst {}x{} alpha {} orig_rect {:?} rot {}: first at ({}, {}) fast {:?} loop {:?}",
+                    if indexed { "indexed" } else { "rgba" }, src.bit_depth, src.original_bit_depth, src.use_alpha, src.trim_white_space,
+                    params.ink, params.blend, mask.is_some(), (sl, st, rw, rh), (l, tp, r, bt), dw, dh, dst.use_alpha, params.original_dst_rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom)), params.rotation,
+                    k % dw as usize, k / dw as usize, &a.data[k * 4..k * 4 + 4], &b.data[k * 4..k * 4 + 4]
+                );
+            }
+        }
+    }
+    println!("[selftest] {n} blits, {taken} through the fast path, {failed} differ");
+    failed == 0
+}
+
 fn main() {
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("--blit-selftest") {
+            let n = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20_000);
+            std::process::exit(if blit_selftest(n) { 0 } else { 1 });
+        }
+    }
     if std::env::var_os("DCR_PROBE_BENCH").is_some() {
         println!("[probe] {}", bench());
     }
@@ -350,6 +588,11 @@ fn main() {
         default_hook(info);
     }));
 
+    let profiling = std::env::var_os("DCR_PROBE_PROF").is_some();
+    if profiling {
+        prof::start();
+    }
+    let prof_out = out.join("prof.txt");
     println!("[probe] movie {} for {seconds} s, a picture every {every} s, {} scripted inputs", movie.display(), script.len());
     run_test(async move {
         let mut player = TestPlayer::new();
@@ -365,9 +608,14 @@ fn main() {
         let (mut mixed_to, mut mix_buf, mut peak) = (t0.elapsed().as_secs_f64(), Vec::<f32>::new(), 0.0f32);
         let mut next_status = 1.0;
         let mut steps = 0u64;
-        let render_each = std::env::var_os("DCR_PROBE_RENDER").is_some();
+        let fast = std::env::var_os("DCR_PROBE_FAST").is_some();
+        let compare = std::env::var("DCR_PROBE_COMPARE").ok();
+        let (mut cmp_frames, mut cmp_bad_frames, mut cmp_bad_px, mut shown_diffs) = (0u64, 0u64, 0usize, 0u32);
         let (mut step_ms, mut draw_ms, mut draws, mut window_steps) = (0.0f64, 0.0f64, 0u64, 0u64);
+        let (mut step_cpu, mut draw_cpu) = (0.0f64, 0.0f64);
+        let (mut next_frame_at, mut status_since) = (Instant::now(), 0.0f64);
         let (mut step_alloc, mut draw_alloc) = ((0u64, 0u64, 0u64), (0u64, 0u64, 0u64));
+        let (mut step_clock, mut draw_clock) = (0u64, 0u64);
         let mut todo = script.into_iter().peekable();
         loop {
             let now = t0.elapsed().as_secs_f64();
@@ -386,7 +634,8 @@ fn main() {
                     Act::Key(k) => {
                         let (key, code) = js_key(&k).unwrap();
                         player.key_down(&key, code).await;
-                        player.step_frame().await;
+                        vm_rust::player::native::run_native_frame().await;
+                        steps += 1;
                         player.key_up(&key, code).await;
                     }
                     Act::Down(k) => {
@@ -402,23 +651,77 @@ fn main() {
                     Act::Lingo => dump_lingo(&out.join("lingo")),
                 }
             }
-            let t_step = Instant::now();
-            let a0 = alloc_counts();
-            let playing = player.step_frame().await;
-            let a1 = alloc_counts();
-            step_ms += t_step.elapsed().as_secs_f64() * 1000.0;
-            step_alloc = (step_alloc.0 + a1.0 - a0.0, step_alloc.1 + a1.1 - a0.1, step_alloc.2 + a1.2 - a0.2);
-            steps += 1;
-            // DCR_PROBE_RENDER=1: render the stage after every frame, as the console does, and time it
-            if render_each {
+            // ---- the next score frame once it is due, as the console's loop runs it
+            // (src/shockwave.rs, Director's model): one frame, then the stage rendered; a frame
+            // starts one tempo period after the last, or at once if that has passed (no burst to
+            // catch up); then the rest of a 60 Hz display refresh, as the console's present waits.
+            // DCR_PROBE_FAST=1: no waiting for the refresh.
+            let loop_start = Instant::now();
+            let tempo = match vm_rust::player::reserve_player_ref(|p| p.movie.get_effective_tempo()) {
+                0 => 30,
+                t => t.min(120),
+            };
+            let period = std::time::Duration::from_secs_f64(1.0 / tempo as f64);
+            let mut n = 0;
+            let mut playing = true;
+            if steps == 0 || loop_start >= next_frame_at {
+                n = 1;
+                let t_step = Instant::now();
+                let cpu0 = thread_cpu_ms();
+                let a0 = alloc_counts();
+                let c0 = clock_calls();
+                playing = vm_rust::player::native::run_native_frame().await;
+                step_clock += clock_calls() - c0;
+                let a1 = alloc_counts();
+                step_ms += t_step.elapsed().as_secs_f64() * 1000.0;
+                step_cpu += thread_cpu_ms() - cpu0;
+                step_alloc = (step_alloc.0 + a1.0 - a0.0, step_alloc.1 + a1.1 - a0.1, step_alloc.2 + a1.2 - a0.2);
+                steps += 1;
+                next_frame_at = (next_frame_at + period).max(Instant::now());
+            }
+            if n > 0 {
                 let t_draw = Instant::now();
-                let _ = player.snapshot_stage();
+                let cpu0 = thread_cpu_ms();
+                let a1 = alloc_counts();
+                let c1 = clock_calls();
+                prof::PROF_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+                let snap = player.snapshot_stage();
+                prof::PROF_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+                // DCR_PROBE_COMPARE=1: the same stage again without DirPlayer's upright blit fast
+                // path, compared byte for byte (=2: with it, to check the render is repeatable)
+                if let Some(mode) = compare.as_deref() {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    use vm_rust::player::bitmap::drawing::draw_stats::FAST_PATHS;
+                    FAST_PATHS.store(mode == "2", Relaxed);
+                    let again = player.snapshot_stage();
+                    FAST_PATHS.store(true, Relaxed);
+                    use vm_rust::player::testing_shared::SnapshotOutput;
+                    if let (SnapshotOutput::Rgba { data: a, width, .. }, SnapshotOutput::Rgba { data: b, .. }) = (&snap, &again) {
+                        cmp_frames += 1;
+                        let mut bad = 0usize;
+                        for (k, (x, y)) in a.chunks(4).zip(b.chunks(4)).enumerate() {
+                            if x != y {
+                                if bad == 0 && shown_diffs < 8 {
+                                    shown_diffs += 1;
+                                    println!("[compare] frame {}: first difference at ({}, {}): fast {:?}, loop {:?}", player.current_frame(), k % *width as usize, k / *width as usize, x, y);
+                                }
+                                bad += 1;
+                            }
+                        }
+                        if bad > 0 || a.len() != b.len() {
+                            cmp_bad_frames += 1;
+                            cmp_bad_px += bad;
+                        }
+                    }
+                }
+                draw_clock += clock_calls() - c1;
                 let a2 = alloc_counts();
                 draw_ms += t_draw.elapsed().as_secs_f64() * 1000.0;
+                draw_cpu += thread_cpu_ms() - cpu0;
                 draw_alloc = (draw_alloc.0 + a2.0 - a1.0, draw_alloc.1 + a2.1 - a1.1, draw_alloc.2 + a2.2 - a1.2);
                 draws += 1;
             }
-            // the speaker the console would have: mix what has played since the last frame
+            // the speaker the console would have: mix what has played since the last loop
             let now_s = t0.elapsed().as_secs_f64();
             let frames = ((now_s - mixed_to) * 48_000.0) as usize;
             if frames > 0 {
@@ -428,32 +731,54 @@ fn main() {
                 peak = mix_buf.iter().fold(peak, |m, x| m.max(x.abs()));
                 mixed_to += frames as f64 / 48_000.0;
             }
+            if !fast {
+                let spent = loop_start.elapsed().as_secs_f64();
+                if spent < 1.0 / 60.0 {
+                    std::thread::sleep(std::time::Duration::from_secs_f64(1.0 / 60.0 - spent));
+                }
+            }
             let now = t0.elapsed().as_secs_f64();
             if now >= next_status {
+                let window = now - status_since;
+                let fr = (steps - window_steps).max(1) as f64;
                 println!(
-                    "[probe] {now:>6.1} s: frame {}, playing {playing}, {steps} steps, {} voices, peak {peak:.2}; ms per frame: lingo {:.1}, draw {:.1}; allocs per frame: lingo {} ({} KB, {} >=64K), draw {} ({} KB, {} >=64K)",
+                    "[probe] {now:>6.1} s: frame {}, tempo {tempo}, playing {playing}, {:.1} frames/s, {:.1} draws/s, {} voices, peak {peak:.2}; ms per frame: lingo {:.1} (cpu {:.1}), draw {:.1} (cpu {:.1}); allocs per frame: lingo {} ({} KB, {} >=64K), draw {} ({} KB, {} >=64K)",
                     player.current_frame(),
+                    (steps - window_steps) as f64 / window,
+                    draws as f64 / window,
                     vm_rust::player::native_audio::playing(),
-                    step_ms / (steps - window_steps).max(1) as f64,
+                    step_ms / fr,
+                    step_cpu / fr,
                     draw_ms / draws.max(1) as f64,
-                    step_alloc.0 / (steps - window_steps).max(1),
-                    step_alloc.1 / 1024 / (steps - window_steps).max(1),
-                    step_alloc.2 / (steps - window_steps).max(1),
+                    draw_cpu / draws.max(1) as f64,
+                    step_alloc.0 / fr as u64,
+                    step_alloc.1 / 1024 / fr as u64,
+                    step_alloc.2 / fr as u64,
                     draw_alloc.0 / draws.max(1),
                     draw_alloc.1 / 1024 / draws.max(1),
                     draw_alloc.2 / draws.max(1)
                 );
+                if clock_calls() > 0 {
+                    println!(
+                        "[probe]          clock reads per frame: lingo {}, draw {}",
+                        step_clock / fr as u64,
+                        draw_clock / draws.max(1)
+                    );
+                    (step_clock, draw_clock) = (0, 0);
+                }
                 let (copies, copy_ms, copy_mpx, mattes, matte_ms, matte_mpx) =
                     vm_rust::player::bitmap::drawing::draw_stats::take();
                 let per = |v: f64| v / draws.max(1) as f64;
+                let fast_blits = vm_rust::player::bitmap::drawing::draw_stats::FAST_BLITS.swap(0, std::sync::atomic::Ordering::Relaxed);
                 println!(
-                    "[probe]          draw per frame: {:.0} blits ({:.2} Mpx) {:.1} ms, of which {:.0} matte masks ({:.2} Mpx) {:.1} ms",
-                    per(copies as f64), per(copy_mpx), per(copy_ms), per(mattes as f64), per(matte_mpx), per(matte_ms)
+                    "[probe]          draw per frame: {:.0} blits ({:.0} fast) ({:.2} Mpx) {:.1} ms, of which {:.0} matte masks ({:.2} Mpx) {:.1} ms",
+                    per(copies as f64), per(fast_blits as f64), per(copy_mpx), per(copy_ms), per(mattes as f64), per(matte_mpx), per(matte_ms)
                 );
-                (step_ms, draw_ms, draws, window_steps) = (0.0, 0.0, 0, steps);
+                (step_ms, step_cpu, draw_ms, draw_cpu, draws, window_steps) = (0.0, 0.0, 0.0, 0.0, 0, steps);
                 (step_alloc, draw_alloc) = ((0, 0, 0), (0, 0, 0));
                 peak = 0.0;
                 next_status += 1.0;
+                status_since = now;
             }
             if now >= next_pic {
                 save(&player, &out, &format!("t{:04}", now as u32));
@@ -475,5 +800,12 @@ fn main() {
         }
         dump(&player).await;
         println!("[probe] done: {steps} frames in {:.1} s", t0.elapsed().as_secs_f64());
+        if compare.is_some() {
+            println!("[compare] {cmp_frames} stages compared, {cmp_bad_frames} differ ({cmp_bad_px} pixels)");
+        }
+        if profiling {
+            prof::dump(&prof_out);
+        }
+
     });
 }

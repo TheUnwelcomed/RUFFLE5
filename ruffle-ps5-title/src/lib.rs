@@ -27,6 +27,13 @@
 //! console has no sceSysmoduleGetModuleHandleInternal); a one-time CPU/memory benchmark and per-stage
 //! draw costs in the log for Shockwave games (src/shockwave.rs), to find why drawing is slow there.
 //!
+//! 1.000.024 (2026-10-24): Shockwave games run one score frame, then the stage (Director's model;
+//! a game that paces itself, as Battle Blitz does, showed only one frame in three); DirPlayer's
+//! per-frame steps after a frame — the sound channels' tick (a sound's end, so channels free up and
+//! music loops: sound stopped about a minute in), `idle`, cue points — run off the web too; sprites
+//! drawn upright take a per-row path (3 to 4 times faster); the log names the first USB key and
+//! mouse movement.
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -34,7 +41,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.023";
+pub const APP_VERSION: &str = "1.000.024";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 

@@ -314,6 +314,9 @@ impl Input {
         self.backspace = false;
         self.moved = false;
         self.hid_frame = self.hid.read();
+        for line in std::mem::take(&mut self.hid.report) {
+            crate::say(&format!("     {line}"));
+        }
 
         let mut s = PadState::default();
         if self.open {

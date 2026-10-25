@@ -8,7 +8,8 @@
 //!
 //!   * DirPlayer loads the movie the menu chose (for a game folder, the one its projector starts),
 //!     its casts and the movies it goes to from the same folder;
-//!   * every score frame (at the movie's tempo) runs its Lingo; the stage is rendered on the CPU
+//!   * one score frame runs its Lingo, then the stage is drawn (Director's model: the tempo is a
+//!     ceiling, and a late frame is not made up for), rendered on the CPU
 //!     into RGBA and shown by src/shell.rs (`present_picture`): scaled to the display in whole
 //!     multiples, fitted or stretched (Settings › Display › Scale mode: Unscaled = whole multiples,
 //!     Zoom to Fit = fitted, Stretch = stretched, Crop = fitted), sharp at Quality Low/Medium,
@@ -48,8 +49,6 @@ use vm_rust::player::native_audio;
 /// Frames per second when the score sets no tempo (Director's default for a new movie is 15, but
 /// DirPlayer's own loop and most Shockwave games run at 30).
 const DEFAULT_TEMPO: u32 = 30;
-/// At most this many score frames per loop, so a slow stretch does not snowball.
-const MAX_STEPS: u32 = 3;
 
 /// A browser `KeyboardEvent`'s (key, keyCode) for a Ruffle key: what DirPlayer takes.
 pub fn js_key(k: &KeyDescriptor) -> Option<(String, u16)> {
@@ -389,7 +388,7 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
     let ms = |since: Instant| since.elapsed().as_secs_f64() * 1000.0;
     let _ = app.display.stats.take();
     let mut fading_out: Option<f32> = None;
-    let mut owed = 0.0f64;
+    let mut next_frame_at = Instant::now();
     let mut stopped = false;
     let mut first_frame = true;
     let mut picture: Vec<u8> = Vec::new();
@@ -517,31 +516,34 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
             }
         }
 
-        // ---- the game: input, then the score frames that are due ----
+        // ---- the game: input, then the next score frame once it is due ----
+        // Director's model, which DirPlayer's own frame loop follows: one score frame, then the
+        // stage drawn. The tempo is a ceiling — a frame starts one period after the last one's
+        // deadline, or at once if that has passed — and a late frame is not made up for with a
+        // burst of frames. 1.000.024: until then up to 3 frames ran between two pictures to
+        // keep the tempo, and a game that times itself loses by that: Teen Titans: Battle Blitz
+        // sets puppetTempo 999 and waits inside each frame until 33 ms after the last one, so
+        // the frames came 33 ms apart either way and two of every three were never shown
+        // (30 score frames a second, 10 pictures).
         let paused = quick.is_some() || editor.is_some();
         let t = Instant::now();
         let mut stepped = false;
         if !paused && !stopped {
             send_events(&mut player, &mut events).await;
-            let tempo = match player.tempo() {
-                0 => DEFAULT_TEMPO,
-                t => t.min(120),
-            };
-            owed = (owed + dt.as_secs_f64()).min(MAX_STEPS as f64 / tempo as f64);
-            let period = 1.0 / tempo as f64;
-            let mut n = 0;
-            while (owed >= period || first_frame) && n < MAX_STEPS {
+            if first_frame || t >= next_frame_at {
                 first_frame = false;
-                owed = (owed - period).max(0.0);
-                n += 1;
+                stepped = true;
                 steps += 1;
                 if !player.frame().await {
                     say(&format!("game: {name}: the movie stopped playing"));
                     stopped = true;
-                    break;
                 }
+                let tempo = match player.tempo() {
+                    0 => DEFAULT_TEMPO,
+                    t => t.min(120),
+                };
+                next_frame_at = (next_frame_at + Duration::from_secs_f64(1.0 / tempo as f64)).max(Instant::now());
             }
-            stepped = n > 0;
         } else {
             events.clear();
         }
@@ -671,11 +673,12 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
                 per(d.acquire_ms + d.present_ms),
             ));
             say(&format!(
-                "[Game] Shockwave stage {stage_w}x{stage_h} -> {}x{} ({:?}, {}): {:.1} score frames/s, {:.1} presents/s, {} sounds playing",
+                "[Game] Shockwave stage {stage_w}x{stage_h} -> {}x{} ({:?}, {}): tempo {}, {:.1} score frames/s, {:.1} presents/s, {} sounds playing",
                 dw,
                 dh,
                 fit,
                 if smooth { "smooth" } else { "sharp" },
+                player.tempo(),
                 steps as f64 / window,
                 d.presents as f64 / window,
                 native_audio::playing()

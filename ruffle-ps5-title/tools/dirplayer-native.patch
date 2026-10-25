@@ -249,15 +249,16 @@ index f1191b9..7233759 100644
                                      y, x, line_offset, result.len()
                                  ).into());
 diff --git a/vm-rust/src/player/bitmap/drawing.rs b/vm-rust/src/player/bitmap/drawing.rs
-index 280387c..03c5c70 100644
+index 280387c..5f38fef 100644
 --- a/vm-rust/src/player/bitmap/drawing.rs
 +++ b/vm-rust/src/player/bitmap/drawing.rs
-@@ -1,5 +1,54 @@
+@@ -1,5 +1,67 @@
  use std::collections::HashMap;
  
 +/// PS5_RUFFLE_DIRPLAYER_NATIVE: what drawing sprites costs, for the console's frame log (Ruffle5
-+/// prints it every 5 s; dcr-probe on a PC). Counters only; no effect on what is drawn. Off the web
-+/// only (no clock there).
++/// prints it every 5 s; dcr-probe on a PC), and the switch for `copy_pixels_with_params`' upright
++/// fast path (which draws the same pixels as its pixel loop). The timings are off the web only (no
++/// clock there).
 +pub mod draw_stats {
 +    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 +    /// copyPixels-style blits, their nanoseconds, destination pixels; matte masks built, their
@@ -291,6 +292,18 @@ index 280387c..03c5c70 100644
 +        let _ = (ns, since);
 +    }
 +
++    /// Whether `copy_pixels_with_params` may take its upright fast path (on unless dcr-probe
++    /// turns it off, to compare the two pixel for pixel).
++    pub static FAST_PATHS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
++
++    #[inline]
++    pub fn fast_paths() -> bool {
++        FAST_PATHS.load(Relaxed)
++    }
++
++    /// Blits the upright fast path drew (of `COPIES`).
++    pub static FAST_BLITS: AtomicU64 = AtomicU64::new(0);
++
 +    /// (blits, ms, megapixels, matte masks, ms, megapixels) since the last call.
 +    pub fn take() -> (u64, f64, f64, u64, f64, f64) {
 +        (
@@ -307,7 +320,7 @@ index 280387c..03c5c70 100644
  use rgb565::Rgb565;
  
  use crate::{
-@@ -2134,6 +2183,21 @@ impl Bitmap {
+@@ -2134,6 +2196,47 @@ impl Bitmap {
          dst_rect: IntRect,
          src_rect: IntRect,
          params: &CopyPixelsParams,
@@ -317,6 +330,32 @@ index 280387c..03c5c70 100644
 +        self.copy_pixels_with_params_timed(palettes, src, dst_rect, src_rect, params);
 +        draw_stats::COPY_PIXELS.fetch_add(area, std::sync::atomic::Ordering::Relaxed);
 +        draw_stats::add(&draw_stats::COPIES, &draw_stats::COPY_NS, started);
++    }
++
++    /// The upright fast path's pixels (see `copy_pixels_with_params_timed`): every destination
++    /// row in `rows` × column in `cols` (each with the source row / column it reads), with its
++    /// current colour, and what `pixel` makes of them: a colour written opaque (as
++    /// `set_pixel_fast` writes a 32-bit pixel), or None (left as it is).
++    #[inline(always)]
++    fn upright_rows(
++        &mut self,
++        cols: &[(usize, u16)],
++        rows: &[(usize, u16)],
++        mut pixel: impl FnMut(u16, u16, (u8, u8, u8)) -> Option<(u8, u8, u8)>,
++    ) {
++        let row_len = self.width as usize * 4;
++        for &(dst_y, sy) in rows {
++            let row = &mut self.data[dst_y * row_len..(dst_y + 1) * row_len];
++            for &(dst_x, sx) in cols {
++                let px = &mut row[dst_x * 4..dst_x * 4 + 4];
++                if let Some((r, g, b)) = pixel(sx, sy, (px[0], px[1], px[2])) {
++                    px[0] = r;
++                    px[1] = g;
++                    px[2] = b;
++                    px[3] = 0xFF;
++                }
++            }
++        }
 +    }
 +
 +    fn copy_pixels_with_params_timed(
@@ -329,7 +368,7 @@ index 280387c..03c5c70 100644
      ) {
          // Destination pixels are about to change, so retire anything keyed on the
          // old contents. The WebGL2 texture cache keys on `bitmap.version`
-@@ -2395,6 +2459,7 @@ impl Bitmap {
+@@ -2395,6 +2498,7 @@ impl Bitmap {
              };
  
          if needs_matte_mask {
@@ -337,7 +376,7 @@ index 280387c..03c5c70 100644
              let width = src.width as usize;
              let height = src.height as usize;
  
-@@ -2451,6 +2516,8 @@ impl Bitmap {
+@@ -2451,6 +2555,8 @@ impl Bitmap {
              }
  
              matte_mask = Some(mask);
@@ -346,6 +385,210 @@ index 280387c..03c5c70 100644
          }
  
          // ---------------- Fast path: unscaled, unrotated, same-palette 8-bit blit ----------------
+@@ -2606,13 +2712,201 @@ impl Bitmap {
+             }
+         }
+ 
++        // ------------- Fast path: upright blits onto a 32-bit bitmap -------------
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: the pixel loop below decides each pixel from scratch —
++        // rotation and scale maths, a chain of ink tests, a palette resolve, bounds-checked
++        // reads and writes — 15 to 30 ns a pixel, most of a frame's drawing in a Shockwave game
++        // (Teen Titans: Battle Blitz on the PS5: 18 ms of a fight frame, 50 ms of a menu one).
++        // Without rotation or skew, which source pixel a destination pixel shows depends on its
++        // column alone and on its row alone, so the loop's sampling (scale, phase, flip, floor,
++        // clamp, the skips) is worked out once per column and once per row, with the same
++        // arithmetic; and for the common inks the per-pixel part is what the loop does — the same
++        // tests in the same order, the same palette table and blend functions — a row at a
++        // time. Everything else (rotation, skew, text, a foreColor/backColor tint, inks 5 and 9,
++        // 16-bit and packed sources, and for RGBA sources a destination with alpha) still takes
++        // the loop. `draw_stats::FAST_PATHS` turns this off, which dcr-probe uses to compare
++        // the two pixel for pixel.
++        {
++            let sprite_bg = params.sprite.map_or(false, |sp| sp.has_back_color);
++            let sprite_fg = params.sprite.map_or(false, |sp| sp.has_fore_color);
++            let no_colorize = !(sprite_bg
++                || sprite_fg
++                || params.bg_color_explicit
++                || params.fore_color_explicit);
++            let indexed_src = src.bit_depth == 8 && src.original_bit_depth <= 8 && src_palette_cache.is_some();
++            let rgba_src = src.bit_depth == 32 && src.original_bit_depth == 32;
++            // An indexed source's inks 0, 2, 36 and 8 (and the rest but 32 and 33, whose writes
++            // depend on it) do not look at the destination's alpha; an RGBA source's ink 0 does.
++            let ink_ok = if indexed_src {
++                ink != 5 && ink != 9 && (!self.use_alpha || (ink != 32 && ink != 33))
++            } else {
++                matches!(ink, 0 | 2 | 8 | 36) && !self.use_alpha
++            };
++            if draw_stats::fast_paths()
++                && self.bit_depth == 32
++                && !params.is_text_rendering
++                && !has_sprite_rotation
++                && !has_skew_flip
++                && no_colorize
++                && (indexed_src || rgba_src)
++                && ink_ok
++                && src.data.len() >= src.width as usize * src.height as usize * (src.bit_depth as usize / 8)
++                && self.data.len() >= self.width as usize * self.height as usize * 4
++                && src_rect.left <= src_rect.right - 1
++                && src_rect.top <= src_rect.bottom - 1
++            {
++                // The loop's sampling, per column and per row: the source x (y) a destination
++                // x (y) reads, or None where the loop skips it.
++                let scaling_up = scale_x < 1.0 || scale_y < 1.0;
++                let phase = if scaling_up || !params.floor_rule { 0.5 } else { 0.0 };
++                let (src_max_x, src_max_y) = (src_rect.right - 1, src_rect.bottom - 1);
++                let sample = |d: i32, min_d_f: f64, span: f64, start_f: f64, scale: f64, flip: bool, size: f64, lo: i32, hi: i32, limit: u16| -> Option<u16> {
++                    let idx = d as f64 - min_d_f;
++                    if idx < 0.0 || idx >= span {
++                        return None;
++                    }
++                    let f = start_f + (idx + phase) * scale;
++                    let mapped = if flip {
++                        let rel = f - start_f;
++                        start_f + size - rel
++                    } else {
++                        f
++                    };
++                    let s = (mapped.floor() as i32).clamp(lo, hi) as u16;
++                    if s >= limit { None } else { Some(s) }
++                };
++                let cols: Vec<(usize, u16)> = (min_dst_x.max(0)..max_dst_x.min(self.width as i32))
++                    .filter_map(|x| sample(x, min_dst_x_f, dst_w, src_left_f, scale_x, flip_x, src_w, src_rect.left, src_max_x, src.width).map(|sx| (x as usize, sx)))
++                    .collect();
++                let rows: Vec<(usize, u16)> = (min_dst_y.max(0)..max_dst_y.min(self.height as i32))
++                    .filter_map(|y| sample(y, min_dst_y_f, dst_h, src_top_f, scale_y, flip_y, src_h, src_rect.top, src_max_y, src.height).map(|sy| (y as usize, sy)))
++                    .collect();
++                let sw = src.width as usize;
++                let sdata = &src.data[..];
++                let mask_offset = params.mask_offset;
++                let mask_ok = |sx: u16, sy: u16| -> bool {
++                    match mask_image {
++                        Some(m) => m.get_bit(
++                            (sx as i32 - mask_offset.0).max(0) as u16,
++                            (sy as i32 - mask_offset.1).max(0) as u16,
++                        ),
++                        None => true,
++                    }
++                };
++                let matte = |sx: u16, sy: u16| -> bool {
++                    matte_mask.as_ref().is_some_and(|m| m[sy as usize][sx as usize])
++                };
++                let (bg, fg) = (bg_color_resolved, fg_color_resolved);
++                let mix = |d: (u8, u8, u8), c: (u8, u8, u8), a: f32| if a >= 0.999 { c } else { blend_color_alpha(d, c, a) };
++                if indexed_src {
++                    let cache = src_palette_cache.as_deref().unwrap_or(&[]);
++                    let index = |sx: u16, sy: u16| sdata[sy as usize * sw + sx as usize];
++                    let orig = src.original_bit_depth;
++                    let transparent_index = if orig <= 4 { 0 } else { bg_index };
++                    match ink {
++                        // the loop's "Indexed bitmap (1-8 bit) ink 0"
++                        0 => self.upright_rows(&cols, &rows, |sx, sy, d| {
++                            if !mask_ok(sx, sy) {
++                                return None;
++                            }
++                            Some(mix(d, cache[index(sx, sy) as usize], alpha))
++                        }),
++                        // "Indexed bitmap (1-8 bit) ink 36 color-key transparency" (before the mask)
++                        2 | 36 => self.upright_rows(&cols, &rows, |sx, sy, d| {
++                            let i = index(sx, sy);
++                            if orig == 1 {
++                                return if i == 0 { None } else { Some(mix(d, fg, alpha)) };
++                            }
++                            let c = cache[i as usize];
++                            if (i == transparent_index && c == bg) || c == bg {
++                                return None;
++                            }
++                            Some(if alpha >= 0.999 { c } else { blend_color_alpha(d, c, 1.0 * alpha) })
++                        }),
++                        // "Indexed bitmap (1-8 bit) ink 8": the mask, then the matte
++                        8 => self.upright_rows(&cols, &rows, |sx, sy, d| {
++                            if !mask_ok(sx, sy) {
++                                return None;
++                            }
++                            let c = cache[index(sx, sy) as usize];
++                            if matte(sx, sy) {
++                                return None;
++                            }
++                            Some(if alpha >= 0.999 { c } else { blend_color_alpha(d, c, 1.0 * alpha) })
++                        }),
++                        // the rest: the mask (not for ink 33), then `blend_pixel`
++                        _ => self.upright_rows(&cols, &rows, |sx, sy, d| {
++                            if ink != 33 && !mask_ok(sx, sy) {
++                                return None;
++                            }
++                            let c = cache[index(sx, sy) as usize];
++                            Some(blend_pixel(d, c, ink, bg, fg, true, alpha, 1.0))
++                        }),
++                    }
++                } else {
++                    let ua = src.use_alpha;
++                    let rgba = |sx: u16, sy: u16| {
++                        let k = (sy as usize * sw + sx as usize) * 4;
++                        ((sdata[k], sdata[k + 1], sdata[k + 2]), sdata[k + 3])
++                    };
++                    match ink {
++                        // the mask, a transparent pixel of an alpha bitmap skipped, `blend_pixel`
++                        0 => self.upright_rows(&cols, &rows, |sx, sy, d| {
++                            if !mask_ok(sx, sy) {
++                                return None;
++                            }
++                            let (c, a) = rgba(sx, sy);
++                            if ua && a == 0 {
++                                return None;
++                            }
++                            let sa = if ua { a } else { 255 };
++                            Some(blend_pixel(d, c, 0, bg, fg, false, alpha, sa as f32 / 255.0))
++                        }),
++                        // the mask, then "32-bit ink 8": the matte (no alpha) or the pixel's alpha
++                        8 => self.upright_rows(&cols, &rows, |sx, sy, d| {
++                            if !mask_ok(sx, sy) {
++                                return None;
++                            }
++                            let (c, a) = rgba(sx, sy);
++                            if ua && a == 0 {
++                                return None;
++                            }
++                            if !ua && matte(sx, sy) {
++                                return None;
++                            }
++                            let src_alpha = if ua { a as f32 / 255.0 } else { 1.0 };
++                            Some(if src_alpha >= 0.999 && alpha >= 0.999 { c } else { blend_color_alpha(d, c, src_alpha * alpha) })
++                        }),
++                        // "32-bit bitmap ink 36 color-key transparency" (before the mask)
++                        _ => self.upright_rows(&cols, &rows, |sx, sy, d| {
++                            let (c, a) = rgba(sx, sy);
++                            if ua && a == 0 {
++                                return None;
++                            }
++                            if c == bg {
++                                return None;
++                            }
++                            let c = if c == (0, 0, 0) { fg } else { c };
++                            let eff = (if ua { a as f32 / 255.0 } else { 1.0 }) * alpha;
++                            Some(if eff >= 0.999 { c } else { blend_color_alpha(d, c, eff) })
++                        }),
++                    }
++                }
++                draw_stats::FAST_BLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                return;
++            }
++        }
++
+         // ---------------- Pixel loop ----------------
+         // Invalidate the cached matte ONCE for the whole blit. `set_pixel_fast`
+         // used to do this per pixel. (The early-return fast paths above each
+         // clear it themselves before returning.)
+         self.matte = None;
+-        for dst_y in draw_min_y..draw_max_y {
+-            for dst_x in draw_min_x..draw_max_x {
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: only the rows and columns on this bitmap — every pixel
++        // off it is skipped first thing in the loop anyway, and a large sprite mostly off the
++        // stage (a scrolling backdrop) cost a pass over all of its pixels.
++        for dst_y in draw_min_y.max(0)..draw_max_y.min(self.height as i32) {
++            for dst_x in draw_min_x.max(0)..draw_max_x.min(self.width as i32) {
+                 if dst_x < 0
+                     || dst_y < 0
+                     || dst_x >= self.width as i32
 diff --git a/vm-rust/src/player/bytecode/string.rs b/vm-rust/src/player/bytecode/string.rs
 index 7b6a277..70b2b65 100644
 --- a/vm-rust/src/player/bytecode/string.rs
@@ -1171,10 +1414,10 @@ index 8fef74e..9e1f43f 100644
          }
 diff --git a/vm-rust/src/player/native.rs b/vm-rust/src/player/native.rs
 new file mode 100644
-index 0000000..aa52b79
+index 0000000..a1e9bb6
 --- /dev/null
 +++ b/vm-rust/src/player/native.rs
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,249 @@
 +//! PS5_RUFFLE_DIRPLAYER_NATIVE — DirPlayer inside another program, without a browser.
 +//!
 +//! The web front end drives the VM from JavaScript: it loads the movie, runs the frame loop on
@@ -1198,10 +1441,12 @@ index 0000000..aa52b79
 +use async_std::channel;
 +
 +use crate::director::file::read_director_file_bytes;
++use crate::director::lingo::datum::Datum;
 +use crate::player::{
 +    bitmap::bitmap::{get_system_default_palette, Bitmap, PaletteRef},
 +    commands::{run_player_command, PlayerVMCommand},
-+    events::run_event_loop,
++    events::{player_invoke_frame_and_movie_scripts, run_event_loop},
++    symbols::symbol::Symbol,
 +    fire_pending_timeouts, reserve_player_mut, reserve_player_ref, run_movie_init_sequence,
 +    run_single_frame, DirPlayer, PlayerVMExecutionItem, PLAYER_OPT,
 +};
@@ -1211,6 +1456,74 @@ index 0000000..aa52b79
 +/// helper tasks onto the calling thread; they only make progress while something here awaits).
 +pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
 +    crate::player::native_rt::block_on(f)
++}
++
++/// One score frame the way the web front end's frame loop (`run_frame_loop`) runs one, without
++/// its pacing (the host decides when frames run, at the movie's tempo):
++///
++/// * a pending restart (`play movie` of the current movie) or a finished `gotoNetMovie` first;
++/// * the timeouts that are due, then the frame (`run_single_frame`: its scripts and events, the
++///   playhead's advance); `stopMovie` once the movie has stopped;
++/// * then what the loop does after each frame: the movie's `idle` event (to the frame and movie
++///   scripts), the sound channels' tick — fades, and the end of a sound: the channel goes idle
++///   (`soundBusy` turns FALSE), loops, plays its queue's next sound — the `cuePassed` events that
++///   tick found, and the tempo read again (a `puppetTempo` on a held frame).
++///
++/// 1.000.024: until then the host ran only the timeouts and `run_single_frame`, so a channel's
++/// sound ending never reached it — every channel a game had used stayed busy, and once a game
++/// had used them all (Teen Titans: Battle Blitz, about a minute in) it found no free channel and
++/// played nothing more; its fight music, restarted when it ends, stopped too.
++pub async fn run_native_frame() -> bool {
++    if reserve_player_ref(|player| player.pending_restart) {
++        super::restart_current_movie().await;
++        return reserve_player_ref(|player| player.is_playing);
++    }
++    let goto_transition = reserve_player_ref(|player| match player.pending_goto_net_movie {
++        Some((task_id, ref target)) if player.net_manager.is_task_done(Some(task_id)) => Some((task_id, target.clone())),
++        _ => None,
++    });
++    if let Some((task_id, target)) = goto_transition {
++        super::transition_to_net_movie(task_id, target).await;
++        return reserve_player_ref(|player| player.is_playing);
++    }
++
++    fire_pending_timeouts().await;
++    let (is_playing, _) = run_single_frame().await;
++    if !is_playing {
++        super::stop_movie_sequence().await;
++        return false;
++    }
++
++    let active = reserve_player_ref(|player| player.is_playing && !player.is_script_paused && !player.pending_movie_init);
++    if active {
++        if let Err(err) = player_invoke_frame_and_movie_scripts(Symbol::from_str("idle"), &vec![]).await {
++            log::warn!("idle dispatch failed: {}", err.message);
++        }
++    }
++
++    let tempo = reserve_player_ref(|player| player.current_frame_tempo);
++    super::tick_sound_manager(if tempo == 0 { 1.0 / 30.0 } else { 1.0 / tempo as f64 });
++
++    loop {
++        let events = reserve_player_mut(|player| std::mem::take(&mut player.pending_cue_events));
++        if events.is_empty() {
++            break;
++        }
++        for (channel_num, cue_number, cue_name) in events {
++            let args = reserve_player_mut(|player| {
++                let channel = player.alloc_datum(Datum::Symbol(Symbol::from_str(&format!("sound{}", channel_num))));
++                let number = player.alloc_datum(Datum::Int(cue_number));
++                let name = player.alloc_datum(Datum::String(cue_name));
++                vec![channel, number, name]
++            });
++            if let Err(err) = player_invoke_frame_and_movie_scripts(Symbol::from_str("cuePassed"), &args).await {
++                log::warn!("cuePassed dispatch failed: {}", err.message);
++            }
++        }
++    }
++
++    reserve_player_mut(|player| player.refresh_frame_tempo());
++    true
 +}
 +
 +pub struct NativePlayer {
@@ -1275,12 +1588,9 @@ index 0000000..aa52b79
 +        run_movie_init_sequence().await;
 +    }
 +
-+    /// One score frame: due timeouts, then the frame's scripts and events. False once the movie
-+    /// has stopped playing.
++    /// One score frame, as [`run_native_frame`] runs it. False once the movie has stopped playing.
 +    pub async fn frame(&mut self) -> bool {
-+        fire_pending_timeouts().await;
-+        let (is_playing, _) = run_single_frame().await;
-+        is_playing
++        run_native_frame().await
 +    }
 +
 +    /// Frames per second the score asks for now (puppetTempo or the tempo channel); 0 if none.

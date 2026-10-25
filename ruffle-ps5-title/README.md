@@ -153,6 +153,14 @@ patch): async-std's runtime needs async-io, whose kqueue reactor does not start 
 (1.000.021 aborted with "cannot initialize I/O event notification", EINVAL). Nothing in Ruffle5
 opens a kqueue now.
 
+Frames follow Director's model, as DirPlayer's own frame loop does: one score frame, then the stage
+drawn, at most at the movie's tempo and never a burst of frames to catch up (1.000.024; before, up
+to three frames ran per picture, and a game that paces itself — Battle Blitz sets `puppetTempo 999`
+and waits inside each frame until 33 ms after the last — showed one frame in three). After each
+frame the same steps run as on the web (`run_native_frame` in the patch): the sound channels'
+tick (the end of a sound frees its channel and loops or queues the next one; without it every
+channel stayed busy and a game ran out of them), the `idle` event and cue points.
+
 `tools/fetch-dirplayer.sh` (run by `build-title.sh`) fetches DirPlayer at a pinned commit into
 `vendor/dirplayer` and applies `tools/dirplayer-native.patch`: an embedding API for a native
 program (`player/native.rs`), a sound mixer without Web Audio (`player/native_audio.rs`), local
@@ -160,7 +168,10 @@ files instead of `fetch()`, browser-console calls compiled out off the web, `rec
 returning the overlap (DirPlayer returned the union, so every collision test in a fighting game
 hit), its `image` dependency cut to the formats movies use (no AV1 encoder in the build), its
 wasm-bindgen pins relaxed to share Ruffle's versions, an rlib-only crate type, and a native task
-executor and timers (`player/native_rt.rs`) in place of async-std's runtime.
+executor and timers (`player/native_rt.rs`) in place of async-std's runtime, the web frame loop's
+per-frame steps for a native host (`run_native_frame`), and a per-row path for sprites drawn
+upright onto the stage (`copy_pixels_with_params`: the same pixels as DirPlayer's per-pixel loop,
+checked by `dcr-probe --blit-selftest` and `DCR_PROBE_COMPARE=1`, 3 to 4 times faster).
 `dcr-probe/` (at the repository root) runs a movie in DirPlayer on a PC or server and saves the
 stage as PNGs — for checking a game before it goes on the console.
 

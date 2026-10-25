@@ -124,6 +124,10 @@ pub struct Hid {
     shift: bool,
     repeat: Option<(u16, Instant)>,
     buttons: u32,
+    /// The first key down was logged ("usb keyboard: first key").
+    key_logged: bool,
+    /// Lines for the log: the open's, then the first record of each device and the first key
+    /// (src/input.rs logs them as they come).
     pub report: Vec<String>,
 }
 
@@ -137,6 +141,7 @@ impl Hid {
             shift: false,
             repeat: None,
             buttons: 0,
+            key_logged: false,
             report: Vec::new(),
         }
     }
@@ -270,6 +275,12 @@ impl Hid {
         }
         for index in seen_now {
             self.report.push(format!("usb keyboard on index {index}"));
+        }
+        if !self.key_logged {
+            if let Some(&(usage, _)) = frame.keys.iter().find(|&&(_, down)| down) {
+                self.key_logged = true;
+                self.report.push(format!("usb keyboard: first key down (usage 0x{usage:02x})"));
+            }
         }
         self.shift = self.keyboards.iter().any(|k| k.held.iter().any(|&u| u == 0xE1 || u == 0xE5));
     }
