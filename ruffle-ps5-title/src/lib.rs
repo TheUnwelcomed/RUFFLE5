@@ -40,6 +40,11 @@
 //! `sceKeyboardRead` gives nothing; handles are opened again every 5 s while no device has shown
 //! up on them (a keyboard plugged in after start did nothing in 1.000.023).
 //!
+//! 1.000.026 (2026-10-24): Shockwave film loops (DirPlayer patch): a film loop a script puts on a
+//! sprite takes the loop's own size (Battle Blitz's opponent portrait was drawn 2.5 times too large:
+//! the pink block over the fighter grid), and a see-through layer inside a film loop stays
+//! see-through (the pulsing highlight over the chosen fighters hid their portraits under a dark box).
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -47,7 +52,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.025";
+pub const APP_VERSION: &str = "1.000.026";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 

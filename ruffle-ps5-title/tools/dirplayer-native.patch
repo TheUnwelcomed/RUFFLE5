@@ -2207,7 +2207,7 @@ index e684a93..4c2cbc9 100644
          std::future::pending::<()>(),
      )
 diff --git a/vm-rust/src/player/score.rs b/vm-rust/src/player/score.rs
-index 25330f7..7b5ebec 100644
+index 25330f7..1513d64 100644
 --- a/vm-rust/src/player/score.rs
 +++ b/vm-rust/src/player/score.rs
 @@ -398,7 +398,7 @@ impl Score {
@@ -2246,6 +2246,23 @@ index 25330f7..7b5ebec 100644
                          "Unexpected color flag: {}",
                          data.color_flag
                      )));
+@@ -4176,6 +4176,16 @@ fn resolve_sprite_member_assignment(
+                     let (l, t, r, b) = flash.effective_rect();
+                     Some(((r - l) as i32, (b - t) as i32))
+                 }
++                // Ruffle5 (PS5): a film loop's natural size is its rect (info.reg_point = left/top,
++                // width/height = right/bottom), as get_concrete_sprite_rect reads it. Without it a
++                // film loop swapped onto a non-stretched sprite kept the score's box of the member
++                // before: Battle Blitz's opponent portrait (sprite 28, a 255x188 score box) drew
++                // its 104x56 loop 2.5x too large over the fighter grid.
++                CastMemberType::FilmLoop(film_loop) => {
++                    let w = film_loop.info.width as i32 - film_loop.info.reg_point.0 as i32;
++                    let h = film_loop.info.height as i32 - film_loop.info.reg_point.1 as i32;
++                    Some((w, h))
++                }
+                 _ => None,
+             };
+             let is_film_loop = matches!(&m.member_type, CastMemberType::FilmLoop(_));
 diff --git a/vm-rust/src/player/testing.rs b/vm-rust/src/player/testing.rs
 index 7096c71..8e9ad80 100644
 --- a/vm-rust/src/player/testing.rs
@@ -2309,7 +2326,7 @@ index cfef474..2435607 100644
  }
  
 diff --git a/vm-rust/src/rendering.rs b/vm-rust/src/rendering.rs
-index 0a7e9d6..099d59d 100644
+index 0a7e9d6..141640e 100644
 --- a/vm-rust/src/rendering.rs
 +++ b/vm-rust/src/rendering.rs
 @@ -5,7 +5,7 @@ use std::{
@@ -2321,6 +2338,116 @@ index 0a7e9d6..099d59d 100644
  use chrono::Local;
  use itertools::Itertools;
  use log::{debug, warn};
+@@ -1404,6 +1404,7 @@ fn render_filmloop_from_channel_data(
+                 };
+ 
+                 // Debug: resolve some representative palette indices to see what colors they would be
++                if log::log_enabled!(log::Level::Debug) {
+                 let test_idx_0 = crate::player::bitmap::bitmap::resolve_color_ref(
+                     &palettes,
+                     &ColorRef::PaletteIndex(0),
+@@ -1448,6 +1449,7 @@ fn render_filmloop_from_channel_data(
+                         "    Matte mask: None"
+                     );
+                 }
++                }
+ 
+                 let params = CopyPixelsParams {
+                     blend,
+@@ -1476,13 +1478,32 @@ fn render_filmloop_from_channel_data(
+                     floor_rule: true,
+                 };
+ 
+-                bitmap.copy_pixels_with_params(
+-                    &palettes,
+-                    &src_bitmap,
+-                    dst_rect,
+-                    src_rect,
+-                    &params,
+-                );
++                // Ruffle5 (PS5): a blended child is drawn at `blend` over what is beneath it in the
++                // loop — and over nothing where the loop is still empty, so the stage shows through
++                // it there. copy_pixels mixes with the offscreen's colour and stamps alpha 0xFF, so
++                // a 30% layer over the cleared (0,0,0,0) became an opaque dark rectangle: Battle
++                // Blitz's pulsing selection highlights (ink 36, blend 10-50%) hid the portraits of
++                // the chosen fighters. For the inks whose result does not depend on the colour
++                // beneath (copy, matte, mask, background transparent), the child is drawn opaque
++                // into a clear layer, and the layer laid over the offscreen at `blend`, coverage in
++                // the alpha channel ("over", straight alpha). Where the offscreen is opaque that
++                // is the mix copy_pixels makes.
++                if blend < 100 && bitmap.use_alpha && bitmap.bit_depth == 32 && matches!(ink, 0 | 8 | 9 | 36) {
++                    let mut layer = Bitmap::new(bitmap.width, bitmap.height, 32, 32, 8, bitmap.palette_ref.clone());
++                    layer.use_alpha = true;
++                    layer.data.fill(0);
++                    let opaque = CopyPixelsParams { blend: 100, ..params };
++                    layer.copy_pixels_with_params(&palettes, &src_bitmap, dst_rect, src_rect, &opaque);
++                    layer_over(bitmap, &layer, blend);
++                } else {
++                    bitmap.copy_pixels_with_params(
++                        &palettes,
++                        &src_bitmap,
++                        dst_rect,
++                        src_rect,
++                        &params,
++                    );
++                }
+             }
+             CastMemberType::Shape(shape_member) => {
+                 // Skip blank placeholders and zero-size shapes, but NOT a #line: a line
+@@ -1798,6 +1819,37 @@ fn render_filmloop_from_channel_data(
+ 
+ /// Parent sprite properties for film loop rendering.
+ /// In Director, film loop internal sprites use the parent sprite's ink semantics.
++/// Ruffle5 (PS5): `layer` (32-bit, alpha = coverage) laid over `dst` at `blend` percent: straight
++/// alpha "over". Over an opaque pixel it is the plain mix d*(1-a) + s*a; over a clear one the colour
++/// is the layer's and the alpha its coverage, so whatever the loop is drawn onto shows through.
++fn layer_over(dst: &mut Bitmap, layer: &Bitmap, blend: i32) {
++    let f = blend.clamp(0, 100) as u32;
++    let n = dst.data.len().min(layer.data.len()) / 4 * 4;
++    for i in (0..n).step_by(4) {
++        let la = layer.data[i + 3] as u32;
++        if la == 0 {
++            continue;
++        }
++        let sa = (la * f + 50) / 100; // 0..255
++        if sa == 0 {
++            continue;
++        }
++        let da = dst.data[i + 3] as u32;
++        // out_a = sa + da (1 - sa), in 0..255 units (scaled by 255)
++        let out_a255 = sa * 255 + da * (255 - sa);
++        if out_a255 == 0 {
++            continue;
++        }
++        for c in 0..3 {
++            let s = layer.data[i + c] as u32;
++            let d = dst.data[i + c] as u32;
++            let num = s * sa * 255 + d * da * (255 - sa);
++            dst.data[i + c] = ((num + out_a255 / 2) / out_a255).min(255) as u8;
++        }
++        dst.data[i + 3] = ((out_a255 + 127) / 255).min(255) as u8;
++    }
++}
++
+ pub struct FilmLoopParentProps {
+     pub ink: u32,
+     pub color: ColorRef,
+@@ -3082,6 +3134,7 @@ pub fn render_score_to_bitmap_with_offset(
+ 
+                 // ---- 4. Composite filmloop onto stage ----
+                 // Count total opaque pixels in filmloop bitmap to verify rendering worked
++                if log::log_enabled!(log::Level::Debug) {
+                 let opaque_count = (0..filmloop_bitmap.data.len()).step_by(4)
+                     .filter(|&i| i + 3 < filmloop_bitmap.data.len() && filmloop_bitmap.data[i + 3] > 0)
+                     .count();
+@@ -3095,6 +3148,7 @@ pub fn render_score_to_bitmap_with_offset(
+                     opaque_count, if total_pixels > 0 { opaque_count * 100 / total_pixels } else { 0 },
+                     transparent_count, if total_pixels > 0 { transparent_count * 100 / total_pixels } else { 0 }
+                 );
++                }
+ 
+                 let params = CopyPixelsParams {
+                     blend,
 diff --git a/vm-rust/src/rendering_gpu/webgl2/mod.rs b/vm-rust/src/rendering_gpu/webgl2/mod.rs
 index dffbb65..15d5fd1 100644
 --- a/vm-rust/src/rendering_gpu/webgl2/mod.rs

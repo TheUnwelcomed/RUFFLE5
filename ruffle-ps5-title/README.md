@@ -171,7 +171,13 @@ wasm-bindgen pins relaxed to share Ruffle's versions, an rlib-only crate type, a
 executor and timers (`player/native_rt.rs`) in place of async-std's runtime, the web frame loop's
 per-frame steps for a native host (`run_native_frame`), and a per-row path for sprites drawn
 upright onto the stage (`copy_pixels_with_params`: the same pixels as DirPlayer's per-pixel loop,
-checked by `dcr-probe --blit-selftest` and `DCR_PROBE_COMPARE=1`, 3 to 4 times faster).
+checked by `dcr-probe --blit-selftest` and `DCR_PROBE_COMPARE=1`, 3 to 4 times faster). Two
+film-loop fixes (1.000.026): a film loop assigned to a sprite by Lingo gets the loop's own size when
+the sprite is not stretched, as bitmaps already did (DirPlayer kept the score's box of the member
+before, so Battle Blitz's opponent portrait drew 2.5 times too large over the fighter grid); and a
+blended sprite inside a film loop is laid over the loop's offscreen with its coverage in the alpha
+channel, so where the loop is empty the stage shows through it (before, a 30% layer over the cleared
+offscreen became an opaque dark box: the selection highlights hid the chosen fighters' portraits).
 `dcr-probe/` (at the repository root) runs a movie in DirPlayer on a PC or server and saves the
 stage as PNGs — for checking a game before it goes on the console.
 
