@@ -1,5 +1,5 @@
-//! PS5_RUFFLE_MENU_V4 — the screen the title opens on: pick a game, set its controls, change
-//! settings, look at badges.
+//! PS5_RUFFLE_MENU_V5 — the screen the title opens on: pick a game, set its controls, change
+//! settings, look at badges; find more online.
 //!
 //! The layout follows ProsperoStore's home screen (darkxex/BlackBearReloaded, GPL-3.0-or-later:
 //! `src/app/store.cpp`): a top bar with the mark, the wordmark and the sections as tabs under a line
@@ -22,6 +22,11 @@
 //! V3: Director / Shockwave games too (src/shockwave.rs): a `.dcr`, `.dir` or `.dxr` file, or a
 //! folder holding one (with its casts and Xtras) — started by the movie its Projector.ini names, or
 //! its only .dcr (src/dirinfo.rs). A folder game's controls are named after the folder.
+//!
+//! V5 (1.000.027): the Online tab (src/online.rs) — Flash games and movies from the Internet
+//! Archive and Flash Museum; a fetched game lands in the games folder in a folder of its own, whose
+//! online.txt names the movie to play and the title to show. A rescan reuses the GPU pictures of
+//! the games before it (each rescan used to add a new set).
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::badges::{self, Badges, Live, BADGES};
@@ -37,25 +42,25 @@ use crate::widgets::*;
 use ruffle_core::events::{LogicalKey, NamedKey, PlayerEvent};
 
 // ---- the layout (store.cpp's constants, 1920x1080) ----
-const MARGIN: f32 = 96.0;
-const RIGHT: f32 = W - MARGIN;
+pub(crate) const MARGIN: f32 = 96.0;
+pub(crate) const RIGHT: f32 = W - MARGIN;
 const TOP_Y: f32 = 64.0; // the top bar's centre line
 const TAB_H: f32 = 44.0;
 const TABS_START: f32 = 560.0;
 const TAB_PAD: f32 = 34.0;
 const TAB_GAP: f32 = 2.0;
-const STAGE_KICKER_Y: f32 = 236.0;
-const STAGE_TITLE_Y: f32 = 330.0;
-const STAGE_META_Y: f32 = 384.0;
-const STAGE_TEXT_Y: f32 = 436.0;
-const STAGE_BUTTONS_Y: f32 = 548.0;
-const SHELF_HEAD_Y: f32 = 694.0;
-const SHELF_TILES_Y: f32 = 718.0;
-const TILE_W: f32 = 368.0;
-const TILE_H: f32 = 207.0;
-const TILE_GAP: f32 = 24.0;
-const TILE_RADIUS: f32 = 18.0;
-const LIFT: f32 = 0.06;
+pub(crate) const STAGE_KICKER_Y: f32 = 236.0;
+pub(crate) const STAGE_TITLE_Y: f32 = 330.0;
+pub(crate) const STAGE_META_Y: f32 = 384.0;
+pub(crate) const STAGE_TEXT_Y: f32 = 436.0;
+pub(crate) const STAGE_BUTTONS_Y: f32 = 548.0;
+pub(crate) const SHELF_HEAD_Y: f32 = 694.0;
+pub(crate) const SHELF_TILES_Y: f32 = 718.0;
+pub(crate) const TILE_W: f32 = 368.0;
+pub(crate) const TILE_H: f32 = 207.0;
+pub(crate) const TILE_GAP: f32 = 24.0;
+pub(crate) const TILE_RADIUS: f32 = 18.0;
+pub(crate) const LIFT: f32 = 0.06;
 const HINTS_Y: f32 = 1012.0;
 const HOLD_BAR_Y: f32 = 842.0;
 const CLOSE_DELAY: f32 = 0.3;
@@ -70,6 +75,8 @@ pub enum Tab {
     Games,
     Favorites,
     Recent,
+    /// V5: games and movies from the Internet Archive and Flash Museum (src/online.rs).
+    Online,
     Badges,
     Settings,
 }
@@ -80,6 +87,7 @@ impl Tab {
             Tab::Games => "Games",
             Tab::Favorites => "Favorites",
             Tab::Recent => "Recent",
+            Tab::Online => "Online",
             Tab::Badges => "Badges",
             Tab::Settings => "Settings",
         }
@@ -130,9 +138,13 @@ pub struct Game {
     pub accent: Color,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Play(usize),
+    /// The Online tab fetched a game, or it was there already: look again, then play this movie.
+    PlayFile(String),
+    /// The Online tab fetched a game: look again.
+    Added(String),
     EditControls(usize),
     EditAllControls,
     Quit,
@@ -202,6 +214,10 @@ pub struct Menu {
     launch: Option<(usize, f32)>,
     /// Seconds since the menu came back: the ribbons sweep off it.
     uncover: f32,
+    /// The Online tab (src/online.rs).
+    pub online: crate::online::Online,
+    /// GPU pictures of the games before a rescan, reused for the games after it.
+    spare_images: Vec<ImageId>,
 }
 
 /// How long the ribbon wipe into a game takes.
@@ -246,6 +262,8 @@ impl Menu {
             settings_hl: Smooth::default(),
             launch: None,
             uncover: 0.0,
+            online: crate::online::Online::new(&paths.games),
+            spare_images: Vec::new(),
         };
         m.scan(paths);
         m
@@ -319,6 +337,7 @@ impl Menu {
         games.sort_by_key(|g| g.name.to_lowercase());
         self.report.push(format!("menu: {} game(s) in {} and USB drives", games.len(), paths.games));
         self.lifts = vec![Smooth::default(); games.len()];
+        self.spare_images.extend(self.games.iter().filter_map(|g| g.thumb));
         self.games = games;
         self.focus = [0; 3];
         self.scroll.snap(0.0);
@@ -337,6 +356,19 @@ impl Menu {
     /// .swf, else the Director movie its projector starts. True if one was added.
     fn folder_game(paths: &Paths, full: &str, name: &str, games: &mut Vec<Game>, report: &mut Vec<String>) -> bool {
         let files = Self::list(full);
+        // V5: a game the Online tab fetched names its movie (the item may hold several .swf files)
+        // and its title in online.txt.
+        let online = crate::online::read_online_txt(&format!("{full}/online.txt"));
+        if let Some(movie) = online.get("movie").filter(|m| std::path::Path::new(&format!("{full}/{m}")).is_file()) {
+            let thumb = [format!("{full}/cover.png"), format!("{full}/icon.png")].into_iter().find(|p| std::path::Path::new(p).is_file());
+            let file = movie.rsplit('/').next().unwrap_or(movie).to_string();
+            let mut g = Self::game(paths, &format!("{full}/{movie}"), &file, Some(name), thumb, report);
+            if let Some(t) = online.get("title").filter(|t| !t.is_empty()) {
+                g.name = t.clone();
+            }
+            games.push(g);
+            return true;
+        }
         if let Some(swf) = files.iter().find(|f| f.to_ascii_lowercase().ends_with(".swf")) {
             let stem = &swf[..swf.len() - 4];
             let thumb = [format!("{full}/{stem}.png"), format!("{full}/cover.png"), format!("{full}/icon.png")].into_iter().find(|p| std::path::Path::new(p).is_file());
@@ -448,7 +480,14 @@ impl Menu {
                 match crate::ui::decode_png(&png) {
                     Ok((w, h, rgba)) if w > 0 && h > 0 => {
                         let (w, h, rgba) = crate::ui::shrink_rgba(w, h, &rgba, 1024);
-                        g.thumb = Some(ui.add_image(device, queue, w, h, &rgba));
+                        // a slot of a picture from before the rescan, else a new one
+                        g.thumb = Some(match self.spare_images.pop() {
+                            Some(id) => {
+                                ui.replace_image(device, queue, id, w, h, &rgba);
+                                id
+                            }
+                            None => ui.add_image(device, queue, w, h, &rgba),
+                        });
                     }
                     Ok(_) => {}
                     Err(e) => self.report.push(format!("menu: {}: picture not decoded: {e}", g.file)),
@@ -522,7 +561,7 @@ impl Menu {
     }
 
     fn tabs(&self, settings: &Settings) -> Vec<Tab> {
-        let mut t = vec![Tab::Games, Tab::Favorites, Tab::Recent];
+        let mut t = vec![Tab::Games, Tab::Favorites, Tab::Recent, Tab::Online];
         if settings.badges {
             t.push(Tab::Badges);
         }
@@ -561,6 +600,23 @@ impl Menu {
         }
     }
 
+    /// After a rescan: the wipe into the game whose movie is `path` (false if it is not listed).
+    pub fn launch_path(&mut self, path: &str) -> bool {
+        match self.games.iter().position(|g| g.path == path) {
+            Some(gi) => {
+                sounds::play(Sfx::Launch);
+                self.launch = Some((gi, 0.0));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Every menu frame: the Online tab's answers, its pictures onto the GPU.
+    pub fn poll_online(&mut self, ui: &mut Ui, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.online.poll(ui, device, queue);
+    }
+
     pub fn live(&self, library: &Library) -> Live {
         Live { games_played: library.played() as u64, library_size: self.games.len() as u64, favorites: library.favorites() as u64 }
     }
@@ -583,6 +639,14 @@ impl Menu {
         }
         if let Some((_, t)) = self.toast.as_mut() {
             *t += dt;
+        }
+        for msg in self.online.take_toasts() {
+            self.toast(&msg);
+        }
+        match self.online.take_outcome() {
+            Some(crate::online::Outcome::Play(path)) => return Some(Action::PlayFile(path)),
+            Some(crate::online::Outcome::Added(path)) => return Some(Action::Added(path)),
+            None => {}
         }
         if self.intro_delay > 0.0 {
             self.intro_delay -= dt;
@@ -646,8 +710,8 @@ impl Menu {
                 self.hold_armed = false;
             }
         }
-        // Typing on a USB keyboard searches the shelves.
-        if tab.shelf().is_some() {
+        // Typing on a USB keyboard searches the shelves (and the Online tab).
+        if tab.shelf().is_some() || tab == Tab::Online {
             for &c in pad.typed {
                 self.type_char(c, badges);
             }
@@ -729,10 +793,24 @@ impl Menu {
             Tab::Settings => {
                 action = self.update_settings(nav, pressed, settings, library);
             }
+            Tab::Online => {
+                self.online.update(dt, nav, pressed, &self.search, self.osk.is_open());
+                if pressed & BTN_L2 != 0 {
+                    self.osk.set_open(true);
+                    sounds::play(Sfx::Select);
+                }
+            }
         }
 
+        // Circle on the Online tab while a game is being fetched: stops that.
+        if tab == Tab::Online && pressed & BTN_CIRCLE != 0 && self.online.busy() {
+            self.online.cancel();
+            sounds::play(Sfx::Back);
+            self.hold_armed = false;
+            pressed &= !BTN_CIRCLE;
+        }
         // Circle: clears a search first; held, it closes the title.
-        if pressed & BTN_CIRCLE != 0 && !self.search.is_empty() && tab.shelf().is_some() {
+        if pressed & BTN_CIRCLE != 0 && !self.search.is_empty() && (tab.shelf().is_some() || tab == Tab::Online) {
             self.search.clear();
             sounds::play(Sfx::Back);
             self.hold_armed = false;
@@ -917,6 +995,7 @@ impl Menu {
             }
             Tab::Badges => self.draw_badges(ui, scene, library, badges),
             Tab::Settings => self.draw_settings(ui, scene, settings),
+            Tab::Online => self.online.draw(ui, scene),
         }
         self.draw_top_bar(ui, scene, &tabs);
         self.draw_hint_row(ui, scene, tab);
@@ -1364,10 +1443,13 @@ impl Menu {
                 }
             }
             Tab::Badges => hints.push((Glyph::DPad(4), "Browse")),
+            Tab::Online => hints.extend(self.online.hints()),
         }
         hints.push((Glyph::Chip("L1"), ""));
         hints.push((Glyph::Chip("R1"), "Sections"));
-        if !(tab == Tab::Settings && self.settings_page.in_rows) {
+        if tab == Tab::Online && self.online.busy() {
+            hints.push((Glyph::Circle, "Cancel"));
+        } else if !(tab == Tab::Settings && self.settings_page.in_rows) {
             hints.push((Glyph::Circle, if self.search.is_empty() { "Close (hold)" } else { "Clear search" }));
         }
         draw_hints(ui, scene, &hints, RIGHT, HINTS_Y);

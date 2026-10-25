@@ -16,7 +16,7 @@ crate-type = ["staticlib", "rlib"]
 default = []
 # Phase 3b: Ruffle itself. The default build (3a) is only the GPU seam: wgpu on the static RADV,
 # clearing the display — nothing of Ruffle is compiled, so nothing of Ruffle can block it.
-ruffle = ["dep:ruffle_core", "dep:ruffle_render", "dep:ruffle_render_wgpu", "dep:ruffle_video_software", "dep:url", "dep:vm-rust"]
+ruffle = ["dep:ruffle_core", "dep:ruffle_render", "dep:ruffle_render_wgpu", "dep:ruffle_video_software", "dep:url", "dep:vm-rust", "dep:r5net", "dep:image"]
 
 [dependencies]
 # Pinned to a Ruffle revision whose render/wgpu uses wgpu 30 (clone HEAD 2026-10-19).
@@ -42,6 +42,12 @@ url = { version = "2", optional = true }
 # Director / Shockwave games (src/shockwave.rs): DirPlayer's VM, fetched into vendor/dirplayer at the
 # commit tools/fetch-dirplayer.sh pins, with tools/dirplayer-native.patch (build-title.sh runs it).
 vm-rust = { path = "vendor/dirplayer/vm-rust", default-features = false, optional = true }
+# The Online tab (src/online.rs): HTTPS and the online sources, in net/ (its own crate, so that
+# `cargo run --example online-check` there tries them from a PC: tools/online-check.sh).
+r5net = { path = "net", optional = true }
+# The online sources' pictures (JPEG, GIF, PNG; WebP for Flash Museum). Ruffle already builds
+# `image` 0.25 with png/jpeg/gif; webp adds the pure-Rust image-webp.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"], optional = true }
 
 # Bring-your-own-Vulkan: the instance/surface/device are built on the statically linked RADV and
 # handed to wgpu through its `from_hal` seams. Versions must match what Ruffle's wgpu pins

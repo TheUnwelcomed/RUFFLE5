@@ -22,6 +22,11 @@ pub extern "C" fn ps5_local_hour() -> c_int {
 }
 
 #[no_mangle]
+pub extern "C" fn ps5_net_init() -> c_int {
+    0
+}
+
+#[no_mangle]
 pub extern "C" fn ps5_vk_get_instance_proc_addr() -> *const c_void {
     std::ptr::null()
 }

@@ -14,6 +14,10 @@
 | [ruffle_video_software](https://github.com/ruffle-rs/ruffle) | FLV video (H.263, VP6, Screen Video) | MIT / Apache-2.0 |
 | [DirPlayer](https://github.com/igorlira/dirplayer-rs) (`vm-rust`), by Igor Lira and contributors | the Director / Shockwave player for `.dcr` / `.dir` games (`src/shockwave.rs`), fetched at a pinned commit by `tools/fetch-dirplayer.sh` and patched by `tools/dirplayer-native.patch` (native embedding, a sound mixer without a browser) | GPL-3.0-only — so a Ruffle5 built with it is distributed under the GPL version 3 |
 | [Symphonia](https://github.com/pdeljanov/Symphonia) | MP3 decoding for Shockwave sound off the web (also Ruffle's MP3 decoder) | MPL-2.0 |
+| [rustls](https://github.com/rustls/rustls) 0.23, [rustls-webpki](https://github.com/rustls/webpki) | TLS for the Online tab (`net/`) | Apache-2.0 / ISC / MIT; webpki: ISC |
+| [rustls-rustcrypto](https://github.com/RustCrypto/rustls-rustcrypto) (pinned commit) and the [RustCrypto](https://github.com/RustCrypto) crates it uses (AES-GCM, ChaCha20-Poly1305, SHA-2, HMAC/HKDF, P-256/P-384, RSA, Ed25519/X25519 via [curve25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek)) | TLS's cryptography, in Rust | MIT / Apache-2.0 (curve25519-dalek: BSD-3-Clause) |
+| [webpki-roots](https://github.com/rustls/webpki-roots) | Mozilla's root certificates (from the CCADB), compiled in | CDLA-Permissive-2.0 |
+| [image](https://github.com/image-rs/image) with [image-webp](https://github.com/image-rs/image-webp) | the online sources' pictures (JPEG, GIF, PNG, WebP) | MIT / Apache-2.0 |
 | [ab_glyph](https://github.com/alexheretic/ab-glyph), [png](https://github.com/image-rs/image-png), [flate2](https://github.com/rust-lang/flate2-rs), [url](https://github.com/servo/rust-url) | glyph rasterising, pictures (reading and writing), SWF header inflation, the pretend site's URL | Apache-2.0 / MIT |
 
 Ruffle5 itself is GPL-3.0-or-later (the repository's `LICENSE`).

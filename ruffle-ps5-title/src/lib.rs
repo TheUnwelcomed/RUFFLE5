@@ -45,6 +45,11 @@
 //! the pink block over the fighter grid), and a see-through layer inside a film loop stays
 //! see-through (the pulsing highlight over the chosen fighters hid their portraits under a dark box).
 //!
+//! 1.000.027 (2026-10-24): the Online tab (src/online.rs, net/): Flash games and movies from the
+//! Internet Archive's Flash collection and Flash Museum, searched and fetched into the games folder
+//! from the menu, over HTTPS (rustls with RustCrypto) on the console's sockets; `sceNetInit` from the
+//! shell (V6) before the first socket; a rescan reuses the GPU pictures it replaces.
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -52,7 +57,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.026";
+pub const APP_VERSION: &str = "1.000.027";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 
@@ -89,6 +94,8 @@ mod keyboard;
 mod library;
 #[cfg(feature = "ruffle")]
 mod menu;
+#[cfg(feature = "ruffle")]
+mod online;
 #[cfg(feature = "ruffle")]
 mod paths;
 #[cfg(feature = "ruffle")]
@@ -395,17 +402,17 @@ fn run_app(gpu: gpu::Gpu, paths: paths::Paths) -> Result<(), String> {
                 }
                 Some(menu::Action::EditAllControls) => editor = Some(editor::Editor::open(&app.paths, editor::Target::AllGames, None)),
                 Some(menu::Action::Rescan) => {
-                    app.menu.scan(&app.paths);
-                    if let Ok(mut ui) = app.display.ui.lock() {
-                        app.menu.load_pictures(&mut ui, &app.display.device, &app.display.queue);
-                    }
-                    for line in &app.menu.report {
-                        say(&format!("     {line}"));
-                    }
+                    rescan(&mut app);
                     let found = format!("{} game(s) found", app.menu.games.len());
                     app.menu.toast(&found);
-                    let live = app.menu.live(&app.library);
-                    app.badges.check(&live);
+                }
+                Some(menu::Action::Added(_)) => rescan(&mut app),
+                Some(menu::Action::PlayFile(path)) => {
+                    rescan(&mut app);
+                    if !app.menu.launch_path(&path) {
+                        say(&format!("menu: {path} is not among the games after the rescan"));
+                        app.menu.toast("That game is not in the list (see ruffle.log)");
+                    }
                 }
                 Some(menu::Action::ClearRecent) => {}
                 Some(menu::Action::Setting(row)) => apply_setting(&mut app, row, &mut bg),
@@ -420,6 +427,7 @@ fn run_app(gpu: gpu::Gpu, paths: paths::Paths) -> Result<(), String> {
             {
                 let mut ui = app.display.ui.lock().map_err(|_| "ui lock")?;
                 app.menu.poll_cover(dt, &mut ui, &app.display.device, &app.display.queue);
+                app.menu.poll_online(&mut ui, &app.display.device, &app.display.queue);
                 app.menu.draw(&mut ui, &mut scene, dt, &app.settings, &app.library, &mut app.badges, bg.is_some());
                 if let Some(ed) = editor.as_mut() {
                     ed.draw(&mut ui, &mut scene, 1.0, false);
@@ -452,6 +460,20 @@ fn run_app(gpu: gpu::Gpu, paths: paths::Paths) -> Result<(), String> {
             say("game: restarting");
         }
     }
+}
+
+/// Look for games again (the Settings row, or a game the Online tab fetched).
+#[cfg(feature = "ruffle")]
+fn rescan(app: &mut App) {
+    app.menu.scan(&app.paths);
+    if let Ok(mut ui) = app.display.ui.lock() {
+        app.menu.load_pictures(&mut ui, &app.display.device, &app.display.queue);
+    }
+    for line in &app.menu.report {
+        say(&format!("     {line}"));
+    }
+    let live = app.menu.live(&app.library);
+    app.badges.check(&live);
 }
 
 #[cfg(feature = "ruffle")]

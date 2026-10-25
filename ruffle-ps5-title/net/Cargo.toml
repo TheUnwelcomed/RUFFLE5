@@ -1,0 +1,26 @@
+[package]
+name = "r5net"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Ruffle5's network: HTTPS (rustls, pure-Rust crypto) and the online Flash sources"
+
+# Its own package (not a workspace member of the title): `cargo run --example online-check` here
+# builds only this and its few dependencies, on any PC.
+[workspace]
+
+[dependencies]
+# TLS without C or assembly: rustls with RustCrypto's algorithms. The provider's last release
+# (0.0.2-alpha, 2024) predates its move to the released RustCrypto 0.11/0.14 crates, so it comes
+# from its repository at a fixed commit (master, 2026-08-28).
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+rustls-rustcrypto = { git = "https://github.com/RustCrypto/rustls-rustcrypto", rev = "70f76c039e587192688af18a80d5d6435dedaf22" }
+# Mozilla's root certificates, compiled in.
+webpki-roots = "1"
+# Already in the title's tree (Ruffle, DirPlayer).
+serde_json = "1"
+log = "0.4"
+
+# The plain socket() path (src/http.rs), should the console refuse std's SOCK_CLOEXEC socket.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

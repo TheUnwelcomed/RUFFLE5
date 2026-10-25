@@ -1,4 +1,4 @@
-/* PS5_RUFFLE_SHELL_V5 — the C shell of the Ruffle PS5 title.
+/* PS5_RUFFLE_SHELL_V6 — the C shell of the Ruffle PS5 title.
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Small on purpose: it does the few things that must happen from the title executable itself,
@@ -18,6 +18,7 @@
  * console's local hour (badges).
  * V5 (1.000.022): the USB keyboard and mouse system modules load first thing in main(), before the
  * title opens /data or touches the GPU (shell/hid.c V2), and their answers are logged.
+ * V6 (1.000.027): ps5_net_init(), sceNetInit once, for the Online tab's first socket.
  */
 #include <stdarg.h>
 #include <stdint.h>
@@ -74,6 +75,22 @@ int ps5_local_hour(void)
     return tm.tm_hour;
 }
 
+/* The network library, before the first socket: a title's BSD sockets answer EACCES until the
+ * process has done sceNetInit (measured, see the repository README). The Online tab (src/online.rs)
+ * calls this when it starts; once. -1000: the import is not bound on this console. */
+int sceNetInit(void);
+int ps5_import_missing(const char *name);
+int ps5_net_init(void)
+{
+    static int done = 0, rc = 0;
+    if (!done) {
+        int (*volatile f)(void) = sceNetInit;
+        rc = (!f || ps5_import_missing("sceNetInit")) ? -1000 : f();
+        done = 1;
+    }
+    return rc;
+}
+
 /* USB keyboard and mouse system modules (shell/hid.c). */
 void ps5_hid_preload(void);
 int32_t ps5_hid_sysmodule_rc(int which);
@@ -89,7 +106,7 @@ int main(int argc, char **argv)
     ps5_hid_preload();
     mkdir(DATA_DIR, 0777);
     g_log = fopen(DATA_DIR "/ruffle.log", "w");
-    ps5_log("ruffle-ps5 shell (PS5_RUFFLE_SHELL_V5) up");
+    ps5_log("ruffle-ps5 shell (PS5_RUFFLE_SHELL_V6) up");
 
     char line[160];
     snprintf(line, sizeof line, "usb: sysmodule keyboard 0x0106 = 0x%08x, mouse 0x00a9 = 0x%08x (loaded first)",
