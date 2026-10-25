@@ -90,6 +90,16 @@ pub unsafe extern "C" fn ps5_hid_read(_which: i32, _handle: i32, _data: *mut u8,
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn ps5_hid_read_state(_handle: i32, _data: *mut u8) -> i32 {
+    -1000
+}
+
+#[no_mangle]
+pub extern "C" fn ps5_hid_close(_which: i32, _handle: i32) -> i32 {
+    -1
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn scePthreadGetaffinity(_thread: usize, mask: *mut u64) -> i32 {
     *mask = 0;
     -1

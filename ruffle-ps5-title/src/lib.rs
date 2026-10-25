@@ -34,6 +34,12 @@
 //! drawn upright take a per-row path (3 to 4 times faster); the log names the first USB key and
 //! mouse movement.
 //!
+//! 1.000.025 (2026-10-24): USB keyboard and mouse V4 (src/hid.rs, shell/hid.c): the log shows what
+//! the console answers each handle (kinds of read answer, first records with their bytes,
+//! connections, the system holding the keyboard); `sceKeyboardReadState` is tried while
+//! `sceKeyboardRead` gives nothing; handles are opened again every 5 s while no device has shown
+//! up on them (a keyboard plugged in after start did nothing in 1.000.023).
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -41,7 +47,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.024";
+pub const APP_VERSION: &str = "1.000.025";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 

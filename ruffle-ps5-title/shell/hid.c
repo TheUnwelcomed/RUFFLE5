@@ -1,4 +1,4 @@
-/* PS5_RUFFLE_HID_V3 — a USB keyboard and mouse, for src/hid.rs.
+/* PS5_RUFFLE_HID_V4 — a USB keyboard and mouse, for src/hid.rs.
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * libSceKeyboard and libSceMouse are not loaded for a title. They are system modules: loaded with
@@ -29,6 +29,13 @@
  * They are read through volatile pointers, since an unbound import reads as NULL. The handle
  * lookup stays as the second way, for a console that exports it.
  *
+ * V4 (1.000.025), after V3 on hardware: the functions bound (direct imports), init answered 0 and
+ * handles opened for index 0 and 1, but a keyboard plugged in after start did nothing. Also
+ * imported: sceKeyboardReadState, the keyboard's current state (prospero-win reads it, "measured
+ * on the console"; OpenOrbis's PS4 sample too), which src/hid.rs asks while sceKeyboardRead gives
+ * nothing (ps5_hid_read_state; -1000 when the console leaves it unbound); and close, so src/hid.rs
+ * can open the handles again (ps5_hid_close).
+ *
  * The system calls it does use are checked first against the title's import table (build-title.sh
  * links a table of every import; one the console does not export is bound to NULL, and calling it
  * would end the title): `ps5_import_missing`, also used by src/cpu.rs.
@@ -54,6 +61,7 @@ int sceMouseInit(void);
 int sceMouseOpen(int user, int type, int index, const void *param);
 int sceMouseRead(int handle, void *data, int count);
 int sceMouseClose(int handle);
+int sceKeyboardReadState(int handle, void *state);
 
 /* The direct imports for the keyboard (0) or mouse (1); NULL where the loader left one unbound. */
 static void direct_imports(int which, void *fns[4])
@@ -229,4 +237,21 @@ int ps5_hid_open(int which, int user, int index)
 int ps5_hid_read(int which, int handle, void *data, int count)
 {
     return which >= 0 && which <= 1 && g_hid[which].read ? g_hid[which].read(handle, data, count) : -1;
+}
+
+/* The keyboard's current state (one 96-byte record) into `state`: 0, negative on error, -1000 when
+ * the console left sceKeyboardReadState unbound (read through a volatile pointer: an unbound
+ * import reads as NULL). */
+int ps5_hid_read_state(int handle, void *state)
+{
+    int (*volatile f)(int, void *) = sceKeyboardReadState;
+    if (!f || ps5_import_missing("sceKeyboardReadState"))
+        return -1000;
+    return f(handle, state);
+}
+
+/* Close a keyboard (0) or mouse (1) handle; negative on error, -1 without the function. */
+int ps5_hid_close(int which, int handle)
+{
+    return which >= 0 && which <= 1 && g_hid[which].close ? g_hid[which].close(handle) : -1;
 }

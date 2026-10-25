@@ -98,7 +98,7 @@ two settings can be compared on the same game.
 | `src/covers.rs` | a game's own cover picture, taken from its frame |
 | `src/saves.rs` | Flash saves (SharedObjects) on disk |
 | `src/ps5ui.rs` | Ruffle's UI hooks: text boxes open the keyboard, the pointer can be hidden |
-| `src/hid.rs` + `shell/hid.c` | a USB keyboard and mouse (loaded at run time, not imported) |
+| `src/hid.rs` + `shell/hid.c` | a USB keyboard and mouse (system modules loaded first thing in `main()`, functions imported directly; the log shows what the console answers) |
 | `src/cpu.rs` | a CPU core of its own for the sound |
 | `src/sounds.rs` | the menu's sounds, on their own audio port |
 | `src/input.rs` | the DualSense (and USB devices) as keyboard and mouse; menu navigation with auto-repeat |

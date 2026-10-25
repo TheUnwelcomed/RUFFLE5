@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# PS5_RUFFLE_TITLE_BUILD_V7 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
+# PS5_RUFFLE_TITLE_BUILD_V8 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
 # under Games. Phase 3a by default (wgpu on the static RADV clears the display); 3b with --ruffle.
+# V8 (1.000.025): the first line of the log names the version and when the build started, so
+# tools/ruffle5-status.sh can tell a log of this build from the last one's.
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Three proven pieces, joined:
@@ -37,6 +39,7 @@ need() { [[ -e "$1" ]] || die "$2"; }
 RUFFLE=0; CLEAN=0
 for a in "$@"; do case "$a" in --ruffle) RUFFLE=1 ;; --clean) CLEAN=1 ;; -h|--help) sed -n '2,30p' "$0"; exit 0 ;; *) die "unknown option $a" ;; esac; done
 JOBS="${JOBS:-4}"
+log "Ruffle5 $(sed -n 's/^pub const APP_VERSION: &str = "\(.*\)";/\1/p' src/lib.rs) — build started $(date '+%Y-%m-%d %H:%M')"
 NICE=(nice -n 19); command -v ionice >/dev/null 2>&1 && NICE+=(ionice -c 2 -n 7)
 
 # --- 1. environment -------------------------------------------------------------------------------
