@@ -181,6 +181,15 @@ before, so Battle Blitz's opponent portrait drew 2.5 times too large over the fi
 blended sprite inside a film loop is laid over the loop's offscreen with its coverage in the alpha
 channel, so where the loop is empty the stage shows through it (before, a 30% layer over the cleared
 offscreen became an opaque dark box: the selection highlights hid the chosen fighters' portraits).
+1.000.032: a film loop on the stage is drawn at the size DirPlayer's WebGL2 renderer gives it (the
+loop's own rect, from the cast member); the size worked out from its score's records can be the
+whole stage (Trick or Treat Beat!'s Keys_Loop says 432x330 for a 93x50 loop), and the loop was
+squeezed by that much: every power in that game (spell, smash, keys, swim) showed as a few dots and
+the character vanished while it played; Battle Blitz's fighters and names on the select screen drew
+narrowed. Checked with `DCR_PROBE_COMPARE=3` (each stage drawn both ways): only film-loop stages
+differ. And a sprite whose foreColor/backColor are set but left at black and white takes the
+upright path with a 32-bit picture, as those colours tint nothing (Supersonic RC's whole stage: the
+blit went from 11–13 ms to 2 ms a frame on a PC, the same pixels in 630 race frames).
 1.000.028, in the patch: text in a font the movie does not carry (Arial, Times New Roman, Verdana…)
 no longer stops the game — DirPlayer asked a browser's canvas for it; off the web `native_text.rs`
 lays it out and draws it with the Liberation fonts (`fonts/liberation/`, the advance widths of
@@ -295,6 +304,14 @@ A game stays in the games folder after it is played; Settings › Library › *K
 deletes a fetched game when it is left (its saves stay), and OPTIONS on any game's tile deletes it
 there and then.
 
+The trash folder (1.000.032). On the console every removal of a game's folder was refused
+("Operation not permitted", 1.000.031's log), while renaming works. What Ruffle5 cannot remove it
+moves into `games/.ruffle5-trash/`: the game leaves the menu (a folder whose name starts with a dot
+is never listed), the files stay on the disk until they can be removed. Each start tries to empty
+it and says in ruffle.log what is left and why; you can also delete the folder over FTP. The log's
+`files: removing in …` lines say what removing a file, an empty folder and a folder of files
+answers in the games folder and in `/data/ruffle5`, and whether renaming works.
+
 HTTPS is `net/`'s: rustls 0.23 with RustCrypto's algorithms (no C, no assembly) and Mozilla's root
 certificates compiled in, on the console's own sockets and resolver; the title calls `sceNetInit`
 first (a title's sockets answer EACCES before it). Names are looked up by the kit's `evo_dns.c`
@@ -382,8 +399,11 @@ Me: Cross/Triangle = A, Square/Circle = S, R1 = Q); then a `<movie>.controls.txt
 
 ## The log
 
-`/data/ruffle5/ruffle.log` (FTP). While a game plays, every 5 s, in Ruffle-Flash-PS5's format so
-the same SWF can be compared in both players:
+`/data/ruffle5/ruffle.log` (FTP). Since 1.000.032 it keeps the runs before (each starts with a
+`==== Ruffle5 started <date> ====` line); past 1 MB the oldest are cut, keeping the last 512 KB.
+A step of a game's loop that takes 5 s or more is named (`watchdog: <game>: still in <step> after
+<n> s`, then how long it took): a game that hangs says where. While a game plays, every 5 s, in
+Ruffle-Flash-PS5's format so the same SWF can be compared in both players:
 
 ```
 [Game] 5 s: 300 ticks, 300 frames drawn, 0 read back, 0 readbacks failed, root frame Some(42), playing true

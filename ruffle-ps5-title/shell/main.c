@@ -1,4 +1,4 @@
-/* PS5_RUFFLE_SHELL_V7 — the C shell of the Ruffle PS5 title.
+/* PS5_RUFFLE_SHELL_V8 — the C shell of the Ruffle PS5 title.
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Small on purpose: it does the few things that must happen from the title executable itself,
@@ -22,6 +22,9 @@
  * V7 (1.000.029): evo_boot_log() — the console resolver's own log (the kit's evo_dns.c, which
  * answers the title's name lookups) goes into ruffle.log as "dns: ..." lines, in place of the kit's
  * shell/boot_log.c (a folder of the kit's hello app, which this title does not have).
+ * V8 (1.000.032): ruffle.log keeps the runs before this one. Each run is added after a line with the
+ * console's date and time; past 1 MB the file is cut to its last 512 KB at a line start. Until now
+ * every start emptied it, so a game that hung, then a restart, left nothing of the hang.
  */
 #include <stdarg.h>
 #include <stdint.h>
@@ -57,11 +60,73 @@ void ps5_notify(const char *msg)
 
 /* ---- a log in the title's data folder (FTP: /data/ruffle5/ruffle.log) ---- */
 #define DATA_DIR "/data/ruffle5"
+#define LOG_PATH DATA_DIR "/ruffle.log"
+/* V8: the runs before this one are kept; past LOG_MAX bytes the file is cut to its last LOG_KEEP. */
+#define LOG_MAX (1024L * 1024L)
+#define LOG_KEEP (512L * 1024L)
 /* Where the menu looks for games, and where every controls mapping lives: the title's own folder
  * (PPSA99620 is sce_sys/param.json's titleId; build-title.sh checks the two agree). */
 #define GAMES_DIR "/data/homebrew/PPSA99620/games"
 #define MAPPINGS_DIR "/data/homebrew/PPSA99620/Custom Mappings"
 static FILE *g_log;
+
+/* The log's size, or -1 (stdio only: fseek/ftell). */
+static long log_size(void)
+{
+    FILE *f = fopen(LOG_PATH, "rb");
+    if (!f)
+        return -1;
+    long size = -1;
+    if (fseek(f, 0, SEEK_END) == 0)
+        size = ftell(f);
+    fclose(f);
+    return size;
+}
+
+/* Past LOG_MAX: keep the last LOG_KEEP bytes from the first whole line in them (written beside,
+ * then renamed over). Returns how many bytes were dropped (0: nothing done). */
+static long trim_log(void)
+{
+    const long size = log_size();
+    if (size <= LOG_MAX)
+        return 0;
+    FILE *in = fopen(LOG_PATH, "rb");
+    if (!in)
+        return 0;
+    static char keep[LOG_KEEP];
+    long got = 0;
+    if (fseek(in, size - LOG_KEEP, SEEK_SET) == 0)
+        got = (long)fread(keep, 1, sizeof keep, in);
+    fclose(in);
+    long start = 0;
+    while (start < got && keep[start] != '\n')
+        start++;
+    if (start < got)
+        start++;
+    FILE *out = fopen(DATA_DIR "/ruffle.log.tmp", "wb");
+    if (!out)
+        return 0;
+    fprintf(out, "(older runs cut: the log keeps about its last %ld KB)\n", LOG_KEEP / 1024);
+    fwrite(keep + start, 1, (size_t)(got - start), out);
+    fclose(out);
+    if (rename(DATA_DIR "/ruffle.log.tmp", LOG_PATH) != 0)
+        return 0;
+    return size - (got - start);
+}
+
+/* The console's date and time, "2026-10-25 11:30:00" (or "time unknown"). */
+static void local_time_text(char *out, size_t size)
+{
+    time_t now = time(NULL);
+    struct tm tm;
+    if (now == (time_t)-1 || !localtime_r(&now, &tm)) {
+        snprintf(out, size, "time unknown");
+        return;
+    }
+    snprintf(out, size, "%04d-%02d-%02d %02d:%02d:%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec);
+}
+
 void ps5_log(const char *msg)
 {
     if (g_log) { fprintf(g_log, "%s\n", msg); fflush(g_log); }
@@ -120,10 +185,19 @@ int main(int argc, char **argv)
     /* before /data and the GPU: see shell/hid.c */
     ps5_hid_preload();
     mkdir(DATA_DIR, 0777);
-    g_log = fopen(DATA_DIR "/ruffle.log", "w");
-    ps5_log("ruffle-ps5 shell (PS5_RUFFLE_SHELL_V7) up");
-
+    const long dropped = trim_log();
+    g_log = fopen(LOG_PATH, "a");
     char line[160];
+    char when[40];
+    local_time_text(when, sizeof when);
+    snprintf(line, sizeof line, "\n==== Ruffle5 started %s ====", when);
+    ps5_log(line);
+    ps5_log("ruffle-ps5 shell (PS5_RUFFLE_SHELL_V8) up");
+    if (dropped > 0) {
+        snprintf(line, sizeof line, "log: %ld KB of older runs cut (it keeps about %ld KB)", dropped / 1024, LOG_KEEP / 1024);
+        ps5_log(line);
+    }
+
     snprintf(line, sizeof line, "usb: sysmodule keyboard 0x0106 = 0x%08x, mouse 0x00a9 = 0x%08x (loaded first)",
              (unsigned)ps5_hid_sysmodule_rc(0), (unsigned)ps5_hid_sysmodule_rc(1));
     ps5_log(line);

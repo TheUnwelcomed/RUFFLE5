@@ -400,36 +400,47 @@ impl Menu {
 
     /// 1.000.028: delete game `gi` — its own folder (a folder game), else its movie and the picture
     /// beside it. Its saves, cover and play time stay (they are kept by its key, so a game fetched
-    /// again finds them). Never a folder the menu looks in itself. Returns what went, for the log.
-    pub fn delete_game(&self, gi: usize) -> Result<String, String> {
+    /// again finds them). Never a folder the menu looks in itself. Returns what went, for the log,
+    /// and whether it went to the trash folder rather than off the disk.
+    ///
+    /// 1.000.032: what the console refuses to remove (every removal in the 1.000.031 log) is moved
+    /// into the games folder's `.ruffle5-trash` (fsutil::remove_or_trash), which the menu does not
+    /// list; Ruffle5 tries to empty it at each start.
+    pub fn delete_game(&self, gi: usize) -> Result<(String, bool), String> {
+        use crate::fsutil::{remove_or_trash, Removed};
         let g = self.games.get(gi).ok_or_else(|| "no such game".to_string())?;
         let roots = scan_roots(&self.games_dir);
-        let in_root = |p: &str| std::path::Path::new(p).parent().map(|d| d.to_string_lossy().into_owned()).is_some_and(|d| roots.contains(&d));
+        let root_of = |p: &str| std::path::Path::new(p).parent().map(|d| d.to_string_lossy().into_owned()).filter(|d| roots.contains(d));
+        let said = |what: &str, r: Removed| match r {
+            Removed::Gone => (what.to_string(), false),
+            Removed::Trashed(to, why) => (format!("{what} moved to {to} (the console refused removing it: {why})"), true),
+        };
         match &g.folder {
             Some(folder) => {
                 let name = std::path::Path::new(folder).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                if !in_root(folder) || name.is_empty() || name.starts_with('.') || roots.contains(folder) {
+                let Some(root) = root_of(folder).filter(|_| !name.is_empty() && !name.starts_with('.') && !roots.contains(folder)) else {
                     return Err(format!("{folder} is not a game's own folder"));
-                }
-                std::fs::remove_dir_all(folder).map_err(|e| format!("{folder}: {e}"))?;
-                Ok(format!("{folder}/"))
+                };
+                let r = remove_or_trash(folder, &root).map_err(|e| format!("{folder}: {e}"))?;
+                Ok(said(&format!("{folder}/"), r))
             }
             None => {
-                if !in_root(&g.path) {
+                let Some(root) = root_of(&g.path) else {
                     return Err(format!("{} is not in a games folder", g.path));
-                }
-                std::fs::remove_file(&g.path).map_err(|e| format!("{}: {e}", g.path))?;
-                let mut gone = vec![g.path.clone()];
+                };
+                let (mut text, trashed) = said(&g.path, remove_or_trash(&g.path, &root).map_err(|e| format!("{}: {e}", g.path))?);
                 if let Some((dir, file)) = g.path.rsplit_once('/') {
                     let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
                     for ext in ["png", "PNG"] {
                         let picture = format!("{dir}/{stem}.{ext}");
-                        if std::fs::remove_file(&picture).is_ok() {
-                            gone.push(picture);
+                        if std::path::Path::new(&picture).is_file() {
+                            if let Ok(r) = remove_or_trash(&picture, &root) {
+                                text.push_str(&format!(", {}", said(&picture, r).0));
+                            }
                         }
                     }
                 }
-                Ok(gone.join(", "))
+                Ok((text, trashed))
             }
         }
     }
@@ -443,8 +454,12 @@ impl Menu {
         files
     }
 
-    /// The game in folder `full` (named after `name`, the folder in the games folder): its first
-    /// .swf, else the Director movie its projector starts. True if one was added.
+    /// The game in folder `full` (named after `name`, the folder in the games folder): the Director
+    /// movie its projector starts, else its first .swf. True if one was added.
+    ///
+    /// 1.000.032: Director first. A Director game's folder can hold .swf files of its own (Flash cast
+    /// members, a web site's advert loader): Paul Blart: Mall Cop's (gameloader.dcr, paul_blart.dcr,
+    /// advert_loader.swf) started its 100x100 advert loader, a white screen.
     fn folder_game(paths: &Paths, full: &str, name: &str, games: &mut Vec<Game>, report: &mut Vec<String>) -> bool {
         let files = Self::list(full);
         // V5: a game the Online tab fetched names its movie (the item may hold several .swf files)
@@ -467,17 +482,20 @@ impl Menu {
             games.push(g);
             return true;
         }
-        if let Some(swf) = files.iter().find(|f| f.to_ascii_lowercase().ends_with(".swf")) {
-            let stem = &swf[..swf.len() - 4];
-            let thumb = [format!("{full}/{stem}.png"), format!("{full}/cover.png"), format!("{full}/icon.png")].into_iter().find(|p| std::path::Path::new(p).is_file());
-            games.push(Self::game(paths, &format!("{full}/{swf}"), swf, Some(name), thumb, report));
-            return true;
-        }
         if let Some(movie) = crate::dirinfo::launcher(full, &files) {
             // A Director game in its own folder: named and mapped after the folder.
             let thumb = [format!("{full}/{name}.png"), format!("{full}/cover.png"), format!("{full}/icon.png")].into_iter().find(|p| std::path::Path::new(p).is_file());
             let controls_path = format!("{full}/{name}.dcr");
+            if let Some(swf) = files.iter().find(|f| f.to_ascii_lowercase().ends_with(".swf")) {
+                report.push(format!("menu: {full}/: Director movie {movie} chosen over {swf}"));
+            }
             games.push(Self::director_game(paths, &format!("{full}/{movie}"), name, &controls_path, Some(name), thumb));
+            return true;
+        }
+        if let Some(swf) = files.iter().find(|f| f.to_ascii_lowercase().ends_with(".swf")) {
+            let stem = &swf[..swf.len() - 4];
+            let thumb = [format!("{full}/{stem}.png"), format!("{full}/cover.png"), format!("{full}/icon.png")].into_iter().find(|p| std::path::Path::new(p).is_file());
+            games.push(Self::game(paths, &format!("{full}/{swf}"), swf, Some(name), thumb, report));
             return true;
         }
         false
@@ -1638,6 +1656,11 @@ mod tests {
         mk("flat/game.dcr", b"XFIR\0\0\0\0MDGF");
         // nothing playable
         mk("notes/readme.txt", b"hi");
+        // 1.000.032: a Director game with a Flash file of its own (Paul Blart: Mall Cop's layout)
+        mk("Paul Blart Mall Cop/advert_loader.swf", b"FWS\x08\x15\0\0\0\x30\0\x01\x00\x0c\x01\x00");
+        mk("Paul Blart Mall Cop/gameloader.dcr", b"XFIR\0\0\0\0MDGF");
+        mk("Paul Blart Mall Cop/paul_blart.dcr", b"XFIR\0\0\0\0MDGF");
+        mk("Paul Blart Mall Cop/mallcop.exe", b"MZ");
         let p = |s: &str| {
             let d = root.join(s);
             std::fs::create_dir_all(&d).unwrap();
@@ -1646,7 +1669,10 @@ mod tests {
         let paths = Paths::new(&p("data"), &p("games"), &p("maps"));
         let menu = Menu::new(&paths);
         let names: Vec<&str> = menu.games.iter().map(|g| g.name.as_str()).collect();
-        assert_eq!(names, ["Flat", "Ttbattleblitz"], "{:?}", menu.report);
+        assert_eq!(names, ["Flat", "Paul Blart Mall Cop", "Ttbattleblitz"], "{:?}", menu.report);
+        let pb = menu.games.iter().find(|g| g.name == "Paul Blart Mall Cop").unwrap();
+        assert!(pb.path.ends_with("Paul Blart Mall Cop/gameloader.dcr"), "the Director movie, not the advert loader: {}", pb.path);
+        assert!(menu.report.iter().any(|l| l.contains("gameloader.dcr chosen over advert_loader.swf")), "{:?}", menu.report);
         let tt = menu.games.iter().find(|g| g.name == "Ttbattleblitz").unwrap();
         assert!(tt.path.ends_with("ttbattleblitz/ttbattleblitz/gamewrapper.dir"), "{}", tt.path);
         assert_eq!(crate::controls::movie_stem(&tt.controls_path), "ttbattleblitz");
@@ -1701,12 +1727,19 @@ mod tests {
         menu.scan(&paths);
         let l = find(&menu, "Loose");
         assert_eq!(menu.games[l].folder, None);
-        let gone = menu.delete_game(l).unwrap();
-        assert!(gone.contains("Loose.swf") && gone.contains("Loose.png"), "{gone}");
+        let (gone, trashed) = menu.delete_game(l).unwrap();
+        assert!(gone.contains("Loose.swf") && gone.contains("Loose.png") && !trashed, "{gone}");
         assert!(games.join("Other.swf").is_file() && games.is_dir());
 
         menu.scan(&paths);
         assert_eq!(menu.games.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["Other"]);
+        // what waits in the trash folder (a removal the console refused) is not listed
+        std::fs::create_dir_all(games.join(crate::fsutil::TRASH).join("Fetched")).unwrap();
+        std::fs::write(games.join(crate::fsutil::TRASH).join("Fetched/game.swf"), b"FWS").unwrap();
+        menu.scan(&paths);
+        assert_eq!(menu.games.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["Other"]);
+        assert!(!menu.report.iter().any(|l| l.contains(crate::fsutil::TRASH)), "{:?}", menu.report);
+        let _ = std::fs::remove_dir_all(games.join(crate::fsutil::TRASH));
         // never the games folder itself
         menu.games[0].folder = Some(games.to_string_lossy().into_owned());
         assert!(menu.delete_game(0).is_err());

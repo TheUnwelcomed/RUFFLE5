@@ -325,7 +325,13 @@ pub fn fetch_files(client: &Client, source: Source, item: &Item, files: &Files, 
     std::fs::create_dir_all(&folder).map_err(|e| format!("making {folder}: {e}"))?;
     let undo = |why: String| -> String {
         if created {
-            let _ = std::fs::remove_dir_all(&folder);
+            // 1.000.032: by paths if std's way leaves it; into the trash folder if the console
+            // refuses removing it (fsutil::remove_or_trash); said in the log if neither works
+            match crate::fsutil::remove_or_trash(&folder, games_dir) {
+                Ok(crate::fsutil::Removed::Gone) => {}
+                Ok(crate::fsutil::Removed::Trashed(to, why)) => crate::say(&format!("online: {folder} moved to {to} after the failed fetch (the console refused removing it: {why})")),
+                Err(e) => crate::say(&format!("warn online: {folder} not removed after the failed fetch: {e}")),
+            }
         }
         why
     };

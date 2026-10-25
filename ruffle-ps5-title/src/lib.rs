@@ -87,6 +87,19 @@
 //! fewer uniform lookups per draw, the bone palette only for skinned draws, and the texture blend
 //! in SSE2 (the same pixels, bit for bit, on the Supersonic RC replay).
 //!
+//! 1.000.032 (2026-10-25): what the console logs had shown. Shockwave film loops are sized as
+//! DirPlayer's WebGL2 renderer sizes them (the loop's own rect): Trick or Treat Beat!'s powers —
+//! each a film loop on the character — drew squeezed to a few dots, and the character vanished
+//! while one played. A sprite whose foreColor/backColor are set but left at black and white takes
+//! the upright blit fast path with a 32-bit picture (Supersonic RC's stage: 11–13 ms to 2 ms a frame
+//! on a PC; the same pixels, compared frame for frame). The console refused every removal of a
+//! game folder (Delete, Keep online games Off, a failed fetch: "Operation not permitted"), while
+//! renaming works: what cannot be removed is moved into the games folder's `.ruffle5-trash`, which
+//! the menu does not list and each start tries to empty; the log says, call by call, what removing
+//! answers (src/fsutil.rs). ruffle.log keeps the runs before (shell V8: trimmed to its last 512 KB
+//! past 1 MB, each run headed with its date); a watchdog names the step of a game's loop that takes
+//! 5 s or more (src/watchdog.rs). A folder with a Director movie and a .swf plays the movie.
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -94,7 +107,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.031";
+pub const APP_VERSION: &str = "1.000.032";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 
@@ -154,6 +167,8 @@ mod sounds;
 mod swfinfo;
 #[cfg(feature = "ruffle")]
 mod ui;
+#[cfg(feature = "ruffle")]
+mod watchdog;
 #[cfg(feature = "ruffle")]
 mod widgets;
 
@@ -348,6 +363,15 @@ fn run_app(gpu: gpu::Gpu, paths: paths::Paths) -> Result<(), String> {
     for line in controls::migrate(&paths) {
         say(&format!("     {line}"));
     }
+    // 1.000.032: what removing answers in the games folder (Delete, a failed fetch) and in Ruffle5's
+    // own folder, call by call: one line each. What waits in a trash folder is tried again.
+    say(&format!("     {}", fsutil::check_removal(&paths.games)));
+    say(&format!("     {}", fsutil::check_removal(&paths.data)));
+    for root in menu::scan_roots(&paths.games) {
+        if let Some(line) = fsutil::empty_trash(&root) {
+            say(&format!("     {line}"));
+        }
+    }
     let settings = settings::Settings::load(&paths.file("settings.txt"));
     say(&format!("     settings: {settings:?}"));
     let mut library = library::Library::load(&paths.file("library.txt"), &paths.file("session.txt"));
@@ -515,12 +539,17 @@ fn delete_game(app: &mut App, gi: usize, why: &str) {
         return;
     };
     match app.menu.delete_game(gi) {
-        Ok(gone) => {
+        Ok((gone, trashed)) => {
             say(&format!("menu: deleted {name}{why}: {gone}"));
             let focus = app.menu.focus();
             rescan(app);
             app.menu.set_focus(focus);
-            app.menu.toast(&format!("Deleted {name}{why}"));
+            if trashed {
+                // 1.000.032: the console refused removing the files; they wait in the trash folder
+                app.menu.toast(&format!("Deleted {name}{why}: its files wait in games/{} (see ruffle.log)", fsutil::TRASH));
+            } else {
+                app.menu.toast(&format!("Deleted {name}{why}"));
+            }
         }
         Err(e) => {
             say(&format!("warn menu: {name} not deleted: {e}"));

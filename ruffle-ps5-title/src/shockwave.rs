@@ -22,7 +22,9 @@
 //!     same `[Game]` format ("game" is the frame's Lingo, "draw" rendering the stage);
 //!   * 1.000.031: the keyboard with the game's own settings, and when they put the game beside it,
 //!     the stage is fitted into the part of the screen the keyboard leaves free (src/shell.rs
-//!     `stage_rect`), the pointer's area with it.
+//!     `stage_rect`), the pointer's area with it;
+//!   * 1.000.032: the loop names each step to a watchdog (src/watchdog.rs), which writes to
+//!     ruffle.log when one takes 5 s or more.
 //!
 //! Everything DirPlayer does runs on this thread, inside its executor (`block_on`): its helper tasks
 //! (loading casts, timeouts) only move while this loop awaits it. 1.000.022: that executor is
@@ -39,6 +41,7 @@ use crate::input::BTN_OPTIONS;
 use crate::keyboard::Osk;
 use crate::quickmenu::{self, QuickMenu};
 use crate::shell::{picture_rect, stage_rect, Fit, GameArea, FULL_FRAME};
+use crate::watchdog::{Step, Watchdog};
 use crate::ui::{Align, Face, Rect, Scene, W};
 use crate::widgets::{self, centred, draw_hold_bar, ease, Glyph, BLACK, INK, NIGHT, ORANGE};
 use crate::{say, App};
@@ -332,6 +335,8 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
     };
     let (path, controls_path, name, key, stem, own_picture) = (g.path.clone(), g.controls_path.clone(), g.name.clone(), g.key.clone(), g.stem.clone(), g.own_picture);
     say(&format!("game: {name} (Shockwave, {path})"));
+    let wd = Watchdog::start(&name);
+    wd.step(Step::Starting);
 
     // ---- the movie ----
     give_fonts();
@@ -462,6 +467,7 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
     let mut last_progress = Instant::now();
     let mut last_stats = Instant::now();
     let (mut ticks, mut steps, mut drawn) = (0u64, 0u64, 0u64);
+    let mut first_drawn = false;
     // ms summed over the 5 s: game (score frames + input), draw (stage render), overlay
     let mut spent = [0.0f64; 3];
     let ms = |since: Instant| since.elapsed().as_secs_f64() * 1000.0;
@@ -474,6 +480,7 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
     let mut events: Vec<PlayerEvent> = Vec::new();
 
     loop {
+        wd.step(Step::Loop);
         let loop_start = Instant::now();
         let dt = loop_start.duration_since(last).min(Duration::from_millis(100));
         let dtf = dt.as_secs_f32();
@@ -620,6 +627,7 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
         let paused = quick.is_some() || editor.is_some();
         let t = Instant::now();
         let mut stepped = false;
+        wd.step(Step::Frame);
         if !paused && !stopped {
             send_events(&mut player, &mut events).await;
             if first_frame || t >= next_frame_at {
@@ -639,6 +647,7 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
         } else {
             events.clear();
         }
+        wd.step(Step::Loop);
         spent[0] += ms(t);
         ticks += 1;
 
@@ -646,7 +655,9 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
         let t = Instant::now();
         let mut upload: Option<(u32, u32)> = None;
         if stepped || picture.is_empty() {
+            wd.step(Step::Drawing);
             let (rgba, w, h) = player.render();
+            wd.step(Step::Loop);
             picture.clear();
             picture.extend_from_slice(rgba);
             if (w, h) != (stage_w, stage_h) {
@@ -658,14 +669,17 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
             upload = Some((w, h));
             drawn += 1;
             fps_frames += 1;
-            if drawn == 1 {
+            // once per game: `drawn` counts the stats window and starts again every 5 s (the line
+            // came back every 5 s until 1.000.032)
+            if !first_drawn {
+                first_drawn = true;
                 say(&format!("ok   first stage drawn after {:.2} s", started.elapsed().as_secs_f64()));
             }
         }
         spent[1] += ms(t);
 
         // ---- covers: the stage as it is ----
-        if need_auto_cover && drawn > 0 && !paused && started.elapsed().saturating_sub(paused_for) >= AUTO_COVER_AFTER {
+        if need_auto_cover && first_drawn && !paused && started.elapsed().saturating_sub(paused_for) >= AUTO_COVER_AFTER {
             need_auto_cover = false;
             cover_wanted = true;
             cover_manual = false;
@@ -749,9 +763,11 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
 
         // ---- shown: every loop (the overlay and the pointer move even when the stage does not) ----
         let pic = upload.map(|(w, h)| (&picture[..], w, h));
+        wd.step(Step::Showing);
         if let Err(e) = app.display.present_picture(pic, fit, smooth) {
             say(&format!("warn present: {e}"));
         }
+        wd.step(Step::Loop);
 
         // ---- progress, the frame-time log ----
         if last_progress.elapsed() >= PROGRESS_EVERY {
@@ -835,6 +851,7 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
     send_events(&mut player, &mut release).await;
     drop(audio);
     drop(player);
+    drop(wd);
     app.display.set_overlay(Scene::new());
     app.display.release_offscreen();
     app.input.reset();

@@ -18,6 +18,9 @@
 //! (`stage_crop`), the pointer's area moved with it. The quick menu's Keyboard for this game opens
 //! the editor on those settings; its full-size preview moves the paused game the same way.
 //!
+//! 1.000.032: the loop names each step to a watchdog (src/watchdog.rs), which writes to ruffle.log
+//! when one takes 5 s or more — a game that hangs now says where.
+//!
 //! Every 5 s the log gets the frame-time lines in Ruffle-Flash-PS5's format, so the two can be
 //! compared on the same game:
 //!   [Game] 5 s: N ticks, N frames drawn, N read back, N readbacks failed, root frame .., playing ..
@@ -30,6 +33,7 @@
 use crate::controls::Controls;
 use crate::editor::{Editor, Target};
 use crate::shell::{GameArea, FULL_FRAME};
+use crate::watchdog::{Step, Watchdog};
 use crate::input::BTN_OPTIONS;
 use crate::keyboard::Osk;
 use crate::quickmenu::{self, QuickMenu};
@@ -153,6 +157,8 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
     };
     let (path, name, key, stem, own_picture, thumb, accent) = (game.path.clone(), game.name.clone(), game.key.clone(), game.stem.clone(), game.own_picture, game.thumb, game.accent);
     say(&format!("game: {name} ({path})"));
+    let wd = Watchdog::start(&name);
+    wd.step(Step::Loading);
 
     // ---- load on a worker, the spinner turning ----
     let job_path = path.clone();
@@ -191,6 +197,7 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
     let movie_w = movie.width().to_pixels().max(1.0) as u32;
     let movie_h = movie.height().to_pixels().max(1.0) as u32;
     say(&format!("     movie {movie_w}x{movie_h} at {:.0} fps, SWF {}, loaded in {:.2} s", movie.frame_rate().to_f32(), movie.version(), shown.elapsed().as_secs_f64()));
+    wd.step(Step::Starting);
 
     // ---- the size it renders at ----
     let s: Settings = app.settings.clone();
@@ -389,6 +396,7 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
     log::set_max_level(log::LevelFilter::Info);
 
     loop {
+        wd.step(Step::Loop);
         let loop_start = Instant::now();
         let dt = loop_start.duration_since(last).min(Duration::from_millis(100));
         let dtf = dt.as_secs_f32();
@@ -492,6 +500,7 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
                 options_armed = false;
                 app.input.release_all(&mut events);
                 events.extend(osk.release_all());
+                wd.step(Step::Saving);
                 if let Ok(mut p) = player.lock() {
                     for e in events.drain(..) {
                         p.handle_event(e);
@@ -499,6 +508,7 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
                     p.set_is_playing(false);
                     p.flush_shared_objects();
                 }
+                wd.step(Step::Loop);
                 last_save = Instant::now();
                 paused_at = Some(Instant::now());
                 let secs = started.elapsed().saturating_sub(paused_for).as_secs();
@@ -547,6 +557,7 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
         // ---- the game ----
         let t = Instant::now();
         let paused = quick.is_some() || editor.is_some();
+        wd.step(Step::Frame);
         {
             let Ok(mut p) = player.lock() else {
                 break;
@@ -560,7 +571,9 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
         }
         spent[0] += ms(t);
         let t = Instant::now();
+        wd.step(Step::Jobs);
         executor.run();
+        wd.step(Step::Loop);
         spent[1] += ms(t);
         ticks += 1;
 
@@ -657,7 +670,9 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
         let mut rendered = false;
         if let Ok(mut p) = player.lock() {
             if p.needs_render() || overlay_busy || app.input.moved || capture_pending || area_moved {
+                wd.step(Step::Drawing);
                 p.render();
+                wd.step(Step::Loop);
                 rendered = true;
             }
         }
@@ -673,9 +688,11 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
 
         // ---- saves, progress, the frame-time log ----
         if last_save.elapsed() >= SAVE_EVERY && !paused {
+            wd.step(Step::Saving);
             if let Ok(mut p) = player.lock() {
                 p.flush_shared_objects();
             }
+            wd.step(Step::Loop);
             last_save = Instant::now();
         }
         if last_progress.elapsed() >= PROGRESS_EVERY {
@@ -735,6 +752,7 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
     let mut release = Vec::new();
     app.input.release_all(&mut release);
     release.extend(osk.release_all());
+    wd.step(Step::Saving);
     if let Ok(mut p) = player.lock() {
         for e in release {
             p.handle_event(e);
@@ -742,7 +760,9 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
         p.flush_shared_objects();
         p.set_is_playing(false);
     }
+    wd.step(Step::Loop);
     drop(player);
+    drop(wd);
     app.display.set_overlay(Scene::new());
     app.display.release_offscreen();
     app.input.reset();

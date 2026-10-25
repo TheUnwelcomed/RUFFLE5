@@ -301,10 +301,10 @@ index d22c47c7..9a201405 100644
                                      y, x, line_offset, result.len()
                                  ).into());
 diff --git a/vm-rust/src/player/bitmap/drawing.rs b/vm-rust/src/player/bitmap/drawing.rs
-index 5191847d..b1b9a9f9 100644
+index 5191847d..74b1fecd 100644
 --- a/vm-rust/src/player/bitmap/drawing.rs
 +++ b/vm-rust/src/player/bitmap/drawing.rs
-@@ -1,5 +1,67 @@
+@@ -1,5 +1,72 @@
  use std::collections::HashMap;
  
 +/// PS5_RUFFLE_DIRPLAYER_NATIVE: what drawing sprites costs, for the console's frame log (Ruffle5
@@ -353,6 +353,11 @@ index 5191847d..b1b9a9f9 100644
 +        FAST_PATHS.load(Relaxed)
 +    }
 +
++    /// Ruffle5 1.000.032: on, a film loop on the stage is sized and placed as before 1.000.032
++    /// (its load-time rect, at the sprite's top-left). Off in the title; dcr-probe turns it on to
++    /// show, frame for frame, what the change does.
++    pub static FILMLOOP_OLD_RECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
 +    /// Blits the upright fast path drew (of `COPIES`).
 +    pub static FAST_BLITS: AtomicU64 = AtomicU64::new(0);
 +
@@ -372,7 +377,7 @@ index 5191847d..b1b9a9f9 100644
  use rgb565::Rgb565;
  
  use crate::{
-@@ -2241,6 +2303,47 @@ impl Bitmap {
+@@ -2241,6 +2308,47 @@ impl Bitmap {
          dst_rect: IntRect,
          src_rect: IntRect,
          params: &CopyPixelsParams,
@@ -420,7 +425,7 @@ index 5191847d..b1b9a9f9 100644
      ) {
          // Destination pixels are about to change, so retire anything keyed on the
          // old contents. The WebGL2 texture cache keys on `bitmap.version`
-@@ -2559,6 +2662,7 @@ impl Bitmap {
+@@ -2559,6 +2667,7 @@ impl Bitmap {
              };
  
          if needs_matte_mask {
@@ -428,7 +433,7 @@ index 5191847d..b1b9a9f9 100644
              let width = src.width as usize;
              let height = src.height as usize;
  
-@@ -2615,6 +2719,8 @@ impl Bitmap {
+@@ -2615,6 +2724,8 @@ impl Bitmap {
              }
  
              matte_mask = Some(mask);
@@ -437,7 +442,7 @@ index 5191847d..b1b9a9f9 100644
          }
  
          // ---------------- Fast path: unscaled, unrotated, same-palette 8-bit blit ----------------
-@@ -2771,13 +2877,202 @@ impl Bitmap {
+@@ -2771,13 +2882,213 @@ impl Bitmap {
              }
          }
  
@@ -458,12 +463,23 @@ index 5191847d..b1b9a9f9 100644
 +        {
 +            let sprite_bg = params.sprite.map_or(false, |sp| sp.has_back_color);
 +            let sprite_fg = params.sprite.map_or(false, |sp| sp.has_fore_color);
++            let indexed_src = src.bit_depth == 8 && src.original_bit_depth <= 8 && src_palette_cache.is_some();
++            let rgba_src = src.bit_depth == 32 && src.original_bit_depth == 32;
++            // Ruffle5 1.000.032: a sprite's own foreColor/backColor left at their defaults (black,
++            // white) tint a 32-bit source in nothing — the loop's "32-BIT" colorize keeps the
++            // authored colour then, and its inks read the same resolved colours as here — so such
++            // a sprite takes this path too. Supersonic RC's 640x480 3D-scene sprite carries
++            // has_fore/has_back with the defaults: 17 ms of each console frame in the loop.
++            let default_sprite_colours = rgba_src
++                && !params.bg_color_explicit
++                && !params.fore_color_explicit
++                && fg_color_resolved == (0, 0, 0)
++                && bg_color_resolved == (255, 255, 255);
 +            let no_colorize = !(sprite_bg
 +                || sprite_fg
 +                || params.bg_color_explicit
-+                || params.fore_color_explicit);
-+            let indexed_src = src.bit_depth == 8 && src.original_bit_depth <= 8 && src_palette_cache.is_some();
-+            let rgba_src = src.bit_depth == 32 && src.original_bit_depth == 32;
++                || params.fore_color_explicit)
++                || default_sprite_colours;
 +            // An indexed source's inks 0, 2, 36 and 8 (and the rest but 32 and 33, whose writes
 +            // depend on it) do not look at the destination's alpha; an RGBA source's ink 0 does.
 +            let ink_ok = if indexed_src {
@@ -642,7 +658,7 @@ index 5191847d..b1b9a9f9 100644
                  if dst_x < 0
                      || dst_y < 0
                      || dst_x >= self.width as i32
-@@ -3363,6 +3658,27 @@ impl Bitmap {
+@@ -3363,6 +3674,27 @@ impl Bitmap {
                      match src.original_bit_depth {
                          // ---------- 32-BIT ----------
                          32 => {
@@ -5253,7 +5269,7 @@ index cfef4746..a278110e 100644
      ok_int(1)
  }
 diff --git a/vm-rust/src/rendering.rs b/vm-rust/src/rendering.rs
-index 4b9d3758..667736ea 100644
+index 4b9d3758..9bfd2189 100644
 --- a/vm-rust/src/rendering.rs
 +++ b/vm-rust/src/rendering.rs
 @@ -5,7 +5,7 @@ use std::{
@@ -5456,7 +5472,78 @@ index 4b9d3758..667736ea 100644
          match &member.member_type {
              CastMemberType::Bitmap(bitmap_member) => {
                  let sprite =
-@@ -3121,6 +3249,7 @@ pub fn render_score_to_bitmap_with_offset(
+@@ -3049,8 +3177,10 @@ pub fn render_score_to_bitmap_with_offset(
+                     rotation,
+                     skew,
+                     logical_rect,
+-                    initial_rect,
++                    load_time_rect,
+                     current_frame,
++                    sprite_size,
++                    raw_loc,
+                 ) = {
+                     let sprite = get_score_sprite(&player.movie, score_source, channel_num).unwrap();
+ 
+@@ -3067,6 +3197,8 @@ pub fn render_score_to_bitmap_with_offset(
+                         rect, // logical rect
+                         computed_initial_rect,
+                         film_loop.current_frame,
++                        (sprite.width, sprite.height),
++                        (sprite.loc_h, sprite.loc_v),
+                     )
+                 };
+ 
+@@ -3074,8 +3206,49 @@ pub fn render_score_to_bitmap_with_offset(
+                 // The filmloop is rendered at its natural size (initial_rect coordinate space).
+                 // This bitmap is then composited at sprite_rect, with copy_pixels
+                 // handling scaling if sprite_rect differs from initial_rect.
++                //
++                // Ruffle5 (PS5): the natural size is chosen as DirPlayer's WebGL2 renderer chooses
++                // it (rendering_gpu/webgl2/mod.rs, TextureSource::FilmLoop): the film loop's info
++                // rect when it has one, else the rect computed at load when the sprite has that
++                // size, else the rect of its members' images. The load-time rect alone is built
++                // from the records' authored sizes, which can be far from the loop's own rect:
++                // Trick or Treat Beat!'s Keys_Loop records say 432x330 (the stage) for an 93x50
++                // loop. The offscreen was then 432x330 while the children are placed relative to
++                // the info rect (render_score_to_bitmap_with_offset), and the composite below,
++                // scaled by the 93x50 sprite rect, squeezed it 4.6x by 6.6x: the keys, every
++                // costume's spell/smash/jump loop drew as a few dots and the character vanished.
++                let (sprite_w, sprite_h) = sprite_size;
++                let sprite_dims_match_stage = sprite_w > 0
++                    && sprite_h > 0
++                    && (sprite_w - load_time_rect.width()).abs() <= 1
++                    && (sprite_h - load_time_rect.height()).abs() <= 1;
++                let old_rect = crate::player::bitmap::drawing::draw_stats::FILMLOOP_OLD_RECT
++                    .load(std::sync::atomic::Ordering::Relaxed);
++                let initial_rect = match get_filmloop_info_rect(player, &member_ref) {
++                    _ if old_rect => load_time_rect.clone(),
++                    Some(info) => info,
++                    None if sprite_dims_match_stage => load_time_rect.clone(),
++                    None => compute_filmloop_initial_rect_with_members(player, &member_ref)
++                        .unwrap_or_else(|| load_time_rect.clone()),
++                };
+                 let width = initial_rect.width().max(1);
+                 let height = initial_rect.height().max(1);
++                // ... and drawn where WebGL2 draws it: in the sprite's rect, or, when the sprite's
++                // size is not the loop's (more than 1 px off) or it has none, at the loop's size
++                // centred on the sprite's loc (its registration point).
++                let should_override = if sprite_dims_match_stage {
++                    sprite_w <= 0 || sprite_h <= 0
++                } else {
++                    sprite_w <= 0 || sprite_h <= 0 || (sprite_w - width).abs() > 1 || (sprite_h - height).abs() > 1
++                };
++                let draw_rect = if old_rect {
++                    sprite_rect.clone()
++                } else if should_override {
++                    let (reg_x, reg_y) = (width / 2, height / 2);
++                    IntRect::from(raw_loc.0 - reg_x, raw_loc.1 - reg_y, raw_loc.0 - reg_x + width, raw_loc.1 - reg_y + height)
++                } else {
++                    sprite_rect.clone()
++                };
+ 
+                 debug!(
+                     "Rendering FilmLoop: channel {} frame {} ink={} blend={} initial_rect ({}, {}, {}, {}) bitmap size {}x{} sprite_rect ({}, {}, {}, {}) offset ({}, {})",
+@@ -3121,6 +3294,7 @@ pub fn render_score_to_bitmap_with_offset(
  
                  // ---- 4. Composite filmloop onto stage ----
                  // Count total opaque pixels in filmloop bitmap to verify rendering worked
@@ -5464,7 +5551,7 @@ index 4b9d3758..667736ea 100644
                  let opaque_count = (0..filmloop_bitmap.data.len()).step_by(4)
                      .filter(|&i| i + 3 < filmloop_bitmap.data.len() && filmloop_bitmap.data[i + 3] > 0)
                      .count();
-@@ -3134,6 +3263,7 @@ pub fn render_score_to_bitmap_with_offset(
+@@ -3134,6 +3308,7 @@ pub fn render_score_to_bitmap_with_offset(
                      opaque_count, if total_pixels > 0 { opaque_count * 100 / total_pixels } else { 0 },
                      transparent_count, if total_pixels > 0 { transparent_count * 100 / total_pixels } else { 0 }
                  );
@@ -5472,7 +5559,32 @@ index 4b9d3758..667736ea 100644
  
                  let params = CopyPixelsParams {
                      blend,
-@@ -3300,6 +3430,10 @@ pub fn render_score_to_bitmap_with_offset(
+@@ -3146,7 +3321,7 @@ pub fn render_score_to_bitmap_with_offset(
+                     skew,
+                     sprite: None,
+                     mask_offset: (0, 0),
+-                    original_dst_rect: Some(logical_rect),
++                    original_dst_rect: Some(draw_rect.clone()),
+                     bg_color_explicit: false,
+                     fore_color_explicit: false,
+                     ink9_mask_bitmap: None,
+@@ -3162,8 +3337,13 @@ pub fn render_score_to_bitmap_with_offset(
+                     filmloop_bitmap.original_bit_depth, ink
+                 );
+ 
+-                // Position the filmloop bitmap at sprite_rect location, but keep natural size.
+-                let dst_rect = IntRect::from_size(sprite_rect.left, sprite_rect.top, width, height);
++                // Ruffle5 (PS5): the loop's picture fills draw_rect (see above), as WebGL2's quad.
++                let _ = &logical_rect;
++                let dst_rect = if old_rect {
++                    IntRect::from_size(sprite_rect.left, sprite_rect.top, width, height)
++                } else {
++                    draw_rect.clone()
++                };
+                 debug!(
+                     "    FILMLOOP DST_RECT: ({}, {}, {}, {}) <- sprite_rect.left={} sprite_rect.top={}",
+                     dst_rect.left, dst_rect.top, dst_rect.right, dst_rect.bottom,
+@@ -3300,6 +3480,10 @@ pub fn render_score_to_bitmap_with_offset(
              _ => {}
          }
      }
