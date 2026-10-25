@@ -192,7 +192,41 @@ impl Drop for DcrAudio {
     }
 }
 
-/// Play Director game `gi` of the menu's list until it is left.
+/// 1.000.028: text in a font the movie does not carry ("Arial", "Times New Roman", "Verdana"...)
+/// is drawn by DirPlayer's native_text (vendor/dirplayer vm-rust/src/player/native_text.rs) with
+/// these: Liberation Sans, Serif and Mono 2.1.5 (SIL OFL 1.1, fonts/liberation/), which have the
+/// advance widths of Arial, Times New Roman and Courier New, so lines wrap where a browser with
+/// those fonts wraps them. Until 1.000.028 such text stopped the game (DirPlayer asked the
+/// browser's canvas for it, and there is none here).
+fn give_fonts() {
+    use vm_rust::player::native_text::{add_font, Family};
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let fonts: [(&str, Family, bool, bool, &'static [u8]); 12] = [
+            ("Sans", Family::Sans, false, false, include_bytes!("../fonts/liberation/LiberationSans-Regular.ttf")),
+            ("Sans Bold", Family::Sans, true, false, include_bytes!("../fonts/liberation/LiberationSans-Bold.ttf")),
+            ("Sans Italic", Family::Sans, false, true, include_bytes!("../fonts/liberation/LiberationSans-Italic.ttf")),
+            ("Sans Bold Italic", Family::Sans, true, true, include_bytes!("../fonts/liberation/LiberationSans-BoldItalic.ttf")),
+            ("Serif", Family::Serif, false, false, include_bytes!("../fonts/liberation/LiberationSerif-Regular.ttf")),
+            ("Serif Bold", Family::Serif, true, false, include_bytes!("../fonts/liberation/LiberationSerif-Bold.ttf")),
+            ("Serif Italic", Family::Serif, false, true, include_bytes!("../fonts/liberation/LiberationSerif-Italic.ttf")),
+            ("Serif Bold Italic", Family::Serif, true, true, include_bytes!("../fonts/liberation/LiberationSerif-BoldItalic.ttf")),
+            ("Mono", Family::Mono, false, false, include_bytes!("../fonts/liberation/LiberationMono-Regular.ttf")),
+            ("Mono Bold", Family::Mono, true, false, include_bytes!("../fonts/liberation/LiberationMono-Bold.ttf")),
+            ("Mono Italic", Family::Mono, false, true, include_bytes!("../fonts/liberation/LiberationMono-Italic.ttf")),
+            ("Mono Bold Italic", Family::Mono, true, true, include_bytes!("../fonts/liberation/LiberationMono-BoldItalic.ttf")),
+        ];
+        let mut ok = 0;
+        for (name, family, bold, italic, data) in fonts {
+            match add_font(family, bold, italic, data) {
+                Ok(()) => ok += 1,
+                Err(e) => say(&format!("warn shockwave: Liberation {name}: {e}")),
+            }
+        }
+        say(&format!("ok   shockwave text: {ok} Liberation fonts"));
+    });
+}
+
 /// What the console's CPU, clock and memory cost, measured once (the first Shockwave game of a run)
 /// and logged: dcr-probe's `bench` prints the same on a PC, so the two can be compared when a
 /// Director game is slower here than there. About half a second.
@@ -269,6 +303,7 @@ pub fn bench() -> String {
     )
 }
 
+/// Play Director game `gi` of the menu's list until it is left.
 pub fn play(app: &mut App, gi: usize) -> GameEnd {
     let Some(g) = app.menu.games.get(gi) else {
         return GameEnd::Menu;
@@ -296,7 +331,40 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
     say(&format!("game: {name} (Shockwave, {path})"));
 
     // ---- the movie ----
+    give_fonts();
     let mut player = NativePlayer::new();
+    // setPref / getPref (a browser's localStorage on the web): files in the game's saves folder
+    let prefs = format!("{}/prefs", app.paths.saves(&key));
+    player.set_prefs_dir(&prefs);
+    say(&format!("     prefs (setPref/getPref) in {prefs}"));
+    // 1.000.028: a game the Online tab fetched starts as its source starts it (online.txt): the
+    // source's Shockwave Projector command (Flashpoint's launchCommand: its flags, its --do Lingo),
+    // the address it was published at (`the moviePath`; the files it asks for there are read from
+    // its folder), and the folder its other web addresses are read from (its game data's content).
+    if let Some(l) = crate::online::launch_for(&path) {
+        if let Some(cmd) = &l.command {
+            let lc = vm_rust::player::native::parse_launch_command(cmd);
+            say(&format!("     launch command (online.txt): {cmd}"));
+            if !lc.startup_do.is_empty() || !lc.startup_do_before.is_empty() || lc.startup_go != 0 {
+                say(&format!("       --do {:?}, --doBefore {:?}, --go {}", lc.startup_do, lc.startup_do_before, lc.startup_go));
+            }
+            if !lc.external_params.is_empty() {
+                say(&format!("       external params {:?}", lc.external_params));
+            }
+            if !lc.ignored.is_empty() {
+                say(&format!("       projector-only flags skipped: {}", lc.ignored.join(", ")));
+            }
+            player.apply_launch_command(&lc);
+        }
+        if let Some(url) = &l.url {
+            say(&format!("     address {url} (online.txt)"));
+            player.set_movie_address(url);
+        }
+        if let Some(root) = &l.web_root {
+            say(&format!("     web addresses read from {root}"));
+            player.set_web_root(root);
+        }
+    }
     if let Err(e) = player.load(&path).await {
         say(&format!("FAIL {name}: {e}"));
         app.menu.toast(&format!("{name}: {e}"));
@@ -407,6 +475,11 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
         }
         for notice in std::mem::take(&mut app.input.hid_frame.notices) {
             toast_msg = Some((notice.to_string(), 0.0));
+        }
+        // what the movie asked of a browser (gotoNetPage, a message box): shown, and logged
+        for notice in vm_rust::player::native::take_notices() {
+            say(&format!("     movie: {notice}"));
+            toast_msg = Some((notice, 0.0));
         }
         if !menu_open {
             session.keyboard |= app.input.hid_frame.keys.iter().any(|&(_, d)| d);

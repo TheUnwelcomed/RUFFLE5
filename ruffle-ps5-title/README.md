@@ -84,8 +84,8 @@ two settings can be compared on the same game.
 | `src/lib.rs` | `ruffle_ps5_main`: 3a clear-screen; 3b the app — the menu loop, a player per game, back |
 | `src/shell.rs` | the display: the swapchain, a game's `RenderTarget` (direct at 4K, or 1080p + GPU scale), cover capture, frame timings |
 | `src/menu.rs` | the menu: Games / Favorites / Recent / Online / Badges / Settings; stage, shelf, search, screensaver |
-| `src/online.rs` | the Online tab: lists, pictures and fetching games from the Internet Archive and Flash Museum, on threads of its own |
-| `net/` | `r5net`, its own crate: HTTPS on the console's sockets (rustls + RustCrypto, Mozilla's roots), the two sources' APIs and pages; `examples/online-check.rs`, `examples/fetch.rs` |
+| `src/online.rs` | the Online tab: lists, pictures and fetching games from the Internet Archive, Flash Museum and Flashpoint, on threads of its own |
+| `net/` | `r5net`, its own crate: HTTPS on the console's sockets (rustls + RustCrypto, Mozilla's roots), the three sources' APIs and pages, a zip reader for Flashpoint's game data; `examples/online-check.rs`, `examples/fetch.rs` |
 | `src/game.rs` | one game: loading screen, the player and its options, quick menu, overlay, the frame-time log |
 | `src/background.rs` | the menu's moving background: ruffle.rs's logo animation, played by Ruffle at the display's size |
 | `src/widgets.rs` | the shared look: Ruffle's colours, buttons, hints, focus halo/ring, ribbons, sparks, easing |
@@ -114,15 +114,15 @@ two settings can be compared on the same game.
 | `controls.txt` | the mapping file's format and the defaults, shipped as a commented example |
 | `assets/` | `ruffle-mark.png` (the menu's logo), `logo-anim.swf` (the background) |
 | `art/` | `make-art.py`: draws `assets/ruffle-mark.png` and the launch icon `sce_sys/icon0.png` from Ruffle's logo |
-| `fonts/` | Inter Regular/SemiBold, Montserrat Medium (SIL OFL 1.1), embedded |
+| `fonts/` | Inter Regular/SemiBold, Montserrat Medium (SIL OFL 1.1), embedded; `liberation/`: Liberation Sans, Serif and Mono (SIL OFL 1.1) for Shockwave text |
 | `build-title.sh` | links the Rust staticlib + RADV archive + runtime into a PPSA title (needs PS5_Vulkan) |
-| `tools/online-check.sh` | asks both online sources from the build server, with the same code, and packs the answers |
+| `tools/online-check.sh` | asks the online sources from the build server, with the same code, and packs the answers |
 
 ## On the console
 
 | where | what |
 |---|---|
-| `/data/homebrew/PPSA99620/games/` | your games (`*.swf`, or one game per sub-folder); also `ruffle5/` on a USB drive; games from the Online tab, each in its folder with `cover.png` and `online.txt` |
+| `/data/homebrew/PPSA99620/games/` | your games (`*.swf`, or one game per sub-folder); also `ruffle5/` on a USB drive; games from the Online tab, each in its folder with `cover.png` and `online.txt` (a Flashpoint game: its game data's `content/` too) |
 | `/data/homebrew/PPSA99620/Custom Mappings/` | every controls file: the shipped presets, the ones the editor writes, `_All Games.controls.txt` |
 | `/data/ruffle5/` | `ruffle.log`, `settings.txt`, the library and badges, `saves/`, `covers/` |
 
@@ -181,8 +181,29 @@ before, so Battle Blitz's opponent portrait drew 2.5 times too large over the fi
 blended sprite inside a film loop is laid over the loop's offscreen with its coverage in the alpha
 channel, so where the loop is empty the stage shows through it (before, a 30% layer over the cleared
 offscreen became an opaque dark box: the selection highlights hid the chosen fighters' portraits).
+1.000.028, in the patch: text in a font the movie does not carry (Arial, Times New Roman, Verdana…)
+no longer stops the game — DirPlayer asked a browser's canvas for it; off the web `native_text.rs`
+lays it out and draws it with the Liberation fonts (`fonts/liberation/`, the advance widths of
+Arial, Times New Roman and Courier New), measuring as Chromium's canvas measures (checked against
+Chromium: kerning inside words, the "top" baseline, the font box); DirPlayer's own system font
+(`charmap-system.png`) is loaded as the web front end loads it; the event loop gets its turn after
+each frame, so `mouseEnter` / `mouseLeave` / `mouseWithin` reach the movie; a `go` told to a
+film-loop sprite (`tell sprite(n)` … `go 1`) moves that loop's playhead, not the movie's (Battle
+Blitz's START button); what a
+movie asks of a browser — a message box, `gotoNetPage`, the Flash bridge, a Shockwave 3D render —
+is answered as no browser here can (a notice shown in the game, a refusal the movie sees, a grey
+3D picture) instead of stopping the title; `setPref` / `getPref` keep their files in the game's
+saves folder; a file a movie asks for is found whatever the case of its name, as on Windows. A game
+from Flashpoint starts as Flashpoint starts it: its launch command is parsed as DirPlayer's web front
+end parses it (`parse_launch_command`, a port of its `launchCommand.js`) — the projector's
+LeechProtectionRemovalHelp flags and `--do` become Lingo run when the movie loads, `--doBefore`
+before, `--go N` after, `--setExternalParam` sets an external param — `the moviePath` is the address
+it was published at (DirPlayer's movie path override, so a sitelocked movie runs and the files it
+asks for there come from its folder), and every other web address it asks for is read from its
+game data (`http://host/path` → `content/host/path`, `set_web_root`); nothing else is fetched.
 `dcr-probe/` (at the repository root) runs a movie in DirPlayer on a PC or server and saves the
-stage as PNGs — for checking a game before it goes on the console.
+stage as PNGs — for checking a game before it goes on the console (`DCR_PROBE_LAUNCH`,
+`DCR_PROBE_ADDRESS` and `DCR_PROBE_WEBROOT` start it as a Flashpoint game).
 
 ## The menu
 
@@ -201,30 +222,47 @@ between games, and a ribbon wipe carries you into a game and back out.
 | Square | favourite / unfavourite |
 | L2 | search (on-screen keyboard, or type on a USB keyboard) |
 | L1 / R1 | Games · Favorites · Recent · Online · Badges · Settings |
+| OPTIONS | delete the focused game (1.000.028): Cross deletes, Circle keeps; its saves, cover and play time stay |
 | Circle, held | close Ruffle5 |
 
-**Online** (1.000.027): Flash games and movies from two sources, R2 switching between them —
-the Internet Archive's Flash collection (`softwarelibrary_flash`, the movies archive.org itself plays
-with Ruffle: found through its search API, most downloaded first) and Flash Museum (flashmuseum.net:
-read from its own list and search pages, its item and player pages, as a browser reads them). L2
-searches the current source. Cross fetches the focused one and plays it, Square only fetches it;
-it lands in the games folder in a folder of its own — the movie (and, from the Internet Archive, the
-small files beside it in the item: levels, sounds, XML), its picture as `cover.png`, and
-`online.txt`, which names the source, the movie to play and the title to show — so it is an ordinary
-game from then on (delete the folder to remove it). Circle cancels a download. Nothing touches the
-network until the tab is opened. HTTPS is `net/`'s: rustls 0.23 with RustCrypto's algorithms
-(no C, no assembly) and Mozilla's root certificates compiled in, on the console's own sockets and
-resolver; the title calls `sceNetInit` first (a title's sockets answer EACCES before it). Requests
-say `User-Agent: Ruffle5/<version> (PlayStation 5 Flash player; +https://github.com/TheUnwelcomed/RUFFLE5)`.
-`tools/online-check.sh` runs the same code on the build server against both sites and packs what
-they answered.
+**Online** (1.000.027, Flashpoint 1.000.028): games and movies from three sources, R2 switching
+between them — the Internet Archive's Flash collection (`softwarelibrary_flash`, the movies
+archive.org itself plays with Ruffle: found through its search API, most downloaded first, its
+sub-collections left out), Flash Museum (flashmuseum.net: read from its own list and search pages
+and its player's settings, as a browser reads them) and Flashpoint Archive's Shockwave games
+(flashpointarchive.org's search API, `platform:Shockwave`, A to Z). L2 searches the current source.
+Cross fetches the focused one and plays it, Square only fetches it; it lands in the games folder in a
+folder of its own — the movie (and, from the Internet Archive, the small files beside it in the
+item: levels, sounds, XML), its picture as `cover.png`, and `online.txt`, which names the source,
+the movie to play and the title to show — so it is an ordinary game from then on. Circle cancels a
+download. Nothing touches the network until the tab is opened.
+
+A Flashpoint entry is fetched as the archive's own launcher fetches it: its game data — a zip of the
+files at the addresses the game was published at, `content/<host>/<path>` — from
+download.flashpointarchive.org (download.unstable.life when that fails), checked against the
+SHA-256 the archive lists, and unpacked into the game's folder; an entry without game data gets its
+movie from the archive's legacy server, with the external casts the movie names. `online.txt` also
+keeps how the archive starts the game — its Shockwave Projector command (`launch`: the movie's
+address and flags such as `--forceTheExitLock 0` or `--do "…"` Lingo), the address (`url`) and the
+folder that holds its files by address (`webroot = content`) — and Ruffle5 hands DirPlayer all
+three (see *Shockwave*).
+
+A game stays in the games folder after it is played; Settings › Library › *Keep online games* Off
+deletes a fetched game when it is left (its saves stay), and OPTIONS on any game's tile deletes it
+there and then.
+
+HTTPS is `net/`'s: rustls 0.23 with RustCrypto's algorithms (no C, no assembly) and Mozilla's root
+certificates compiled in, on the console's own sockets and resolver; the title calls `sceNetInit`
+first (a title's sockets answer EACCES before it). Requests say `User-Agent: Ruffle5/<version>
+(PlayStation 5 Flash player; +https://github.com/TheUnwelcomed/RUFFLE5)`. `tools/online-check.sh`
+runs the same code on the build server against the three sites and packs what they answered.
 
 **Settings**: *Display* — Resolution (4K / 1080p), quality, scale mode, letterbox, alignment;
 *Player* — frame rate, Flash Player version, runtime, load behaviour, script time limit, dummy
 ExternalInterface, a pretend site for sitelocked games; *Controls & Sound* — controls for all
 games (the editor), keyboard for text boxes, USB mouse speed, game volume, menu sounds; *App* — animated
-background, screensaver, FPS counter, automatic covers, badges; *Library* — rescan, clear recent;
-*About*.
+background, screensaver, FPS counter, automatic covers, badges; *Library* — rescan, clear recent,
+keep online games; *About*.
 
 ## In a game
 

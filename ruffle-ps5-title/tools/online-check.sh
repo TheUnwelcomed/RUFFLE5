@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# online-check.sh — ask the Online tab's two sources, from this server, what the console will ask
+# online-check.sh — ask the Online tab's sources, from this server, what the console will ask
 # them, with the same code (net/: HTTPS through rustls with pure-Rust crypto): the Internet Archive's
-# Flash collection (search, an item's files, a movie, a picture) and Flash Museum (its list, a search,
-# an item's page and player page, a movie, a picture). A few minutes; nothing is installed.
+# Flash collection (search, an item's files, a movie, a picture), Flash Museum (its list, a search,
+# an item's page and player page, a movie, a picture) and, from 1.000.028, Flashpoint Archive (its
+# Shockwave list, a search, a game data zip checked and listed, a legacy movie, a picture). A few
+# minutes; nothing is installed.
 #
 #   bash tools/online-check.sh [OUT_DIR]        (default ~/ruffle5-online-check)
 #
@@ -33,7 +35,7 @@ BIN="$SRC/target/$host/release/examples/online-check"
 [[ -x "$BIN" ]] || die "the check did not build (see above); send me the output"
 
 rm -rf "${OUT:?}"; mkdir -p "$OUT"
-echo "==> asking archive.org and flashmuseum.net (answers into $OUT)"
+echo "==> asking archive.org, flashmuseum.net and flashpointarchive.org (answers into $OUT)"
 "$BIN" "$OUT" || true
 tar -C "$(dirname "$OUT")" --exclude="$(basename "$OUT")/movies" -czf "$OUT.tar.gz" "$(basename "$OUT")"
 echo

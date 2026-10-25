@@ -1,6 +1,9 @@
-//! online-check — from a PC, ask both online sources what the console's Online tab asks them: a
+//! online-check — from a PC, ask the online sources what the console's Online tab asks them: a
 //! list, a search, an item's files, a movie, a picture; over the same HTTPS code (rustls with
-//! RustCrypto). tools/online-check.sh runs it on the build server.
+//! RustCrypto). tools/online-check.sh runs it on the build server. 1.000.028: Flashpoint Archive
+//! too — its Shockwave list, a search, an entry's game data zip (checked against its SHA-256 and
+//! listed, the movie in it read and checked) and an entry without game data (its movie from the
+//! legacy server).
 //!
 //!   cargo run --release --example online-check -- [OUT_DIR]
 //!
@@ -14,7 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use r5net::{fm, ia, Client, Request, Source};
+use r5net::{fm, fp, ia, Client, Request};
 
 struct Logger {
     file: Mutex<std::fs::File>,
@@ -65,6 +68,9 @@ fn magic(b: &[u8]) -> String {
         [0x89, b'P', b'N', b'G', ..] => "PNG",
         [b'G', b'I', b'F', b'8', ..] => "GIF",
         [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "WebP",
+        [b'X', b'F', b'I', b'R', ..] => "Director (XFIR)",
+        [b'R', b'I', b'F', b'X', ..] => "Director (RIFX)",
+        [b'P', b'K', 3, 4, ..] => "zip",
         [b'<', ..] => "HTML/XML text",
         _ => "unknown",
     };
@@ -126,15 +132,16 @@ fn show_items(items: &[r5net::Item], n: usize) {
     }
 }
 
-fn movie(client: &Client, dir: &Path, files: &r5net::Files) -> Result<(), String> {
+/// Downloads `url` into OUT_DIR/movies/`name` (not part of the pack); says what came.
+fn fetch_to(client: &Client, dir: &Path, url: &str, referer: Option<&str>, name: &str, limit: u64) -> Result<PathBuf, String> {
     let movies = dir.join("movies");
     std::fs::create_dir_all(&movies).map_err(|e| e.to_string())?;
-    let safe: String = files.main.name.rsplit('/').next().unwrap_or("movie.swf").chars().map(|c| if c.is_alphanumeric() || ".-_".contains(c) { c } else { '_' }).collect();
+    let safe: String = name.rsplit('/').next().unwrap_or("movie.swf").chars().map(|c| if c.is_alphanumeric() || ".-_".contains(c) { c } else { '_' }).collect();
     let path: PathBuf = movies.join(&safe);
     let mut f = std::fs::File::create(&path).map_err(|e| e.to_string())?;
-    let mut req = Request::new(&files.main.url);
-    req.limit = 32 << 20;
-    req.referer = files.referer.as_deref();
+    let mut req = Request::new(url);
+    req.limit = limit;
+    req.referer = referer;
     let mut last = 0u64;
     let d = client
         .download(&req, &mut f, &mut |got, total| {
@@ -148,10 +155,41 @@ fn movie(client: &Client, dir: &Path, files: &r5net::Files) -> Result<(), String
     drop(f);
     let head = std::fs::read(&path).map(|b| b.into_iter().take(16).collect::<Vec<u8>>()).unwrap_or_default();
     out(&format!("     {} bytes from {} ({}), Content-Type {:?}: {}", d.bytes, d.url, path.display(), d.head.content_type(), magic(&head)));
+    Ok(path)
+}
+
+fn movie(client: &Client, dir: &Path, files: &r5net::Files) -> Result<(), String> {
+    let path = fetch_to(client, dir, &files.main.url, files.referer.as_deref(), &files.main.name, 32 << 20)?;
+    let head = std::fs::read(&path).map(|b| b.into_iter().take(16).collect::<Vec<u8>>()).unwrap_or_default();
     if !head.starts_with(b"FWS") && !head.starts_with(b"CWS") && !head.starts_with(b"ZWS") {
         return Err(format!("not a SWF: {}", magic(&head)));
     }
     Ok(())
+}
+
+/// A .zip's central directory: (name, packed size, size, method) of each entry. Nothing unpacked.
+fn zip_listing(path: &Path) -> Result<Vec<(String, u64, u64, u16)>, String> {
+    let b = std::fs::read(path).map_err(|e| e.to_string())?;
+    let u16at = |i: usize| b.get(i..i + 2).map(|s| u16::from_le_bytes([s[0], s[1]]) as u64);
+    let u32at = |i: usize| b.get(i..i + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as u64);
+    // the end of central directory record: its signature, searched from the end (it may have a comment)
+    let eocd = (0..b.len().saturating_sub(21)).rev().take(65_557).find(|&i| b[i..].starts_with(b"PK\x05\x06")).ok_or("not a .zip (no end of central directory)")?;
+    let count = u16at(eocd + 10).ok_or("short .zip")?;
+    let mut at = u32at(eocd + 16).ok_or("short .zip")? as usize;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        if !b.get(at..).is_some_and(|s| s.starts_with(b"PK\x01\x02")) {
+            return Err(format!("bad central directory entry at {at}"));
+        }
+        let method = u16at(at + 10).ok_or("short entry")? as u16;
+        let packed = u32at(at + 20).ok_or("short entry")?;
+        let size = u32at(at + 24).ok_or("short entry")?;
+        let (n, x, c) = (u16at(at + 28).ok_or("short entry")? as usize, u16at(at + 30).ok_or("short entry")? as usize, u16at(at + 32).ok_or("short entry")? as usize);
+        let name = b.get(at + 46..at + 46 + n).map(|s| String::from_utf8_lossy(s).into_owned()).ok_or("short name")?;
+        out.push((name, packed, size, method));
+        at += 46 + n + x + c;
+    }
+    Ok(out)
 }
 
 fn picture(client: &Client, dir: &Path, url: &str, name: &str) -> Result<(), String> {
@@ -256,73 +294,186 @@ fn main() {
         show_items(&p.items, 12);
         Ok(p)
     });
-    t.step("flashmuseum.net: the games list, page 2", || {
+    let list2 = t.step("flashmuseum.net: the games list, page 2", || {
         let url = fm::list_url("", 2);
         let r = client.get_ok(&Request::new(&url)).map_err(|e| e.to_string())?;
-        save(&dir, "fm-list-2.html", &r.body);
         let p = fm::parse_list(&r.text(), 2);
         out(&format!("     {} item(s), more: {}", p.items.len(), p.more));
         show_items(&p.items, 4);
-        Ok(())
+        Ok(p)
     });
     t.step("flashmuseum.net: search \"duck life\"", || {
         let url = fm::list_url("duck life", 1);
         out(&format!("     {url}"));
         let r = client.get(&Request::new(&url)).map_err(|e| e.to_string())?;
         out(&format!("     status {}", r.status));
-        save(&dir, "fm-search-duck-life.html", &r.body);
         let p = fm::parse_list(&r.text(), 1);
         out(&format!("     {} item(s), more: {}", p.items.len(), p.more));
         show_items(&p.items, 8);
         Ok(())
     });
-    for probe in ["/wp-json/", "/wp-json/wp/v2/types", "/wp-json/wp/v2/game?per_page=3", "/wp-json/wp/v2/search?search=duck%20life&per_page=5", "/wp-sitemap.xml", "/sitemap_index.xml", "/robots.txt"] {
-        t.step(&format!("flashmuseum.net{probe} (what else the site offers)"), || {
-            let url = format!("{}{probe}", fm::SITE);
-            let mut req = Request::new(&url);
-            req.limit = 4 << 20;
-            let r = client.get(&req).map_err(|e| e.to_string())?;
-            out(&format!("     status {}, Content-Type {:?}, {} bytes", r.status, r.head.content_type(), r.body.len()));
-            let name: String = probe.trim_matches('/').chars().map(|c| if c.is_alphanumeric() || c == '.' { c } else { '_' }).collect();
-            save(&dir, &format!("fm-probe-{name}.txt"), &r.body);
-            Ok(())
-        });
+    let mut listed: Vec<r5net::Item> = Vec::new();
+    for p in [&list, &list2].into_iter().flatten() {
+        for it in &p.items {
+            if !listed.iter().any(|l| l.id == it.id) {
+                listed.push(it.clone());
+            }
+        }
     }
-    let first = list.as_ref().and_then(|p| p.items.first().cloned()).unwrap_or_else(|| r5net::Item {
-        id: "insectonator-mt5".into(),
-        title: "Insectonator".into(),
-        kind: Some("Game".into()),
-        page: "https://flashmuseum.net/game/insectonator-mt5/".into(),
-        ..Default::default()
+    // What kind of game each listed one is: its player page's settings (about 5 KB each).
+    let mut a_zip: Option<(r5net::Item, fm::PlayerConfig)> = None;
+    t.step(&format!("flashmuseum.net: the kind of each of the {} listed games (their player pages)", listed.len()), || {
+        let mut kinds: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for it in &listed {
+            let url = fm::player_url(it, None);
+            let mut req = Request::new(&url);
+            req.accept = "text/html";
+            req.referer = Some(&it.page);
+            let kind = match client.get(&req) {
+                Ok(r) if r.status == 200 => match fm::parse_player_page(&r.text()) {
+                    Some(c) => {
+                        if c.is_zip() && a_zip.is_none() {
+                            save(&dir, &format!("fm-player-{}.html", it.id), &r.body);
+                            a_zip = Some((it.clone(), c.clone()));
+                        }
+                        format!("gameType {:?}", c.game_type)
+                    }
+                    None => {
+                        save(&dir, &format!("fm-player-{}.html", it.id), &r.body);
+                        "no settings in the page".to_string()
+                    }
+                },
+                Ok(r) => format!("HTTP {}", r.status),
+                Err(e) => format!("error: {e}"),
+            };
+            kinds.entry(kind).or_default().push(it.id.clone());
+        }
+        for (k, ids) in &kinds {
+            out(&format!("     {k}: {} — {}", ids.len(), ids.join(", ")));
+        }
+        if listed.is_empty() {
+            return Err("no games listed".into());
+        }
+        Ok(())
     });
-    let mut fm_items = vec![first];
-    if fm_items[0].id != "insectonator-mt5" {
-        fm_items.push(r5net::Item { id: "insectonator-mt5".into(), title: "Insectonator".into(), kind: Some("Game".into()), page: "https://flashmuseum.net/game/insectonator-mt5/".into(), ..Default::default() });
+    // Two games (the first listed, and Insectonator): the player's settings, the movie, the picture.
+    let insectonator = r5net::Item { id: "insectonator-mt5".into(), title: "Insectonator".into(), kind: Some("Game".into()), page: "https://flashmuseum.net/game/insectonator-mt5/".into(), ..Default::default() };
+    let mut fm_items: Vec<r5net::Item> = listed.iter().take(1).cloned().collect();
+    if !fm_items.iter().any(|i| i.id == insectonator.id) {
+        fm_items.push(insectonator);
     }
     for it in &fm_items {
-        t.step(&format!("flashmuseum.net: the pages of {}", it.id), || {
-            let r = client.get_ok(&Request::new(&it.page)).map_err(|e| e.to_string())?;
-            save(&dir, &format!("fm-item-{}.html", it.id), &r.body);
-            let info = fm::parse_item_page(&r.text());
-            out(&format!("     player {:?}, picture {:?}, title {:?}", info.player, info.picture, info.title));
-            let player = info.player.unwrap_or_else(|| format!("https://player.flashmuseum.net/game/{}/", it.id));
-            let mut req = Request::new(&player);
-            req.referer = Some(&it.page);
-            let pr = client.get(&req).map_err(|e| e.to_string())?;
-            out(&format!("     player page: status {}, {} bytes, Content-Type {:?}", pr.status, pr.body.len(), pr.head.content_type()));
-            save(&dir, &format!("fm-player-{}.html", it.id), &pr.body);
-            let base = r5net::url::Url::parse(&pr.url).map_err(|e| e.to_string())?;
-            let swfs = fm::swf_addresses(&pr.text(), &base);
-            out(&format!("     .swf addresses in it: {swfs:?}"));
-            Ok(())
+        let files = t.step(&format!("flashmuseum.net: the player's settings for {}", it.id), || {
+            let (c, from) = fm::player_config(&client, it).map_err(|e| e.to_string())?;
+            out(&format!("     from {from}: gameType {:?}, rootURL {}, fileName {}, launchCommand {}, player {:?}", c.game_type, c.root_url, c.file_name, c.launch_command, c.player_url));
+            let files = fm::files_for(it, &c, from).map_err(|e| e.to_string())?;
+            out(&format!("     the movie: {} at {} (Referer {:?}; plays as {:?})", files.main.name, files.main.url, files.referer, files.address));
+            Ok(files)
         });
-        let files = t.step(&format!("flashmuseum.net: the files of {}", it.id), || Source::FlashMuseum.files(&client, it).map_err(|e| e.to_string()));
         if let Some(files) = files {
-            out(&format!("     the movie: {} at {} ({})", files.main.name, files.main.url, files.note));
             t.step(&format!("flashmuseum.net: download {}", it.id), || movie(&client, &dir, &files));
         }
         if let Some(thumb) = &it.thumb {
             t.step(&format!("flashmuseum.net: the picture of {}", it.id), || picture(&client, &dir, thumb, &format!("fm-thumb-{}", it.id)));
+        }
+    }
+    // A GameZip, when one is listed: what is in its archive (names and sizes only).
+    if let Some((it, c)) = &a_zip {
+        t.step(&format!("flashmuseum.net: the archive of {} (a GameZip)", it.id), || {
+            out(&format!("     rootURL {}, fileName {}, launchCommand {}", c.root_url, c.file_name, c.launch_command));
+            let referer = c.player_url.clone().unwrap_or_else(|| fm::player_url(it, None));
+            let path = fetch_to(&client, &dir, &c.movie_url(), Some(&referer), "gamezip.zip", 256 << 20)?;
+            let entries = zip_listing(&path)?;
+            out(&format!("     {} entries:", entries.len()));
+            for (name, packed, size, method) in entries.iter().take(80) {
+                out(&format!("       {name}  ({size} bytes, {packed} packed, method {method})"));
+            }
+            let _ = std::fs::remove_file(&path);
+            Ok(())
+        });
+    } else {
+        out("     (no GameZip among the listed games)");
+    }
+
+    // ---- Flashpoint Archive (1.000.028) ----
+    let fp_page = |words: &str, file: &str| -> Result<r5net::Page, String> {
+        let url = fp::search_url(words, 1);
+        out(&format!("     {url}"));
+        let r = client.get_ok(&Request::new(&url)).map_err(|e| e.to_string())?;
+        save(&dir, file, &r.body);
+        let v: serde_json::Value = serde_json::from_slice(&r.body).map_err(|e| e.to_string())?;
+        let p = fp::parse_search(&v, 1).map_err(|e| e.to_string())?;
+        out(&format!("     total {:?}, {} on page 1, more: {}", p.total, p.items.len(), p.more));
+        show_items(&p.items, 12);
+        Ok(p)
+    };
+    let fp_all = t.step("flashpointarchive.org: every Shockwave entry, A to Z", || fp_page("", "fp-search-all.json"));
+    let fp_totb = t.step("flashpointarchive.org: search \"trick or treat beat\"", || fp_page("trick or treat beat", "fp-search-totb.json"));
+    // an entry with game data (Trick or Treat Beat!), and the first listed one without
+    let mut fp_items: Vec<r5net::Item> = fp_totb.iter().flat_map(|p| p.items.iter().take(1).cloned()).collect();
+    let no_game_data = |it: &r5net::Item| it.data.as_deref().and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok()).is_some_and(|v| v["gameData"].as_array().map_or(true, |a| a.is_empty()));
+    if let Some(it) = fp_all.iter().flat_map(|p| p.items.iter()).find(|it| no_game_data(it)) {
+        fp_items.push(it.clone());
+    }
+    for it in &fp_items {
+        let files = t.step(&format!("flashpointarchive.org: the files of {} ({})", it.title, it.id), || {
+            let f = fp::files(it).map_err(|e| e.to_string())?;
+            out(&format!("     {}: {} at {}", f.note, f.main.name, f.main.url));
+            out(&format!("     address {:?}; launch {:?}; beside {:?}", f.address, f.launch, f.beside));
+            if let Some(a) = &f.archive {
+                out(&format!("     SHA-256 {}, mirrors {:?}, the movie {}", a.sha256, a.mirrors, a.movie));
+            }
+            Ok(f)
+        });
+        match files {
+            Some(files) if files.archive.is_some() => {
+                let a = files.archive.clone().unwrap();
+                t.step(&format!("flashpointarchive.org: the game data of {} (download, SHA-256, listing, the movie)", it.id), || {
+                    let mut got = Err(String::from("no address"));
+                    for url in std::iter::once(&files.main.url).chain(a.mirrors.iter()) {
+                        got = fetch_to(&client, &dir, url, None, &files.main.name, 1 << 30);
+                        match &got {
+                            Ok(_) => break,
+                            Err(e) => out(&format!("     {url}: {e}")),
+                        }
+                    }
+                    let path = got?;
+                    let sum = r5net::sha256_file(&path).map_err(|e| e.to_string())?;
+                    out(&format!("     SHA-256 {sum}: {}", if sum == a.sha256 { "as listed" } else { "NOT as listed" }));
+                    let mut z = r5net::zip::Zip::open(&path)?;
+                    out(&format!("     {} entries:", z.entries.len()));
+                    for e in z.entries.iter().take(80) {
+                        out(&format!("       {}  ({} bytes, {} packed, method {})", e.name, e.size, e.compressed, e.method));
+                    }
+                    let names: Vec<String> = z.entries.iter().map(|e| e.name.clone()).collect();
+                    let i = fp::pick_movie(&names, &a.movie)?;
+                    let mut movie = Vec::new();
+                    z.extract(i, &mut movie, 1 << 30)?;
+                    out(&format!("     the movie: {} ({} bytes, CRC-32 as the zip says): {}", names[i], movie.len(), magic(&movie[..movie.len().min(16)])));
+                    let _ = std::fs::remove_file(&path);
+                    if sum != a.sha256 {
+                        return Err(format!("SHA-256 {sum}, listed {}", a.sha256));
+                    }
+                    if !movie.starts_with(b"XFIR") && !movie.starts_with(b"RIFX") {
+                        return Err(format!("{} is not a Director movie", names[i]));
+                    }
+                    Ok(())
+                });
+            }
+            Some(files) => {
+                t.step(&format!("flashpointarchive.org: the movie of {} from the legacy server", it.id), || {
+                    let path = fetch_to(&client, &dir, &files.main.url, None, &files.main.name, 64 << 20)?;
+                    let head = std::fs::read(&path).map(|b| b.into_iter().take(16).collect::<Vec<u8>>()).unwrap_or_default();
+                    if !head.starts_with(b"XFIR") && !head.starts_with(b"RIFX") {
+                        return Err(format!("not a Director movie: {}", magic(&head)));
+                    }
+                    Ok(())
+                });
+            }
+            None => {}
+        }
+        if let Some(thumb) = &it.thumb {
+            t.step(&format!("flashpointarchive.org: the picture of {}", it.id), || picture(&client, &dir, thumb, &format!("fp-logo-{}", it.id)));
         }
     }
 

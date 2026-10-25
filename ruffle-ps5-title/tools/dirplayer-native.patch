@@ -1,5 +1,5 @@
 diff --git a/vm-rust/Cargo.toml b/vm-rust/Cargo.toml
-index f0a3b59..18098d0 100644
+index f0a3b59..e1c40ab 100644
 --- a/vm-rust/Cargo.toml
 +++ b/vm-rust/Cargo.toml
 @@ -8,7 +8,10 @@ license = "GPL-3.0-only"
@@ -46,13 +46,15 @@ index f0a3b59..18098d0 100644
  rand = { version = "0.9", features = ["small_rng"] }
  getrandom = { version = "0.3", features = ["wasm_js"] }
  base64 = "0.22"
-@@ -77,8 +83,14 @@ wasm-bindgen-test = "0.3.34"
+@@ -77,8 +83,16 @@ wasm-bindgen-test = "0.3.34"
  version = "1.12.0"
  features = ["unstable"]
  
-+# PS5_RUFFLE_DIRPLAYER_NATIVE: MP3 sound without a browser to decode it (src/player/native_audio.rs).
++# PS5_RUFFLE_DIRPLAYER_NATIVE: MP3 sound without a browser to decode it (src/player/native_audio.rs),
++# and text in system fonts without a browser's canvas (src/player/native_text.rs).
 +[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 +symphonia = { version = "0.5.5", default-features = false, features = ["mp3"] }
++ab_glyph = "0.2"
 +
 +# PS5_RUFFLE_DIRPLAYER_NATIVE: the wasm-bindgen family as caret requirements, not exact pins, so
 +# DirPlayer builds next to Ruffle (which needs newer 0.2/0.3/0.4 releases of the same crates).
@@ -75,7 +77,7 @@ index aa15ee1..6690cc0 100644
      let target = std::env::var("TARGET").unwrap_or_default();
      if target.contains("wasm32") {
 diff --git a/vm-rust/src/director/file.rs b/vm-rust/src/director/file.rs
-index c71aa4f..4ba09d9 100644
+index c71aa4f..fb56791 100644
 --- a/vm-rust/src/director/file.rs
 +++ b/vm-rust/src/director/file.rs
 @@ -65,7 +65,7 @@ pub struct DirectorFile {
@@ -87,6 +89,56 @@ index c71aa4f..4ba09d9 100644
  // }
  
  impl DirectorFile {
+@@ -1145,6 +1145,49 @@ pub fn read_director_file_bytes(
+     );
+ }
+ 
++/// PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.028): the casts a movie's cast list (`MCsL`) names, as
++/// (name, file path) — the file path empty for a cast inside the movie — read without a player:
++/// only the file's map, key table, config and cast list. `read_director_file_bytes` also reads the
++/// score, whose behaviours' parameters the running player evaluates (with no player that is
++/// undefined behaviour). A movie before Director 5 has no cast list: an empty list.
++pub fn read_cast_list_bytes(bytes: &Vec<u8>) -> Result<Vec<(String, String)>, String> {
++    let mut reader = binary_reader::BinaryReader::from_vec(bytes);
++    reader.set_endian(binary_reader::Endian::Big);
++    let mut chunk_container = ChunkContainer {
++        cached_chunk_views: HashMap::new(),
++        chunk_info: HashMap::new(),
++        deserialized_chunks: HashMap::new(),
++    };
++    let meta_fourcc = reader.read_u32().map_err(|e| format!("Failed to read file header: {}", e))?;
++    if meta_fourcc == FOURCC("XFIR") {
++        reader.set_endian(binary_reader::Endian::Little);
++    } else if meta_fourcc != FOURCC("RIFX") {
++        return Err("not a Director file".to_owned());
++    }
++    let _ = reader.read_u32().map_err(|e| format!("Failed to read meta length: {}", e))?;
++    let codec = reader.read_u32().map_err(|e| format!("Failed to read codec: {}", e))?;
++    let mut after_burned = false;
++    let mut ils_body_offset: usize = 0;
++    if codec == FOURCC("MV93") || codec == FOURCC("MC95") {
++        read_memory_map(&mut reader, &mut chunk_container.chunk_info)?;
++    } else if codec == FOURCC("FGDM") || codec == FOURCC("FGDC") {
++        after_burned = true;
++        ils_body_offset = read_after_burner_map(&mut reader, &mut chunk_container.cached_chunk_views, &mut chunk_container.chunk_info)?;
++    } else {
++        return Err("Invalid codec".to_owned());
++    }
++    let mut rifx = RIFXReaderContext { after_burned, ils_body_offset, dir_version: 0, lctx_capital_x: false };
++    let _key_table = read_key_table(&mut reader, &mut chunk_container, &mut rifx)?;
++    let config = read_config(&mut reader, &mut chunk_container, &mut rifx)?;
++    rifx.dir_version = human_version(config.director_version);
++    if rifx.dir_version < 500 {
++        return Ok(Vec::new());
++    }
++    Ok(get_cast_list_chunk(&mut reader, &mut chunk_container, &mut rifx)
++        .map(|list| list.entries.into_iter().map(|e| (e.name, e.file_path)).collect())
++        .unwrap_or_default())
++}
++
+ fn get_chunk_data(
+     reader: &mut BinaryReader,
+     chunk_container: &mut ChunkContainer,
 diff --git a/vm-rust/src/director/static_datum.rs b/vm-rust/src/director/static_datum.rs
 index 1fa65d0..9ea7b25 100644
 --- a/vm-rust/src/director/static_datum.rs
@@ -611,11 +663,41 @@ index 7b6a277..70b2b65 100644
                          "putchunk: field set failed (ignored): {}", err.message
                      ).into());
                      return Ok(HandlerExecutionResult::Advance);
+diff --git a/vm-rust/src/player/cast_lib.rs b/vm-rust/src/player/cast_lib.rs
+index 5e6848d..c6d7445 100644
+--- a/vm-rust/src/player/cast_lib.rs
++++ b/vm-rust/src/player/cast_lib.rs
+@@ -171,6 +171,15 @@ impl CastLib {
+             // ~650 null.cst pool slots fail to fetch during resetCastLibs;
+             // keep this off the console (log::debug) to avoid flooding DevTools.
+             log::debug!("Fetching {load_file_name} failed");
++            // PS5_RUFFLE_DIRPLAYER_NATIVE: a cast file missing beside the movie (a game's sounds
++            // in sound.cct, say) is worth a line in the host's log — the first few of them.
++            #[cfg(not(target_arch = "wasm32"))]
++            {
++                static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++                if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
++                    log::warn!("castLib {} '{}': its file {load_file_name} is not there ({})", self.number, self.name, result.as_ref().err().map(|e| format!("{e:?}")).unwrap_or_default());
++                }
++            }
+         }
+         self.state = CastLibState::None;
+     }
 diff --git a/vm-rust/src/player/cast_member.rs b/vm-rust/src/player/cast_member.rs
-index 5364456..868786e 100644
+index 5364456..fd7e75b 100644
 --- a/vm-rust/src/player/cast_member.rs
 +++ b/vm-rust/src/player/cast_member.rs
-@@ -4421,7 +4421,7 @@ impl CastMember {
+@@ -1023,6 +1023,9 @@ pub struct FilmLoopMember {
+     pub initial_rect: super::geometry::IntRect,
+     /// Cached total frame count (computed once from channel_initialization_data, sprite_spans, and keyframes).
+     pub cached_total_frames: Option<u32>,
++    /// PS5_RUFFLE_DIRPLAYER_FILMLOOP_GO: the frame a `go` inside `tell sprite(<this film loop>)`
++    /// asked for, which the film loop shows at its next advance instead of the frame after.
++    pub go_frame: Option<u32>,
+ }
+ 
+ /// A Linked Movie cast member (`#movie`) — references an external Director
+@@ -4421,7 +4424,7 @@ impl CastMember {
          let payload = &raw[flsh_start + 8..];
          let vector_member = Self::parse_flsh_payload(payload);
  
@@ -624,7 +706,7 @@ index 5364456..868786e 100644
              &format!(
                  "OLE member #{} identified as vectorShape: {} vertices, strokeWidth={}, fillMode={}, closed={}, bbox=({},{},{},{})",
                  number,
-@@ -5646,7 +5646,7 @@ impl CastMember {
+@@ -5646,7 +5649,7 @@ impl CastMember {
                          name: member_info.name.clone(),
                      })
                  } else {
@@ -633,7 +715,7 @@ index 5364456..868786e 100644
                      CastMemberType::Unknown
                  }
              }
-@@ -5846,7 +5846,7 @@ impl CastMember {
+@@ -5846,7 +5849,7 @@ impl CastMember {
                                  Some(std::rc::Rc::new(scene))
                              }
                              Err(e) => {
@@ -642,6 +724,80 @@ index 5364456..868786e 100644
                                  Some(std::rc::Rc::new(Self::create_empty_w3d_scene()))
                              }
                          }
+@@ -6185,6 +6188,7 @@ impl CastMember {
+                         current_frame: 1, // Start at frame 1
+                         initial_rect,
+                         cached_total_frames: Some(total_frames),
++                        go_frame: None,
+                     })
+                 } else {
+                     warn!("FilmLoop {} has no valid score chunk, creating empty film loop", number);
+@@ -6205,6 +6209,7 @@ impl CastMember {
+                         current_frame: 1,
+                         initial_rect: super::geometry::IntRect { left: 0, top: 0, right: 0, bottom: 0 },
+                         cached_total_frames: None,
++                        go_frame: None,
+                     })
+                 }
+             }
+diff --git a/vm-rust/src/player/context_vars.rs b/vm-rust/src/player/context_vars.rs
+index 5e14dd7..3cdca8d 100644
+--- a/vm-rust/src/player/context_vars.rs
++++ b/vm-rust/src/player/context_vars.rs
+@@ -9,7 +9,6 @@ use super::{
+ use crate::director::lingo::datum::Datum;
+ use crate::player::bytecode::string::PutType;
+ use crate::player::cast_member::CastMemberType;
+-use web_sys::console;
+ 
+ pub fn read_context_var_args(
+     player: &mut DirPlayer,
+@@ -299,7 +298,7 @@ pub fn player_set_context_var(
+                     }
+                 }
+             } else {
+-                console::log_1(
++                crate::web_console!(log_1,
+                     &format!(
+                         "❌ Member reference found but no mutable member exists: {:?}",
+                         member_ref
+diff --git a/vm-rust/src/player/datum_formatting.rs b/vm-rust/src/player/datum_formatting.rs
+index 220d93f..0532ceb 100644
+--- a/vm-rust/src/player/datum_formatting.rs
++++ b/vm-rust/src/player/datum_formatting.rs
+@@ -190,10 +190,7 @@ pub fn format_concrete_datum_with_depth(datum: &Datum, player: &DirPlayer, depth
+             // concatenation belongs to _system.time() (Windows short-time keeps an
+             // empty AM/PM slot in 24-hour locales); see TypeHandlers::time.
+             player.date_objects.get(id)
+-                .map(|d| js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(d.timestamp_ms as f64))
+-                    .to_locale_date_string("default", &date_opts())
+-                    .as_string()
+-                    .unwrap_or_default())
++                .map(|d| crate::player::host_date::LocalDate::from_ms(d.timestamp_ms as f64).locale_date())
+                 .unwrap_or_else(|| "<date>".to_string())
+         }
+         Datum::Media(_) => {
+@@ -313,16 +310,7 @@ pub fn format_numeric_value(datum: &Datum, player: &DirPlayer) -> String {
+     }
+ }
+ 
+-/// Options for Director's system SHORT date: zero-padded day and month with a
+-/// full year. Measured against Director on this machine: `03.08.2026`, where a
+-/// bare toLocaleDateString gave `3.8.2026`. The locale still chooses the field
+-/// ORDER and separator — only the padding is pinned, matching the dictionary's
+-/// note that the date format "varies, depending on how the date is formatted on
+-/// the computer".
+-fn date_opts() -> js_sys::Object {
+-    let o = js_sys::Object::new();
+-    let _ = js_sys::Reflect::set(&o, &"day".into(), &"2-digit".into());
+-    let _ = js_sys::Reflect::set(&o, &"month".into(), &"2-digit".into());
+-    let _ = js_sys::Reflect::set(&o, &"year".into(), &"numeric".into());
+-    o
+-}
++// Director's system SHORT date — zero-padded day and month with a full year (measured against
++// Director: `03.08.2026`, where a bare toLocaleDateString gave `3.8.2026`; the locale still
++// chooses the field order and separator) — is host_date::LocalDate::locale_date
++// (PS5_RUFFLE_DIRPLAYER_NATIVE: there, so that it has a form without the browser).
 diff --git a/vm-rust/src/player/eval.rs b/vm-rust/src/player/eval.rs
 index 9d1fa62..596427a 100644
 --- a/vm-rust/src/player/eval.rs
@@ -696,7 +852,7 @@ index 5acf223..ad40455 100644
                          "Error in {} for sprite {} member script: {}",
                          handler_name, sprite_number, err.message
 diff --git a/vm-rust/src/player/font/mod.rs b/vm-rust/src/player/font/mod.rs
-index 081e092..af35b42 100644
+index 081e092..50dfe0c 100644
 --- a/vm-rust/src/player/font/mod.rs
 +++ b/vm-rust/src/player/font/mod.rs
 @@ -539,7 +539,7 @@ impl FontManager {
@@ -735,11 +891,154 @@ index 081e092..af35b42 100644
                                  &format!(
                                      "Caching font as: '{}', '{}', '{}'",
                                      cache_key, font_name, member.name
+@@ -852,6 +852,61 @@ impl FontManager {
+     }
+ }
+ 
++/// PS5_RUFFLE_DIRPLAYER_NATIVE: the system font from DirPlayer's own `public/charmap-system.png`,
++/// which the web front end has the VM fetch (`SetSystemFontPath`, below). Off the web nothing sent
++/// that, so the player had no system font: text in a font the movie does not carry found none,
++/// and `locToCharPos`, `pointToChar` and others unwrap it. The same bitmap and font as the web
++/// path makes from the same image (an RGB PNG: every pixel opaque, as the canvas reads it back).
++#[cfg(not(target_arch = "wasm32"))]
++pub fn native_load_system_font(player: &mut crate::player::DirPlayer) -> Result<(), String> {
++    static PNG: &[u8] = include_bytes!("../../../../public/charmap-system.png");
++    let img = image::load_from_memory_with_format(PNG, image::ImageFormat::Png)
++        .map_err(|e| format!("charmap-system.png: {e}"))?
++        .to_rgba8();
++    let bitmap = Bitmap {
++        width: img.width() as u16,
++        height: img.height() as u16,
++        data: img.into_raw(),
++        bit_depth: 32,
++        original_bit_depth: 32,
++        palette_ref: PaletteRef::BuiltIn(get_system_default_palette()),
++        matte: None,
++        use_alpha: false,
++        trim_white_space: false,
++        was_trimmed: false,
++        version: 0,
++    };
++    let grid_columns = 18;
++    let grid_rows = 7;
++    let grid_cell_width = bitmap.width / grid_columns;
++    let grid_cell_height = bitmap.height / grid_rows;
++    let bitmap_ref = player.bitmap_manager.add_bitmap(bitmap);
++    let font = BitmapFont {
++        bitmap_ref,
++        char_width: 5,
++        char_height: 7,
++        grid_columns: grid_columns as u8,
++        grid_rows: grid_rows as u8,
++        grid_cell_width,
++        grid_cell_height,
++        first_char_num: 32,
++        char_offset_x: 1,
++        char_offset_y: 1,
++        font_name: "System".to_string(),
++        font_size: 12,
++        font_style: 0,
++        char_widths: None,
++        pfr_native_size: 0,
++    };
++    let rc_font = Rc::new(font.clone());
++    let font_ref = player.font_manager.font_counter;
++    player.font_manager.font_counter += 1;
++    player.font_manager.fonts.insert(font_ref, Rc::clone(&rc_font));
++    player.font_manager.system_font = Some(rc_font);
++    player.font_manager.font_cache.insert("system".to_string(), font.into());
++    Ok(())
++}
++
+ pub async fn player_load_system_font(path: &str) {
+     let window = web_sys::window().unwrap();
+     let result = JsFuture::from(window.fetch_with_str(path)).await;
 diff --git a/vm-rust/src/player/handlers/datum_handlers/cast_member/font.rs b/vm-rust/src/player/handlers/datum_handlers/cast_member/font.rs
-index f9c56e3..ca3b3ac 100644
+index f9c56e3..6f3dca7 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/cast_member/font.rs
 +++ b/vm-rust/src/player/handlers/datum_handlers/cast_member/font.rs
-@@ -2437,7 +2437,7 @@ impl FontMemberHandlers {
+@@ -496,6 +496,9 @@ impl FontMemberHandlers {
+         bottom_spacing: i16,
+         fixed_line_space: u16,
+     ) -> (u16, u16) {
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: the browser's canvas on the web, native_text's off it.
++        #[cfg(target_arch = "wasm32")]
++        let ctx: web_sys::CanvasRenderingContext2d = {
+         use wasm_bindgen::JsCast;
+ 
+         let document = match web_sys::window().and_then(|w| w.document()) {
+@@ -511,7 +514,7 @@ impl FontMemberHandlers {
+         };
+         canvas.set_width(1);
+         canvas.set_height(1);
+-        let ctx: web_sys::CanvasRenderingContext2d = match canvas
++        match canvas
+             .get_context("2d")
+             .ok()
+             .flatten()
+@@ -521,7 +524,10 @@ impl FontMemberHandlers {
+                 Err(_) => return (100, font_size.max(12)),
+             },
+             None => return (100, font_size.max(12)),
++        }
+         };
++        #[cfg(not(target_arch = "wasm32"))]
++        let ctx = crate::player::native_text::TextCtx::new(1, 1);
+ 
+         let mut parts: Vec<String> = Vec::new();
+         if let Some(s) = font_style {
+@@ -656,6 +662,15 @@ impl FontMemberHandlers {
+         par_runs: &[crate::director::chunks::xmedia_styled_text::ParRun],
+         caret_overlay: Option<NativeCaretOverlay>,
+     ) -> Result<(), ScriptError> {
++        // Render at 2x scale for sharper text (Canvas2D anti-aliasing at 1x
++        // produces low coverage for small characters like ':'), then downscale.
++        let scale_factor = 2u32;
++        let canvas_width = render_width.max(1) as u32 * scale_factor;
++        let canvas_height = render_height.max(1) as u32 * scale_factor;
++
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: the browser's canvas on the web, native_text's off it.
++        #[cfg(target_arch = "wasm32")]
++        let ctx: web_sys::CanvasRenderingContext2d = {
+         // Create temporary canvas for text rendering (size of text area only)
+         let document = web_sys::window()
+             .ok_or_else(|| ScriptError::new("No window".to_string()))?
+@@ -668,20 +683,18 @@ impl FontMemberHandlers {
+             .dyn_into()
+             .map_err(|_| ScriptError::new("Failed to cast canvas".to_string()))?;
+ 
+-        // Render at 2x scale for sharper text (Canvas2D anti-aliasing at 1x
+-        // produces low coverage for small characters like ':'), then downscale.
+-        let scale_factor = 2u32;
+-        let canvas_width = render_width.max(1) as u32 * scale_factor;
+-        let canvas_height = render_height.max(1) as u32 * scale_factor;
+         canvas.set_width(canvas_width);
+         canvas.set_height(canvas_height);
+ 
+-        let ctx: web_sys::CanvasRenderingContext2d = canvas
++        canvas
+             .get_context("2d")
+             .map_err(|_| ScriptError::new("Failed to get 2d context".to_string()))?
+             .ok_or_else(|| ScriptError::new("No 2d context".to_string()))?
+             .dyn_into()
+-            .map_err(|_| ScriptError::new("Failed to cast context".to_string()))?;
++            .map_err(|_| ScriptError::new("Failed to cast context".to_string()))?
++        };
++        #[cfg(not(target_arch = "wasm32"))]
++        let ctx = crate::player::native_text::TextCtx::new(canvas_width, canvas_height);
+ 
+         // Scale the context so text renders at 2x resolution
+         let _ = ctx.scale(scale_factor as f64, scale_factor as f64);
+@@ -1336,7 +1349,7 @@ impl FontMemberHandlers {
+                 // Resolve a byte offset within this line to a pixel x by walking
+                 // segments and using Canvas2D measureText for the prefix inside
+                 // the segment that contains the offset.
+-                let pixel_x_for_byte = |byte: usize, ctx: &web_sys::CanvasRenderingContext2d| -> f64 {
++                let pixel_x_for_byte = |byte: usize, ctx: &crate::player::TextCtx| -> f64 {
+                     let mut x = x_start;
+                     for segment in &line.segments {
+                         if segment.is_tab { continue; }
+@@ -2437,7 +2450,7 @@ impl FontMemberHandlers {
                              })?
                          };
  
@@ -748,6 +1047,228 @@ index f9c56e3..ca3b3ac 100644
                              &format!(
                                  "Using font: '{}' (size: {}, char_width: {}, char_height: {})",
                                  font.font_name, font.font_size, font.char_width, font.char_height
+diff --git a/vm-rust/src/player/handlers/datum_handlers/cast_member/shockwave3d.rs b/vm-rust/src/player/handlers/datum_handlers/cast_member/shockwave3d.rs
+index c731d4d..bd9a3eb 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/cast_member/shockwave3d.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/cast_member/shockwave3d.rs
+@@ -178,6 +178,9 @@ impl Shockwave3dMemberHandlers {
+     fn xmed_cell_height_to_point_size(cell_height: i32, font_face: &str) -> i32 {
+         if cell_height <= 0 { return cell_height; }
+         let ref_size = 100.0_f64;
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: the browser's canvas on the web, native_text's off it.
++        #[cfg(target_arch = "wasm32")]
++        let ctx: web_sys::CanvasRenderingContext2d = {
+         let doc = match web_sys::window().and_then(|w| w.document()) {
+             Some(d) => d,
+             None => return cell_height,
+@@ -187,11 +190,14 @@ impl Shockwave3dMemberHandlers {
+             Some(c) => c,
+             None => return cell_height,
+         };
+-        let ctx: web_sys::CanvasRenderingContext2d = match canvas.get_context("2d")
++        match canvas.get_context("2d")
+             .ok().flatten().and_then(|c| c.dyn_into().ok()) {
+             Some(c) => c,
+             None => return cell_height,
++        }
+         };
++        #[cfg(not(target_arch = "wasm32"))]
++        let ctx = crate::player::native_text::TextCtx::new(1, 1);
+         let font_str = format!("{}px {}", ref_size as i32, font_face);
+         ctx.set_font(&font_str);
+         let metrics = match ctx.measure_text("M") {
+@@ -3249,6 +3255,14 @@ fn render_3d_to_rgba(
+         None => return vec![128u8; (width * height * 4) as usize], // grey fallback
+     };
+ 
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: the scene is drawn with WebGL2, which there is none of off the
++    // web: the grey this gives without a document.
++    #[cfg(not(target_arch = "wasm32"))]
++    if true {
++        let _ = (scene, runtime_state);
++        return vec![128u8; (width * height * 4) as usize];
++    }
++
+     // Create offscreen canvas
+     let document = match web_sys::window().and_then(|w| w.document()) {
+         Some(d) => d,
+diff --git a/vm-rust/src/player/handlers/datum_handlers/date.rs b/vm-rust/src/player/handlers/datum_handlers/date.rs
+index 9132146..20506c2 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/date.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/date.rs
+@@ -11,7 +11,8 @@ pub struct DateObject {
+ impl DateObject {
+     pub fn new(id: u32) -> Self {
+         // Current time in milliseconds
+-        let now_ms = js_sys::Date::now() as i64;
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: the clock through host_date (js_sys on the web).
++        let now_ms = crate::player::host_date::now_ms() as i64;
+         DateObject {
+             id,
+             timestamp_ms: now_ms,
+@@ -38,9 +39,7 @@ impl DateDatumHandlers {
+                 .get(&date_id)
+                 .ok_or_else(|| ScriptError::new(format!("Date object {} not found", date_id)))?;
+ 
+-            let js_date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
+-                date_obj.timestamp_ms as f64,
+-            ));
++            let js_date = crate::player::host_date::LocalDate::from_ms(date_obj.timestamp_ms as f64);
+ 
+             match handler_name.into_builtin() {
+                 Some(BuiltInSymbol::GetTime) => {
+@@ -98,9 +97,7 @@ impl DateDatumHandlers {
+                         ));
+                     }
+                     let year = player.get_datum(&args[0]).int_value()?;
+-                    let mut js_date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
+-                        date_obj.timestamp_ms as f64,
+-                    ));
++                    let mut js_date = crate::player::host_date::LocalDate::from_ms(date_obj.timestamp_ms as f64);
+                     js_date.set_full_year(year as u32);
+ 
+                     let date_obj = player.date_objects.get_mut(&date_id).unwrap();
+@@ -115,9 +112,7 @@ impl DateDatumHandlers {
+                         ));
+                     }
+                     let year_offset = player.get_datum(&args[0]).int_value()?;
+-                    let mut js_date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
+-                        date_obj.timestamp_ms as f64,
+-                    ));
++                    let mut js_date = crate::player::host_date::LocalDate::from_ms(date_obj.timestamp_ms as f64);
+                     js_date.set_full_year((year_offset + 1900) as u32);
+ 
+                     let date_obj = player.date_objects.get_mut(&date_id).unwrap();
+@@ -131,9 +126,7 @@ impl DateDatumHandlers {
+                         ));
+                     }
+                     let month = player.get_datum(&args[0]).int_value()?;
+-                    let mut js_date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
+-                        date_obj.timestamp_ms as f64,
+-                    ));
++                    let mut js_date = crate::player::host_date::LocalDate::from_ms(date_obj.timestamp_ms as f64);
+                     js_date.set_month(month as u32);
+ 
+                     let date_obj = player.date_objects.get_mut(&date_id).unwrap();
+@@ -147,9 +140,7 @@ impl DateDatumHandlers {
+                         ));
+                     }
+                     let date = player.get_datum(&args[0]).int_value()?;
+-                    let mut js_date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
+-                        date_obj.timestamp_ms as f64,
+-                    ));
++                    let mut js_date = crate::player::host_date::LocalDate::from_ms(date_obj.timestamp_ms as f64);
+                     js_date.set_date(date as u32);
+ 
+                     let date_obj = player.date_objects.get_mut(&date_id).unwrap();
+@@ -163,9 +154,7 @@ impl DateDatumHandlers {
+                         ));
+                     }
+                     let hours = player.get_datum(&args[0]).int_value()?;
+-                    let mut js_date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
+-                        date_obj.timestamp_ms as f64,
+-                    ));
++                    let mut js_date = crate::player::host_date::LocalDate::from_ms(date_obj.timestamp_ms as f64);
+                     js_date.set_hours(hours as u32);
+ 
+                     let date_obj = player.date_objects.get_mut(&date_id).unwrap();
+@@ -179,9 +168,7 @@ impl DateDatumHandlers {
+                         ));
+                     }
+                     let minutes = player.get_datum(&args[0]).int_value()?;
+-                    let mut js_date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
+-                        date_obj.timestamp_ms as f64,
+-                    ));
++                    let mut js_date = crate::player::host_date::LocalDate::from_ms(date_obj.timestamp_ms as f64);
+                     js_date.set_minutes(minutes as u32);
+ 
+                     let date_obj = player.date_objects.get_mut(&date_id).unwrap();
+@@ -195,9 +182,7 @@ impl DateDatumHandlers {
+                         ));
+                     }
+                     let seconds = player.get_datum(&args[0]).int_value()?;
+-                    let mut js_date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
+-                        date_obj.timestamp_ms as f64,
+-                    ));
++                    let mut js_date = crate::player::host_date::LocalDate::from_ms(date_obj.timestamp_ms as f64);
+                     js_date.set_seconds(seconds as u32);
+ 
+                     let date_obj = player.date_objects.get_mut(&date_id).unwrap();
+@@ -226,9 +211,7 @@ impl DateDatumHandlers {
+             .date_objects
+             .get(&date_id)
+             .ok_or_else(|| ScriptError::new(format!("Date object {} not found", date_id)))?;
+-        let js_date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
+-            date_obj.timestamp_ms as f64,
+-        ));
++        let js_date = crate::player::host_date::LocalDate::from_ms(date_obj.timestamp_ms as f64);
+ 
+         // Lingo Date object properties — `#year`, `#month`, `#day`. We also
+         // expose the common time-of-day properties so the JavaScript-style
+@@ -265,9 +248,7 @@ impl DateDatumHandlers {
+             .date_objects
+             .get(&date_id)
+             .ok_or_else(|| ScriptError::new(format!("Date object {} not found", date_id)))?;
+-        let mut js_date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
+-            date_obj.timestamp_ms as f64,
+-        ));
++        let mut js_date = crate::player::host_date::LocalDate::from_ms(date_obj.timestamp_ms as f64);
+         let value_datum = player.get_datum(value);
+ 
+         match prop.into_builtin() {
+diff --git a/vm-rust/src/player/handlers/datum_handlers/flash_object.rs b/vm-rust/src/player/handlers/datum_handlers/flash_object.rs
+index ce5283b..19cff5f 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/flash_object.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/flash_object.rs
+@@ -13,6 +13,7 @@ use log::warn;
+ // collide with stock Ruffle if both are loaded on the same page (e.g. via a
+ // browser extension). Matching JS-side definitions live in
+ // src/services/flashPlayerManager.ts::initFlashBridge.
++#[cfg(target_arch = "wasm32")]
+ #[wasm_bindgen]
+ extern "C" {
+     // Per-sprite Flash bridge — see datum_handlers/sprite.rs for the full
+@@ -47,6 +48,27 @@ extern "C" {
+     ) -> Result<JsValue, JsValue>;
+ }
+ 
++// PS5_RUFFLE_DIRPLAYER_NATIVE: off the web no Ruffle instance stands behind a Flash member, so no
++// FlashObjectRef is ever made there (getVariable answers VOID) and `resolve_flash_sprite` finds no
++// sprite: of these only the mouse forwarding (commands.rs) runs, and its answer is dropped.
++// JsValue::UNDEFINED is a constant; making and dropping it never calls into the browser.
++#[cfg(not(target_arch = "wasm32"))]
++fn ruffle_get_variable_global(_sprite_num: i32, _path: &str) -> Result<JsValue, JsValue> {
++    Err(JsValue::UNDEFINED)
++}
++#[cfg(not(target_arch = "wasm32"))]
++fn ruffle_set_variable_global(_sprite_num: i32, _path: &str, _value: &str) -> Result<JsValue, JsValue> {
++    Err(JsValue::UNDEFINED)
++}
++#[cfg(not(target_arch = "wasm32"))]
++fn ruffle_call_function_global(_sprite_num: i32, _path: &str, _args_xml: &str) -> Result<JsValue, JsValue> {
++    Err(JsValue::UNDEFINED)
++}
++#[cfg(not(target_arch = "wasm32"))]
++pub fn ruffle_dispatch_mouse_event_global(_sprite_num: i32, _event_type: &str, _local_x: i32, _local_y: i32, _sprite_w: i32, _sprite_h: i32) -> Result<JsValue, JsValue> {
++    Err(JsValue::UNDEFINED)
++}
++
+ /// Find the sprite number that currently displays the given Flash cast
+ /// member. With per-sprite Ruffle instances we need a sprite-num key for
+ /// the JS bridge; FlashObjectRef only carries cast_lib/cast_member, so we
+@@ -61,6 +83,12 @@ extern "C" {
+ /// the bound sprite keeps `gDemoFlash.play()` working even when the member
+ /// wasn't resolvable at the time the handle was captured.
+ pub fn resolve_flash_sprite(flash_ref: &FlashObjectRef) -> Option<i32> {
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: no Ruffle instances off the web.
++    #[cfg(not(target_arch = "wasm32"))]
++    if true {
++        let _ = flash_ref;
++        return None;
++    }
+     if let Some(sn) = flash_ref.bound_sprite() {
+         return Some(sn);
+     }
 diff --git a/vm-rust/src/player/handlers/datum_handlers/mod.rs b/vm-rust/src/player/handlers/datum_handlers/mod.rs
 index f0e7ac1..bed0bd6 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/mod.rs
@@ -1094,10 +1615,59 @@ index 9ae62c7..d1e3add 100644
          if let Some(ref pan_node) = self.pan_node {
              let _ = pan_node.pan().set_value(clamped as f32);
 diff --git a/vm-rust/src/player/handlers/datum_handlers/sprite.rs b/vm-rust/src/player/handlers/datum_handlers/sprite.rs
-index e1caff1..6098c9c 100644
+index e1caff1..d1e77b9 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/sprite.rs
 +++ b/vm-rust/src/player/handlers/datum_handlers/sprite.rs
-@@ -135,7 +135,7 @@ async fn wait_for_flash_ready(sprite_num: i16) {
+@@ -80,6 +80,10 @@ fn set_sprite_camera_list(
+ // collide with stock Ruffle if both are loaded on the same page (e.g. via a
+ // browser extension). Matching JS-side definitions live in
+ // src/services/flashPlayerManager.ts::initFlashBridge.
++//
++// PS5_RUFFLE_DIRPLAYER_NATIVE: off the web there is no Ruffle instance behind a Flash sprite; the
++// stubs after the block answer as the bridge does for a sprite without one (an error, nothing).
++#[cfg(target_arch = "wasm32")]
+ #[wasm_bindgen]
+ extern "C" {
+     // All Lingo Flash bridge calls now take `sprite_num` because each Flash
+@@ -121,6 +125,37 @@ extern "C" {
+     #[wasm_bindgen(js_name = "dirplayer_isFlashInstanceReady", catch)]
+     fn is_flash_instance_ready(sprite_num: i32) -> Result<JsValue, JsValue>;
+ }
++#[cfg(not(target_arch = "wasm32"))]
++mod no_flash_bridge {
++    use wasm_bindgen::JsValue;
++    pub fn ruffle_goto_frame(_sprite_num: i32, _frame_or_label: &str) {}
++    pub fn ruffle_stop(_sprite_num: i32) {}
++    pub fn ruffle_play(_sprite_num: i32) {}
++    pub fn ruffle_rewind(_sprite_num: i32) {}
++    pub fn ruffle_call_frame(_sprite_num: i32, _frame: i32) {}
++    pub fn ruffle_get_variable(_sprite_num: i32, _path: &str) -> Result<JsValue, JsValue> {
++        Err(JsValue::UNDEFINED)
++    }
++    pub fn ruffle_set_variable(_sprite_num: i32, _path: &str, _value: &str) -> Result<JsValue, JsValue> {
++        Err(JsValue::UNDEFINED)
++    }
++    pub fn ruffle_call_function(_sprite_num: i32, _path: &str, _args_xml: &str) -> Result<JsValue, JsValue> {
++        Err(JsValue::UNDEFINED)
++    }
++    pub fn ruffle_hit_test(_sprite_num: i32, _x: f64, _y: f64) -> i32 {
++        0
++    }
++    pub fn ruffle_get_flash_property(_sprite_num: i32, _target: &str, _prop_num: i32) -> Result<JsValue, JsValue> {
++        Err(JsValue::UNDEFINED)
++    }
++    pub fn ruffle_set_flash_property(_sprite_num: i32, _target: &str, _prop_num: i32, _value: &str) {}
++    pub fn is_flash_instance_ready(_sprite_num: i32) -> Result<JsValue, JsValue> {
++        Err(JsValue::UNDEFINED)
++    }
++}
++#[cfg(not(target_arch = "wasm32"))]
++#[allow(unused_imports)]
++use no_flash_bridge::*;
+ 
+ /// Yield the frame loop until the sprite's Ruffle instance is ready (loaded +
+ /// AS-initialized), so a Flash interop call reads/writes a live instance rather
+@@ -135,7 +170,7 @@ async fn wait_for_flash_ready(sprite_num: i16) {
          if ready {
              return;
          }
@@ -1106,6 +1676,53 @@ index e1caff1..6098c9c 100644
              std::time::Duration::from_millis(100),
              std::future::pending::<()>(),
          )
+@@ -246,6 +281,14 @@ impl SpriteDatumHandlers {
+     /// cast_lib/cast_member are still needed by callers that build
+     /// `FlashObjectRef`s. Returns None when the sprite has no member.
+     fn resolve_sprite_flash_member(datum: &DatumRef) -> Result<Option<(i32, i32, i32)>, ScriptError> {
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: off the web no Ruffle instance stands behind a sprite (the
++        // web front end runs one per Flash sprite), so the Flash methods — gotoFrame, getVariable,
++        // callFunction, ... — do nothing there instead of calling into the browser (a panic).
++        #[cfg(not(target_arch = "wasm32"))]
++        if true {
++            let _ = datum;
++            return Ok(None);
++        }
+         reserve_player_ref(|player| {
+             let sprite_num = player.get_datum(datum).to_sprite_ref()?;
+             let sprite = match player.movie.score.get_sprite(sprite_num) {
+@@ -1023,7 +1066,12 @@ impl SpriteDatumHandlers {
+                         };
+                         return reserve_player_mut(|player| Ok(player.alloc_datum(datum)));
+                     }
++                    #[cfg(target_arch = "wasm32")]
+                     Err(e) => warn!("sprite.getVariable error: {:?}", e),
++                    // PS5_RUFFLE_DIRPLAYER_NATIVE: no Ruffle instance off the web (and a JsValue
++                    // cannot be printed there)
++                    #[cfg(not(target_arch = "wasm32"))]
++                    Err(_) => {}
+                 }
+                 Ok(DatumRef::Void)
+             }
+@@ -1232,6 +1280,8 @@ impl SpriteDatumHandlers {
+                         // The export is exposed under the dirplayer_ prefix
+                         // (see ruffle/web/src/lib.rs and the matching JS in
+                         // src/services/flashPlayerManager.ts).
++                        // PS5_RUFFLE_DIRPLAYER_NATIVE: no browser (nor Ruffle) to register it with.
++                        #[cfg(target_arch = "wasm32")]
+                         if let Some(window) = web_sys::window() {
+                             if let Ok(func) = js_sys::Reflect::get(&window, &"dirplayer_ruffleRegisterLingoCallback".into()) {
+                                 if func.is_function() {
+@@ -1530,6 +1580,9 @@ impl SpriteDatumHandlers {
+             // runs before sprite#1's SWF is dispatched), and without triggering
+             // the dispatch here the wait would block the frame before render ever
+             // dispatches it (deadlock). Whitelist so all later calls are sync.
++            // PS5_RUFFLE_DIRPLAYER_NATIVE: no Ruffle instance to wait for off the web (the
++            // Flash bridge; `call` finds no Flash member there).
++            #[cfg(target_arch = "wasm32")]
+             if let Ok(sn) =
+                 reserve_player_ref(|player| player.get_datum(&datum).to_sprite_ref())
+             {
 diff --git a/vm-rust/src/player/handlers/datum_handlers/xml.rs b/vm-rust/src/player/handlers/datum_handlers/xml.rs
 index 7e0d99c..9c8b302 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/xml.rs
@@ -1222,11 +1839,185 @@ index 7e0d99c..9c8b302 100644
                              &format!(
                                  "🔧 Document {}.childNodes returning root element {}",
                                  xml_id, root_id
+diff --git a/vm-rust/src/player/handlers/manager.rs b/vm-rust/src/player/handlers/manager.rs
+index 8bcc917..a5ed367 100644
+--- a/vm-rust/src/player/handlers/manager.rs
++++ b/vm-rust/src/player/handlers/manager.rs
+@@ -34,6 +34,10 @@ use crate::{
+ // collide with stock Ruffle if both are loaded on the same page (e.g. via a
+ // browser extension). Matching JS-side definitions live in
+ // src/services/flashPlayerManager.ts::initFlashBridge.
++//
++// PS5_RUFFLE_DIRPLAYER_NATIVE: off the web there is no Ruffle instance behind a Flash sprite; the
++// stubs after the block answer as the bridge does for a sprite without one (an error, nothing).
++#[cfg(target_arch = "wasm32")]
+ #[wasm_bindgen]
+ extern "C" {
+     #[wasm_bindgen(js_name = "dirplayer_ruffleGetVariable", catch)]
+@@ -86,6 +90,43 @@ extern "C" {
+     #[wasm_bindgen(js_name = "dirplayer_ruffleSetFlashProperty")]
+     fn ruffle_set_flash_property(sprite_num: i32, target: &str, prop_num: i32, value: &str);
+ }
++#[cfg(not(target_arch = "wasm32"))]
++mod no_flash_bridge {
++    use wasm_bindgen::JsValue;
++    pub fn ruffle_get_variable(_sprite_num: i32, _path: &str) -> Result<JsValue, JsValue> {
++        Err(JsValue::UNDEFINED)
++    }
++    pub fn ruffle_set_variable(_sprite_num: i32, _path: &str, _value: &str) -> Result<JsValue, JsValue> {
++        Err(JsValue::UNDEFINED)
++    }
++    pub fn ruffle_call_function(_sprite_num: i32, _path: &str, _args_xml: &str) -> Result<JsValue, JsValue> {
++        Err(JsValue::UNDEFINED)
++    }
++    pub fn ruffle_goto_frame(_sprite_num: i32, _frame_or_label: &str) {}
++    pub fn ruffle_stop(_sprite_num: i32) {}
++    pub fn ruffle_play(_sprite_num: i32) {}
++    pub fn ruffle_rewind(_sprite_num: i32) {}
++    pub fn ruffle_is_playing(_sprite_num: i32) -> bool {
++        false
++    }
++    pub fn ruffle_get_frame_count(_sprite_num: i32) -> i32 {
++        0
++    }
++    pub fn ruffle_get_current_frame(_sprite_num: i32) -> i32 {
++        0
++    }
++    pub fn ruffle_call_frame(_sprite_num: i32, _frame: i32) {}
++    pub fn ruffle_hit_test(_sprite_num: i32, _x: f64, _y: f64) -> i32 {
++        0
++    }
++    pub fn ruffle_get_flash_property(_sprite_num: i32, _target: &str, _prop_num: i32) -> Result<JsValue, JsValue> {
++        Err(JsValue::UNDEFINED)
++    }
++    pub fn ruffle_set_flash_property(_sprite_num: i32, _target: &str, _prop_num: i32, _value: &str) {}
++}
++#[cfg(not(target_arch = "wasm32"))]
++#[allow(unused_imports)]
++use no_flash_bridge::*;
+ 
+ pub struct BuiltInHandlerManager {}
+ 
+@@ -95,6 +136,13 @@ impl BuiltInHandlerManager {
+     /// key; cast_lib/cast_member are returned alongside for callers that
+     /// still need them (e.g. building FlashObjectRefs).
+     fn resolve_flash_member(datum_ref: &DatumRef) -> Result<Option<(i32, i32, i32)>, ScriptError> {
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: no Ruffle instances off the web (datum_handlers/sprite.rs,
++        // same rule): the Flash built-ins do nothing there.
++        #[cfg(not(target_arch = "wasm32"))]
++        if true {
++            let _ = datum_ref;
++            return Ok(None);
++        }
+         reserve_player_ref(|player| {
+             let datum = player.get_datum(datum_ref);
+             let sprite_num = match datum {
+@@ -125,6 +173,12 @@ impl BuiltInHandlerManager {
+     /// SWA no-op (which is correct for those operands in the web port).
+     fn resolve_flash_sprite_strict(datum_ref: &DatumRef) -> Result<Option<i32>, ScriptError> {
+         use crate::player::cast_member::CastMemberType;
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: no Ruffle instances off the web.
++        #[cfg(not(target_arch = "wasm32"))]
++        if true {
++            let _ = datum_ref;
++            return Ok(None);
++        }
+         reserve_player_ref(|player| {
+             let datum = player.get_datum(datum_ref);
+             let sprite_num = match datum {
+@@ -1513,7 +1567,12 @@ impl BuiltInHandlerManager {
+                                     }
+                                 }
+                             }
++                            #[cfg(target_arch = "wasm32")]
+                             Err(e) => warn!("getVariable error: {:?}", e),
++                            // PS5_RUFFLE_DIRPLAYER_NATIVE: no Ruffle instance off the web (and a
++                            // JsValue cannot be printed there)
++                            #[cfg(not(target_arch = "wasm32"))]
++                            Err(_) => {}
+                         }
+                         if return_as_object {
+                             return reserve_player_mut(|player| {
+@@ -2100,6 +2159,9 @@ impl BuiltInHandlerManager {
+ 
+                         // Build the measurement context once and reuse it for all
+                         // word-wrap probes below.
++                        // PS5_RUFFLE_DIRPLAYER_NATIVE: the browser's canvas on the web,
++                        // native_text's off it.
++                        #[cfg(target_arch = "wasm32")]
+                         let measure_ctx = {
+                             use wasm_bindgen::JsCast;
+                             let font_str = format!("{}px {}", display_font_size, display_font_name);
+@@ -2111,6 +2173,12 @@ impl BuiltInHandlerManager {
+                                 .and_then(|c| c.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
+                                 .map(|ctx| { ctx.set_font(&font_str); ctx })
+                         };
++                        #[cfg(not(target_arch = "wasm32"))]
++                        let measure_ctx = {
++                            let ctx = crate::player::native_text::TextCtx::new(1, 1);
++                            ctx.set_font(&format!("{}px {}", display_font_size, display_font_name));
++                            Some(ctx)
++                        };
+                         let measure = |s: &str| -> f64 {
+                             measure_ctx.as_ref()
+                                 .and_then(|ctx| ctx.measure_text(s).ok())
+@@ -3094,13 +3162,19 @@ fn count_wraps_before_index(
+     wrap_w: i16,
+     target_char_idx: usize,
+ ) -> usize {
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: the browser's canvas on the web, native_text's off it.
++    #[cfg(target_arch = "wasm32")]
++    let ctx_opt = {
+     use wasm_bindgen::JsCast;
+-    let ctx_opt = web_sys::window()
++    web_sys::window()
+         .and_then(|w| w.document())
+         .and_then(|d| d.create_element("canvas").ok())
+         .and_then(|el| el.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+         .and_then(|c| c.get_context("2d").ok().flatten())
+-        .and_then(|c| c.dyn_into::<web_sys::CanvasRenderingContext2d>().ok());
++        .and_then(|c| c.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
++    };
++    #[cfg(not(target_arch = "wasm32"))]
++    let ctx_opt = Some(crate::player::native_text::TextCtx::new(1, 1));
+     let Some(ctx) = ctx_opt else { return 0; };
+     ctx.set_font(&format!("{}px {}", font_size, font_name));
+     // Walk source lines; for each line, simulate word-wrap and count
+@@ -3129,7 +3203,7 @@ fn count_wraps_before_index(
+ /// Total visual-line breaks (excluding the implicit final line) when
+ /// `line` is word-wrapped at `wrap_w` pixels. Uses Canvas2D for width.
+ fn wraps_in_line(
+-    ctx: &web_sys::CanvasRenderingContext2d,
++    ctx: &crate::player::TextCtx,
+     line: &str,
+     wrap_w: i16,
+ ) -> usize {
+@@ -3144,7 +3218,7 @@ fn wraps_in_line(
+ /// preserved). Per-char measurement, by contrast, over-estimates
+ /// because kerning isn't applied between independent calls.
+ fn wraps_in_line_up_to(
+-    ctx: &web_sys::CanvasRenderingContext2d,
++    ctx: &crate::player::TextCtx,
+     line: &str,
+     wrap_w: i16,
+     target_char_offset: usize,
 diff --git a/vm-rust/src/player/handlers/movie.rs b/vm-rust/src/player/handlers/movie.rs
-index f5f820c..44c992b 100644
+index f5f820c..8d299bc 100644
 --- a/vm-rust/src/player/handlers/movie.rs
 +++ b/vm-rust/src/player/handlers/movie.rs
-@@ -234,7 +234,7 @@ impl MovieHandlers {
+@@ -167,6 +167,11 @@ impl MovieHandlers {
+             });
+             return Ok(DatumRef::Void);
+         }
++        // PS5_RUFFLE_DIRPLAYER_FILMLOOP_GO: inside `tell sprite(<film loop>)`, the film loop's
++        // playhead (DirPlayer::go_tell_film_loop)
++        if args.len() == 1 && reserve_player_mut(|player| player.go_tell_film_loop(&args[0]))? {
++            return Ok(DatumRef::Void);
++        }
+         // If a second argument is provided, it's a movie path: go frame X of movie "path"
+         let go_to_movie = if args.len() >= 2 {
+             Some(reserve_player_mut(|player| {
+@@ -234,7 +239,7 @@ impl MovieHandlers {
                          task_id, waited_ms, state
                      );
                  }
@@ -1235,7 +2026,7 @@ index f5f820c..44c992b 100644
                      std::time::Duration::from_millis(POLL_MS),
                      std::future::pending::<()>(),
                  )
-@@ -468,7 +468,7 @@ impl MovieHandlers {
+@@ -468,7 +473,7 @@ impl MovieHandlers {
                  // Initialize behavior default properties
                  for (behavior_ref, sprite_num) in &behaviors_to_init {
                      if let Err(err) = Score::initialize_behavior_defaults_async(behavior_ref.clone(), *sprite_num).await {
@@ -1244,7 +2035,7 @@ index f5f820c..44c992b 100644
                              &format!("Failed to initialize behavior defaults: {}", err.message).into()
                          );
                      }
-@@ -793,7 +793,7 @@ impl MovieHandlers {
+@@ -793,7 +798,7 @@ impl MovieHandlers {
                      }
                      Err(err) => {
                          if err.code != ScriptErrorCode::Abort {
@@ -1253,7 +2044,7 @@ index f5f820c..44c992b 100644
                                  &format!("⚠ sendSprite continuing after error in handler '{}': {}", message, err.message).into()
                              );
                          } else {
-@@ -860,7 +860,7 @@ impl MovieHandlers {
+@@ -860,7 +865,7 @@ impl MovieHandlers {
                          }
                      }
                      Err(err) => {
@@ -1262,7 +2053,99 @@ index f5f820c..44c992b 100644
                              &format!("⚠ sendAllSprites continuing after error in handler: {}", err.message).into()
                          );
                      }
-@@ -1400,7 +1400,7 @@ impl MovieHandlers {
+@@ -969,15 +974,17 @@ impl MovieHandlers {
+     pub fn get_pref(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+         reserve_player_mut(|player| {
+             let pref_name = player.get_datum(&args[0]).string_value()?;
+-            let storage = web_sys::window()
+-                .and_then(|w| w.local_storage().ok().flatten());
+-            if let Some(storage) = storage {
+-                let key = format!("dirplayer_pref_{}", pref_name);
+-                if let Ok(Some(value)) = storage.get_item(&key) {
+-                    return Ok(player.alloc_datum(Datum::String(value)));
+-                }
+-            }
+-            Ok(DatumRef::Void)
++            // PS5_RUFFLE_DIRPLAYER_NATIVE: off the web, from the host's prefs folder (native.rs).
++            #[cfg(not(target_arch = "wasm32"))]
++            let value = crate::player::native::read_pref(&pref_name);
++            #[cfg(target_arch = "wasm32")]
++            let value = web_sys::window()
++                .and_then(|w| w.local_storage().ok().flatten())
++                .and_then(|storage| storage.get_item(&format!("dirplayer_pref_{}", pref_name)).ok().flatten());
++            Ok(match value {
++                Some(value) => player.alloc_datum(Datum::String(value)),
++                None => DatumRef::Void,
++            })
+         })
+     }
+ 
+@@ -985,11 +992,17 @@ impl MovieHandlers {
+         reserve_player_mut(|player| {
+             let pref_name = player.get_datum(&args[0]).string_value()?;
+             let pref_value = player.get_datum(&args[1]).string_value()?;
+-            let storage = web_sys::window()
+-                .and_then(|w| w.local_storage().ok().flatten());
+-            if let Some(storage) = storage {
+-                let key = format!("dirplayer_pref_{}", pref_name);
+-                let _ = storage.set_item(&key, &pref_value);
++            // PS5_RUFFLE_DIRPLAYER_NATIVE: off the web, into the host's prefs folder (native.rs).
++            #[cfg(not(target_arch = "wasm32"))]
++            crate::player::native::write_pref(&pref_name, &pref_value);
++            #[cfg(target_arch = "wasm32")]
++            {
++                let storage = web_sys::window()
++                    .and_then(|w| w.local_storage().ok().flatten());
++                if let Some(storage) = storage {
++                    let key = format!("dirplayer_pref_{}", pref_name);
++                    let _ = storage.set_item(&key, &pref_value);
++                }
+             }
+             Ok(DatumRef::Void)
+         })
+@@ -1017,6 +1030,15 @@ impl MovieHandlers {
+             Ok::<(String, String), ScriptError>((url, target))
+         })?;
+ 
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: no browser to open a page in, nor JavaScript to run: the
++        // host is told (native::take_notices) and the movie carries on.
++        #[cfg(not(target_arch = "wasm32"))]
++        {
++            let what = if url.starts_with("javascript:") { "runs JavaScript" } else { "opens a web page" };
++            crate::player::native::notice(format!("gotoNetPage {url:?} ({target}): the movie {what}; there is no browser here"));
++        }
++        #[cfg(target_arch = "wasm32")]
++        {
+         if let Some(code) = url.strip_prefix("javascript:") {
+             // Defer via setTimeout(...,0) so the current WASM call stack
+             // fully unwinds before the host-page JS runs. Synchronous
+@@ -1036,6 +1058,7 @@ impl MovieHandlers {
+                 log::warn!("gotoNetPage: window.open failed: {:?}", e);
+             }
+         }
++        }
+         Ok(DatumRef::Void)
+     }
+ 
+@@ -1347,7 +1370,7 @@ impl MovieHandlers {
+             if !in_busy_wait {
+                 return false;
+             }
+-            let now = js_sys::Date::now();
++            let now = crate::player::host_date::now_ms();
+             let tempo = player.current_frame_tempo.max(1);
+             let interval = 1000.0 / tempo as f64;
+             if now - player.last_kb_loop_frame_ms >= interval {
+@@ -1391,7 +1414,7 @@ impl MovieHandlers {
+         const YIELD_INTERVAL_MS: f64 = 8.0;
+         let yield_now = should_yield
+             && reserve_player_mut(|player| {
+-                let now = js_sys::Date::now();
++                let now = crate::player::host_date::now_ms();
+                 if now - player.last_update_stage_yield_ms >= YIELD_INTERVAL_MS {
+                     player.last_update_stage_yield_ms = now;
+                     true
+@@ -1400,14 +1423,14 @@ impl MovieHandlers {
                  }
              });
          if yield_now {
@@ -1271,7 +2154,15 @@ index f5f820c..44c992b 100644
          }
  
          Ok(DatumRef::Void)
-@@ -1431,7 +1431,7 @@ impl MovieHandlers {
+     }
+ 
+     pub async fn nothing_async(_: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+-        let now = js_sys::Date::now();
++        let now = crate::player::host_date::now_ms();
+         let should_yield = reserve_player_mut(|player| {
+             // Only count calls inside frame scripts (busy-wait like waitABit).
+             // Reset counter when not in a frame script to prevent accumulation
+@@ -1431,7 +1454,7 @@ impl MovieHandlers {
  
              crate::rendering::draw_frame_immediate();
  
@@ -1281,7 +2172,7 @@ index f5f820c..44c992b 100644
  
          Ok(DatumRef::Void)
 diff --git a/vm-rust/src/player/handlers/types.rs b/vm-rust/src/player/handlers/types.rs
-index ad5a8a0..98a5357 100644
+index ad5a8a0..47f9c0f 100644
 --- a/vm-rust/src/player/handlers/types.rs
 +++ b/vm-rust/src/player/handlers/types.rs
 @@ -302,7 +302,7 @@ impl TypeUtils {
@@ -1293,11 +2184,411 @@ index ad5a8a0..98a5357 100644
                      &format!(
                          "  ❌ Cannot get sub-prop '{}' from type {}",
                          formatted_key,
+@@ -758,9 +758,7 @@ impl TypeHandlers {
+                         .ok_or_else(|| ScriptError::new(format!(
+                             "Date object {} not found", date_id
+                         )))?;
+-                    let js_date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
+-                        date_obj.timestamp_ms as f64,
+-                    ));
++                    let js_date = crate::player::host_date::LocalDate::from_ms(date_obj.timestamp_ms as f64);
+                     let yyyymmdd = js_date.get_full_year() as i32 * 10000
+                         + (js_date.get_month() as i32 + 1) * 100  // js months are 0-based
+                         + js_date.get_date() as i32;
+@@ -1509,13 +1507,9 @@ impl TypeHandlers {
+             // minute explicitly and let the host locale decide the separator and
+             // 12/24-hour convention, matching the dictionary's note that "the
+             // format of the time string depends on the computer's time settings".
+-            let opts = js_sys::Object::new();
+-            let _ = js_sys::Reflect::set(&opts, &"hour".into(), &"2-digit".into());
+-            let _ = js_sys::Reflect::set(&opts, &"minute".into(), &"2-digit".into());
+-            let mut s = js_sys::Date::new_0()
+-                .to_locale_time_string_with_options("default", &opts)
+-                .as_string()
+-                .unwrap_or_default();
++            // PS5_RUFFLE_DIRPLAYER_NATIVE: through host_date (js_sys on the web, an en-US layout
++            // elsewhere).
++            let mut s = crate::player::host_date::LocalDate::now().locale_short_time();
+             // Director keeps Windows' short-time layout `HH:mm tt`, so a
+             // 24-hour locale leaves the AM/PM slot EMPTY but still emits its
+             // separator — measured in Director: `put _system.time()` -> "21:29 "
+@@ -1543,7 +1537,7 @@ impl TypeHandlers {
+                 let year = player.get_datum(&args[0]).int_value()?;
+                 let month = player.get_datum(&args[1]).int_value()?;
+                 let day = player.get_datum(&args[2]).int_value()?;
+-                let js_date = js_sys::Date::new_0();
++                let mut js_date = crate::player::host_date::LocalDate::now();
+                 js_date.set_full_year(year as u32);
+                 js_date.set_month((month - 1) as u32);
+                 js_date.set_date(day as u32);
+@@ -2288,7 +2282,7 @@ impl TypeHandlers {
+                     let year = player.get_datum(&args[1]).int_value()?;
+                     let month = player.get_datum(&args[2]).int_value()?;
+                     let day = player.get_datum(&args[3]).int_value()?;
+-                    let js_date = js_sys::Date::new_0();
++                    let mut js_date = crate::player::host_date::LocalDate::now();
+                     js_date.set_full_year(year as u32);
+                     js_date.set_month((month - 1) as u32); // JS months are 0-based
+                     js_date.set_date(day as u32);
+diff --git a/vm-rust/src/player/host_date.rs b/vm-rust/src/player/host_date.rs
+new file mode 100644
+index 0000000..8700061
+--- /dev/null
++++ b/vm-rust/src/player/host_date.rs
+@@ -0,0 +1,348 @@
++//! PS5_RUFFLE_DIRPLAYER_NATIVE: the clock and calendar DirPlayer took from the browser —
++//! `Date.now()`, `new Date(ms)` read and set in local time, `toLocaleDateString` /
++//! `toLocaleTimeString` — behind one type.
++//!
++//! On the web it is js_sys, called exactly as before. Elsewhere a browser call panics ("cannot
++//! call wasm-bindgen imported functions on non-wasm targets"): there the same arithmetic as
++//! JavaScript's Date (ECMA-262 §21.4.1: time values, Day/TimeWithinDay, MakeTime, MakeDay,
++//! MakeDate, TimeClip, LocalTime and UTC), over chrono's local time zone (the one `the date` and
++//! `the time` already use); the strings are what an en-US browser gives for the same options.
++
++/// Milliseconds since 1970-01-01T00:00:00Z, as `Date.now()`.
++#[cfg(target_arch = "wasm32")]
++pub fn now_ms() -> f64 {
++    js_sys::Date::now()
++}
++
++#[cfg(not(target_arch = "wasm32"))]
++pub fn now_ms() -> f64 {
++    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
++        Ok(d) => d.as_millis() as f64,
++        Err(e) => -(e.duration().as_millis() as f64),
++    }
++}
++
++/// A date as JavaScript holds one: a time value (ms since the epoch, UTC; NaN when invalid), read
++/// and changed in local time. The methods are js_sys::Date's, with its argument and result types.
++#[cfg(target_arch = "wasm32")]
++pub struct LocalDate(js_sys::Date);
++
++#[cfg(target_arch = "wasm32")]
++impl LocalDate {
++    pub fn now() -> Self {
++        LocalDate(js_sys::Date::new_0())
++    }
++    pub fn from_ms(ms: f64) -> Self {
++        LocalDate(js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms)))
++    }
++    pub fn get_time(&self) -> f64 {
++        self.0.get_time()
++    }
++    pub fn get_full_year(&self) -> u32 {
++        self.0.get_full_year()
++    }
++    pub fn get_month(&self) -> u32 {
++        self.0.get_month()
++    }
++    pub fn get_date(&self) -> u32 {
++        self.0.get_date()
++    }
++    pub fn get_day(&self) -> u32 {
++        self.0.get_day()
++    }
++    pub fn get_hours(&self) -> u32 {
++        self.0.get_hours()
++    }
++    pub fn get_minutes(&self) -> u32 {
++        self.0.get_minutes()
++    }
++    pub fn get_seconds(&self) -> u32 {
++        self.0.get_seconds()
++    }
++    pub fn get_milliseconds(&self) -> u32 {
++        self.0.get_milliseconds()
++    }
++    pub fn set_full_year(&mut self, v: u32) -> f64 {
++        self.0.set_full_year(v)
++    }
++    pub fn set_month(&mut self, v: u32) -> f64 {
++        self.0.set_month(v)
++    }
++    pub fn set_date(&mut self, v: u32) -> f64 {
++        self.0.set_date(v)
++    }
++    pub fn set_hours(&mut self, v: u32) -> f64 {
++        self.0.set_hours(v)
++    }
++    pub fn set_minutes(&mut self, v: u32) -> f64 {
++        self.0.set_minutes(v)
++    }
++    pub fn set_seconds(&mut self, v: u32) -> f64 {
++        self.0.set_seconds(v)
++    }
++    pub fn set_milliseconds(&mut self, v: u32) -> f64 {
++        self.0.set_milliseconds(v)
++    }
++    /// `toLocaleDateString("default", {day: "2-digit", month: "2-digit", year: "numeric"})`.
++    pub fn locale_date(&self) -> String {
++        let o = js_sys::Object::new();
++        let _ = js_sys::Reflect::set(&o, &"day".into(), &"2-digit".into());
++        let _ = js_sys::Reflect::set(&o, &"month".into(), &"2-digit".into());
++        let _ = js_sys::Reflect::set(&o, &"year".into(), &"numeric".into());
++        self.0.to_locale_date_string("default", &o).as_string().unwrap_or_default()
++    }
++    /// `toLocaleTimeString("default", {hour: "2-digit", minute: "2-digit"})`.
++    pub fn locale_short_time(&self) -> String {
++        let o = js_sys::Object::new();
++        let _ = js_sys::Reflect::set(&o, &"hour".into(), &"2-digit".into());
++        let _ = js_sys::Reflect::set(&o, &"minute".into(), &"2-digit".into());
++        self.0.to_locale_time_string_with_options("default", &o).as_string().unwrap_or_default()
++    }
++}
++
++#[cfg(not(target_arch = "wasm32"))]
++pub struct LocalDate {
++    t: f64,
++}
++
++#[cfg(not(target_arch = "wasm32"))]
++mod calc {
++    //! ECMA-262 §21.4.1, on time values held as f64 (NaN: an invalid date).
++    pub const MS_PER_DAY: f64 = 86_400_000.0;
++
++    pub fn day(t: f64) -> f64 {
++        (t / MS_PER_DAY).floor()
++    }
++    pub fn time_within_day(t: f64) -> f64 {
++        t.rem_euclid(MS_PER_DAY)
++    }
++    /// Days since 1970-01-01 of a proleptic Gregorian date (H. Hinnant's days_from_civil).
++    pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
++        let y = if m <= 2 { y - 1 } else { y };
++        let era = y.div_euclid(400);
++        let yoe = y - era * 400;
++        let mp = (m + 9) % 12;
++        let doy = (153 * mp + 2) / 5 + d - 1;
++        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++        era * 146_097 + doe - 719_468
++    }
++    /// (year, month 1-12, day 1-31) of days since 1970-01-01 (civil_from_days).
++    pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
++        let z = z + 719_468;
++        let era = z.div_euclid(146_097);
++        let doe = z - era * 146_097;
++        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
++        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++        let mp = (5 * doy + 2) / 153;
++        let d = doy - (153 * mp + 2) / 5 + 1;
++        let m = if mp < 10 { mp + 3 } else { mp - 9 };
++        (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
++    }
++    /// (year, month 0-11, date 1-31, weekday 0-6 from Sunday) of a time value.
++    pub fn ymdw(t: f64) -> (f64, f64, f64, f64) {
++        let d = day(t);
++        let (y, m, dd) = civil_from_days(d as i64);
++        (y as f64, (m - 1) as f64, dd as f64, (d + 4.0).rem_euclid(7.0))
++    }
++    /// (hours, minutes, seconds, ms) of a time value.
++    pub fn hmsm(t: f64) -> (f64, f64, f64, f64) {
++        let w = time_within_day(t);
++        ((w / 3_600_000.0).floor(), (w / 60_000.0).floor() % 60.0, (w / 1000.0).floor() % 60.0, w % 1000.0)
++    }
++    pub fn make_time(h: f64, m: f64, s: f64, ms: f64) -> f64 {
++        if !(h.is_finite() && m.is_finite() && s.is_finite() && ms.is_finite()) {
++            return f64::NAN;
++        }
++        h.trunc() * 3_600_000.0 + m.trunc() * 60_000.0 + s.trunc() * 1000.0 + ms.trunc()
++    }
++    pub fn make_day(year: f64, month: f64, date: f64) -> f64 {
++        if !(year.is_finite() && month.is_finite() && date.is_finite()) {
++            return f64::NAN;
++        }
++        let (y, m, dt) = (year.trunc(), month.trunc(), date.trunc());
++        let ym = y + (m / 12.0).floor();
++        if ym.abs() > 400_000.0 {
++            return f64::NAN; // far outside the time value range: TimeClip makes it NaN anyway
++        }
++        let mn = m.rem_euclid(12.0);
++        days_from_civil(ym as i64, mn as i64 + 1, 1) as f64 + dt - 1.0
++    }
++    pub fn make_date(day: f64, time: f64) -> f64 {
++        if !(day.is_finite() && time.is_finite()) {
++            return f64::NAN;
++        }
++        let tv = day * MS_PER_DAY + time;
++        if tv.is_finite() { tv } else { f64::NAN }
++    }
++    pub fn time_clip(t: f64) -> f64 {
++        if !t.is_finite() || t.abs() > 8.64e15 {
++            return f64::NAN;
++        }
++        t.trunc() + 0.0
++    }
++}
++
++#[cfg(not(target_arch = "wasm32"))]
++impl LocalDate {
++    /// Local time minus UTC at the instant `t` (a UTC time value), in ms.
++    fn offset_at_utc(t: f64) -> f64 {
++        use chrono::{Offset, TimeZone};
++        let Some(utc) = chrono::DateTime::from_timestamp_millis(t as i64) else {
++            return 0.0;
++        };
++        chrono::Local.offset_from_utc_datetime(&utc.naive_utc()).fix().local_minus_utc() as f64 * 1000.0
++    }
++    /// ECMA-262 LocalTime(t).
++    fn local(t: f64) -> f64 {
++        t + Self::offset_at_utc(t)
++    }
++    /// ECMA-262 UTC(t) of a local time value: a repeated local time (clocks going back) is the
++    /// earlier instant, a skipped one (clocks going forward) uses the offset before the change.
++    fn utc(t: f64) -> f64 {
++        use chrono::{LocalResult, Offset, TimeZone};
++        if !t.is_finite() {
++            return f64::NAN;
++        }
++        let Some(naive) = chrono::DateTime::from_timestamp_millis(t as i64).map(|d| d.naive_utc()) else {
++            return f64::NAN;
++        };
++        let off = match chrono::Local.offset_from_local_datetime(&naive) {
++            LocalResult::Single(o) => o.fix().local_minus_utc(),
++            LocalResult::Ambiguous(a, b) => a.fix().local_minus_utc().max(b.fix().local_minus_utc()),
++            LocalResult::None => Self::offset_at_utc(t - calc::MS_PER_DAY) as i32 / 1000,
++        };
++        t - off as f64 * 1000.0
++    }
++
++    pub fn now() -> Self {
++        LocalDate { t: now_ms() }
++    }
++    pub fn from_ms(ms: f64) -> Self {
++        LocalDate { t: calc::time_clip(ms) }
++    }
++    pub fn get_time(&self) -> f64 {
++        self.t
++    }
++    fn parts(&self) -> Option<((f64, f64, f64, f64), (f64, f64, f64, f64))> {
++        if self.t.is_nan() {
++            return None;
++        }
++        let l = Self::local(self.t);
++        Some((calc::ymdw(l), calc::hmsm(l)))
++    }
++    // As js_sys hands JavaScript's numbers to Rust: NaN becomes 0.
++    pub fn get_full_year(&self) -> u32 {
++        self.parts().map_or(0, |p| p.0 .0 as u32)
++    }
++    pub fn get_month(&self) -> u32 {
++        self.parts().map_or(0, |p| p.0 .1 as u32)
++    }
++    pub fn get_date(&self) -> u32 {
++        self.parts().map_or(0, |p| p.0 .2 as u32)
++    }
++    pub fn get_day(&self) -> u32 {
++        self.parts().map_or(0, |p| p.0 .3 as u32)
++    }
++    pub fn get_hours(&self) -> u32 {
++        self.parts().map_or(0, |p| p.1 .0 as u32)
++    }
++    pub fn get_minutes(&self) -> u32 {
++        self.parts().map_or(0, |p| p.1 .1 as u32)
++    }
++    pub fn get_seconds(&self) -> u32 {
++        self.parts().map_or(0, |p| p.1 .2 as u32)
++    }
++    pub fn get_milliseconds(&self) -> u32 {
++        self.parts().map_or(0, |p| p.1 .3 as u32)
++    }
++    /// A setter: the new local date and time from the old ones, back to a time value.
++    fn set(&mut self, f: impl FnOnce((f64, f64, f64), (f64, f64, f64, f64)) -> (f64, f64)) -> f64 {
++        if self.t.is_nan() {
++            return f64::NAN;
++        }
++        let l = Self::local(self.t);
++        let (y, mo, d, _) = calc::ymdw(l);
++        let (day, time) = f((y, mo, d), calc::hmsm(l));
++        self.t = calc::time_clip(Self::utc(calc::make_date(day, time)));
++        self.t
++    }
++    pub fn set_full_year(&mut self, v: u32) -> f64 {
++        // setFullYear on an invalid date starts from +0 (1970-01-01 00:00 local)
++        if self.t.is_nan() {
++            self.t = Self::utc(0.0);
++        }
++        self.set(|(_, mo, d), (h, mi, s, ms)| (calc::make_day(v as f64, mo, d), calc::make_time(h, mi, s, ms)))
++    }
++    pub fn set_month(&mut self, v: u32) -> f64 {
++        self.set(|(y, _, d), (h, mi, s, ms)| (calc::make_day(y, v as f64, d), calc::make_time(h, mi, s, ms)))
++    }
++    pub fn set_date(&mut self, v: u32) -> f64 {
++        self.set(|(y, mo, _), (h, mi, s, ms)| (calc::make_day(y, mo, v as f64), calc::make_time(h, mi, s, ms)))
++    }
++    pub fn set_hours(&mut self, v: u32) -> f64 {
++        self.set(|(y, mo, d), (_, mi, s, ms)| (calc::make_day(y, mo, d), calc::make_time(v as f64, mi, s, ms)))
++    }
++    pub fn set_minutes(&mut self, v: u32) -> f64 {
++        self.set(|(y, mo, d), (h, _, s, ms)| (calc::make_day(y, mo, d), calc::make_time(h, v as f64, s, ms)))
++    }
++    pub fn set_seconds(&mut self, v: u32) -> f64 {
++        self.set(|(y, mo, d), (h, mi, _, ms)| (calc::make_day(y, mo, d), calc::make_time(h, mi, v as f64, ms)))
++    }
++    pub fn set_milliseconds(&mut self, v: u32) -> f64 {
++        self.set(|(y, mo, d), (h, mi, s, _)| (calc::make_day(y, mo, d), calc::make_time(h, mi, s, v as f64)))
++    }
++    /// What an en-US browser gives for `toLocaleDateString(.., {day: "2-digit", month:
++    /// "2-digit", year: "numeric"})`: MM/DD/YYYY ("Invalid Date" for an invalid one).
++    pub fn locale_date(&self) -> String {
++        match self.parts() {
++            Some(((y, mo, d, _), _)) => format!("{:02}/{:02}/{}", mo as i64 + 1, d as i64, y as i64),
++            None => "Invalid Date".into(),
++        }
++    }
++    /// What an en-US browser gives for `toLocaleTimeString(.., {hour: "2-digit", minute:
++    /// "2-digit"})`: hh:mm AM/PM, 12-hour.
++    pub fn locale_short_time(&self) -> String {
++        match self.parts() {
++            Some((_, (h, mi, _, _))) => {
++                let h = h as i64;
++                let h12 = if h % 12 == 0 { 12 } else { h % 12 };
++                format!("{h12:02}:{:02} {}", mi as i64, if h < 12 { "AM" } else { "PM" })
++            }
++            None => "Invalid Date".into(),
++        }
++    }
++}
++
++#[cfg(all(test, not(target_arch = "wasm32")))]
++mod tests {
++    use super::calc::*;
++
++    #[test]
++    fn civil_days_round_trip() {
++        assert_eq!(days_from_civil(1970, 1, 1), 0);
++        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
++        assert_eq!(civil_from_days(-1), (1969, 12, 31));
++        for z in [-719_468i64, -1, 0, 59, 10_957, 20_750, 2_932_896] {
++            let (y, m, d) = civil_from_days(z);
++            assert_eq!(days_from_civil(y, m, d), z);
++        }
++    }
++
++    #[test]
++    fn javascript_rules() {
++        // Date.UTC(2026, 9, 25, 5, 29, 7, 123) = 1792906147123
++        let t = make_date(make_day(2026.0, 9.0, 25.0), make_time(5.0, 29.0, 7.0, 123.0));
++        assert_eq!(t, 1_792_906_147_123.0);
++        assert_eq!(ymdw(t), (2026.0, 9.0, 25.0, 0.0)); // a Sunday
++        assert_eq!(hmsm(t), (5.0, 29.0, 7.0, 123.0));
++        // months and days past their range carry over, as setMonth(12) / setDate(0) do
++        assert_eq!(make_day(2026.0, 12.0, 1.0), make_day(2027.0, 0.0, 1.0));
++        assert_eq!(make_day(2026.0, 2.0, 0.0), make_day(2026.0, 1.0, 28.0));
++        assert_eq!(make_day(2024.0, -1.0, 31.0), make_day(2023.0, 11.0, 31.0));
++        // before 1970
++        assert_eq!(ymdw(-1.0), (1969.0, 11.0, 31.0, 3.0));
++        assert_eq!(hmsm(-1.0), (23.0, 59.0, 59.0, 999.0));
++        assert!(time_clip(8.64e15 + 1.0).is_nan());
++        assert_eq!(time_clip(-8.64e15), -8.64e15);
++    }
++}
 diff --git a/vm-rust/src/player/mod.rs b/vm-rust/src/player/mod.rs
-index 8fef74e..9e1f43f 100644
+index 8fef74e..835e8cb 100644
 --- a/vm-rust/src/player/mod.rs
 +++ b/vm-rust/src/player/mod.rs
-@@ -54,6 +54,22 @@ pub mod console;
+@@ -54,6 +54,33 @@ pub mod console;
  pub mod testing_shared;
  #[cfg(not(target_arch = "wasm32"))]
  pub mod testing;
@@ -1317,10 +2608,21 @@ index 8fef74e..9e1f43f 100644
 +}
 +#[cfg(not(target_arch = "wasm32"))]
 +pub mod native_audio;
++/// PS5_RUFFLE_DIRPLAYER_NATIVE: the browser's clock and calendar, with a form off the web.
++pub mod host_date;
++/// PS5_RUFFLE_DIRPLAYER_NATIVE: text in a system font measured and drawn without a browser.
++#[cfg(not(target_arch = "wasm32"))]
++pub mod native_text;
++/// What measures and draws text in a system font: the browser's Canvas2D context on the web,
++/// native_text's stand-in for it elsewhere.
++#[cfg(target_arch = "wasm32")]
++pub type TextCtx = web_sys::CanvasRenderingContext2d;
++#[cfg(not(target_arch = "wasm32"))]
++pub type TextCtx = native_text::TextCtx;
  #[cfg(target_arch = "wasm32")]
  pub mod testing_browser;
  pub mod symbols;
-@@ -73,10 +89,10 @@ use allocator::{
+@@ -73,10 +100,10 @@ use allocator::{
  use async_recursion::async_recursion;
  use async_std::{
      channel::{self, Sender},
@@ -1333,7 +2635,95 @@ index 8fef74e..9e1f43f 100644
  use cast_manager::CastPreloadReason;
  use cast_member::CastMemberType;
  use datum_ref::DatumRef;
-@@ -2847,7 +2863,7 @@ impl DirPlayer {
+@@ -168,6 +195,13 @@ fn trace_output(player: &DirPlayer, message: &str) {
+ }
+ 
+ pub fn dispatch_file_write_event(file_path: &str, content: &str) {
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: the event is for a desktop (Electron) page to write the trace
++    // log file; off the web the log stays in FileIO's virtual file system, as on a plain page.
++    #[cfg(not(target_arch = "wasm32"))]
++    if true {
++        let _ = (file_path, content);
++        return;
++    }
+     let window = web_sys::window();
+     if let Some(window) = window {
+         let event_init = web_sys::CustomEventInit::new();
+@@ -898,6 +932,11 @@ impl DirPlayer {
+     /// before Lingo scripts try to access them. Per-sprite: each sprite that
+     /// references a Flash member gets its own dedicated Ruffle instance.
+     pub fn pre_dispatch_flash_members(&mut self) {
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: no Ruffle instances off the web (see the Flash bridge).
++        #[cfg(not(target_arch = "wasm32"))]
++        if true {
++            return;
++        }
+         // When running a nested `#movie` sub-player, dispatch its Flash sprites
+         // to Ruffle under a synthetic per-player key so they don't collide with
+         // the host's channel keys and their captured frames route back into THIS
+@@ -2842,12 +2881,69 @@ impl DirPlayer {
+             .and_then(|t| t.film_loop.clone())
+     }
+ 
++    /// PS5_RUFFLE_DIRPLAYER_FILMLOOP_GO: `go <frame>` inside `tell sprite(<film loop>)` moves
++    /// the film loop's own playhead, as `the frame` there reads it (get_movie_prop), not the
++    /// movie's: the film loop shows that frame (a number, or one of its own labels; `next`,
++    /// `previous` and `loop` are its markers) at its next advance. False outside such a tell,
++    /// where `go` is the movie's.
++    ///
++    /// Teen Titans: Battle Blitz restarts its START button's animation (a film loop) with
++    /// `tell sprite(me.spriteNum) go 1 end tell` on mouseEnter. Run against the movie, that sent
++    /// the movie back to frame 1 whenever the mouse touched the button, and its title screen never
++    /// got past its loading frames.
++    pub(crate) fn go_tell_film_loop(&mut self, target: &DatumRef) -> Result<bool, ScriptError> {
++        let Some(member_ref) = self.tell_film_loop() else {
++            return Ok(false);
++        };
++        let datum = self.get_datum(target).clone();
++        let Some(member) = self.movie.cast_manager.find_mut_member_by_ref(&member_ref) else {
++            return Ok(false);
++        };
++        let CastMemberType::FilmLoop(film_loop) = &mut member.member_type else {
++            return Ok(false);
++        };
++        let current = film_loop.current_frame;
++        let mut markers: Vec<u32> = film_loop.score.frame_labels.iter().map(|l| l.frame_num as u32).collect();
++        markers.sort_unstable();
++        markers.dedup();
++        let frame = match &datum {
++            Datum::Int(n) => (*n).max(1) as u32,
++            Datum::String(_) | Datum::Symbol(_) => {
++                let s = datum.string_value()?;
++                let key = s.to_ascii_lowercase();
++                let offset = match key.as_str() {
++                    "next" => Some(1),
++                    "previous" => Some(-1),
++                    "loop" => Some(0),
++                    _ => None,
++                };
++                match offset {
++                    Some(offset) => {
++                        let pos = markers.partition_point(|&f| f <= current) as i32;
++                        let at = pos - 1 + offset;
++                        (at >= 0).then(|| markers.get(at as usize).copied()).flatten().unwrap_or(current)
++                    }
++                    None => film_loop
++                        .score
++                        .frame_labels
++                        .iter()
++                        .find(|l| l.label.eq_ignore_ascii_case(&s))
++                        .map(|l| l.frame_num as u32)
++                        .unwrap_or(current),
++                }
++            }
++            _ => return Err(ScriptError::new("Unsupported or invalid frame label passed to go()".to_string())),
++        };
++        film_loop.go_frame = Some(frame);
++        Ok(true)
++    }
++
+     pub(crate) fn get_movie_prop(&mut self, prop: Symbol) -> Result<DatumRef, ScriptError> {
+         let builtin_prop = prop.into_builtin_or_error()?;
          match builtin_prop {
              BuiltInSymbol::DatumStats => {
                  let stats = self.allocator.datum_type_stats();
@@ -1342,7 +2732,7 @@ index 8fef74e..9e1f43f 100644
                  Ok(self.alloc_datum(Datum::String(stats)))
              },
              BuiltInSymbol::DatumSnapshot => {
-@@ -2857,7 +2873,7 @@ impl DirPlayer {
+@@ -2857,7 +2953,7 @@ impl DirPlayer {
              },
              BuiltInSymbol::DatumLeakScan => {
                  let stats = self.datum_leak_scan();
@@ -1351,7 +2741,7 @@ index 8fef74e..9e1f43f 100644
                  Ok(self.alloc_datum(Datum::String(stats)))
              },
              BuiltInSymbol::SystemDate => {
-@@ -3783,7 +3799,7 @@ impl DirPlayer {
+@@ -3783,7 +3879,7 @@ impl DirPlayer {
              stack_trace.push_str(&self.format_scope_stack(5, 25));
              stack_trace.push_str("\nThis usually indicates a bug in the Director movie's scripts (e.g., a handler calling itself infinitely).\n");
              stack_trace.push_str("Note: If this is happening during frame events, it may be a re-entrant call issue.\n");
@@ -1360,7 +2750,31 @@ index 8fef74e..9e1f43f 100644
              panic!("Stack overflow - infinite recursion in Lingo scripts");
          }
          let scope_ref = self.scope_count;
-@@ -4481,7 +4497,7 @@ where
+@@ -3934,7 +4030,9 @@ impl DirPlayer {
+                             } else {
+                                 next
+                             };
+-                            
++                            // PS5_RUFFLE_DIRPLAYER_FILMLOOP_GO: a `go` in a tell to it
++                            let new_frame = film_loop.go_frame.map(|f| f.clamp(1, frame_count)).unwrap_or(new_frame);
++
+                             Some((member_ref, current, new_frame))
+                         } else {
+                             None
+@@ -3945,6 +4043,12 @@ impl DirPlayer {
+         
+         // Process each filmloop
+         for (member_ref, old_frame, new_frame) in active_filmloops {
++            // PS5_RUFFLE_DIRPLAYER_FILMLOOP_GO: a `go` in a tell to it is taken now
++            if let Some(member) = self.movie.cast_manager.find_mut_member_by_ref(&member_ref) {
++                if let CastMemberType::FilmLoop(film_loop) = &mut member.member_type {
++                    film_loop.go_frame = None;
++                }
++            }
+             // Skip if frame didn't change
+             if old_frame == new_frame {
+                 continue;
+@@ -4481,7 +4585,7 @@ where
  {
      // `use ... as raw` (no trailing `(`) so the bulk `crate::player::spawn_player_local(`
      // → `spawn_player_local(` rewrite doesn't turn this into infinite recursion.
@@ -1369,7 +2783,7 @@ index 8fef74e..9e1f43f 100644
      let id = unsafe { ACTIVE_PLAYER_ID };
      raw(WithActivePlayer { id, inner: fut });
  }
-@@ -4813,7 +4829,10 @@ pub async fn player_call_script_handler_raw_args(
+@@ -4813,7 +4917,10 @@ pub async fn player_call_script_handler_raw_args(
      // On each BACKWARD jump (a loop iteration) we check elapsed time and, past a
      // frame's worth, yield a real macrotask so queued input events fire, then
      // resume. Time-budgeted so ordinary fast compute loops are unaffected.
@@ -1381,7 +2795,7 @@ index 8fef74e..9e1f43f 100644
      // Count backward jumps to distinguish a TIGHT busy-wait (thousands of
      // iterations/ms — `repeat while keyPressed`) from a heavy COMPUTE loop (a
      // few iterations, each doing real work — the game's `drawmap`/water
-@@ -4882,7 +4901,9 @@ pub async fn player_call_script_handler_raw_args(
+@@ -4882,7 +4989,9 @@ pub async fn player_call_script_handler_raw_args(
                          if backjumps >= 4096 {
                              backjumps = 0;
                              let now = chrono::Utc::now().timestamp_millis();
@@ -1392,7 +2806,7 @@ index 8fef74e..9e1f43f 100644
                                  last_yield_ms = now;
                                  let _ = timeout(
                                      Duration::from_millis(1),
-@@ -5188,7 +5209,9 @@ pub async fn player_call_script_handler_raw_args(
+@@ -5188,7 +5297,9 @@ pub async fn player_call_script_handler_raw_args(
                      if backjumps >= 4096 {
                          backjumps = 0;
                          let now = chrono::Utc::now().timestamp_millis();
@@ -1403,7 +2817,7 @@ index 8fef74e..9e1f43f 100644
                              last_yield_ms = now;
                              let _ = timeout(
                                  Duration::from_millis(1),
-@@ -5445,7 +5468,7 @@ async fn run_movie_init_sequence() {
+@@ -5445,7 +5556,7 @@ async fn run_movie_init_sequence() {
      dispatch_system_event_to_timeouts(BuiltInSymbol::PrepareMovie, &vec![]).await;
  
      if let Err(err) = player_invoke_global_event(Symbol::builtin(BuiltInSymbol::PrepareMovie), &vec![]).await {
@@ -1412,12 +2826,71 @@ index 8fef74e..9e1f43f 100644
          if err.code != ScriptErrorCode::Abort {
              reserve_player_mut(|player| player.on_script_error(&err));
          }
+@@ -5948,6 +6059,7 @@ async fn restart_current_movie() {
+ 
+ // JS bridge name uses the `dirplayer_` prefix so this fork's globals don't
+ // collide with stock Ruffle / other libraries on the same page.
++#[cfg(target_arch = "wasm32")]
+ #[wasm_bindgen]
+ extern "C" {
+     #[wasm_bindgen(js_name = "dirplayer_isFlashLoading", catch)]
+@@ -5976,6 +6088,31 @@ extern "C" {
+     #[wasm_bindgen(js_name = "dirplayer_ruffleStop")]
+     fn ruffle_stop(sprite_num: i32);
+ }
++// PS5_RUFFLE_DIRPLAYER_NATIVE: off the web there is no Ruffle instance behind a Flash cast member
++// (the web front end runs one per Flash sprite): the bridge answers "not loading, not playing,
++// nothing there", and calling into the browser — which panics natively — never happens.
++#[cfg(not(target_arch = "wasm32"))]
++pub(crate) fn is_flash_loading() -> Result<bool, wasm_bindgen::JsValue> {
++    Ok(false)
++}
++#[cfg(not(target_arch = "wasm32"))]
++fn ruffle_set_size(_sprite_num: i32, _w: i32, _h: i32) -> Result<(), wasm_bindgen::JsValue> {
++    Ok(())
++}
++#[cfg(not(target_arch = "wasm32"))]
++fn ruffle_is_playing(_sprite_num: i32) -> Result<bool, wasm_bindgen::JsValue> {
++    Ok(false)
++}
++#[cfg(not(target_arch = "wasm32"))]
++fn ruffle_get_current_frame(_sprite_num: i32) -> Result<i32, wasm_bindgen::JsValue> {
++    Ok(0)
++}
++#[cfg(not(target_arch = "wasm32"))]
++fn ruffle_goto_frame_and_stop(_sprite_num: i32, _frame_or_label: &str) -> Result<(), wasm_bindgen::JsValue> {
++    Ok(())
++}
++#[cfg(not(target_arch = "wasm32"))]
++fn ruffle_stop(_sprite_num: i32) {}
+ /// Execute one complete frame cycle: run frame scripts, then advance to the next frame.
+ /// Returns (is_playing, is_script_paused) so callers can check if the movie is still running.
+ ///
+@@ -7111,6 +7248,9 @@ pub async fn run_frame_loop() {
+             // 1-3 s) to set `preloaderTranslationSuccess`; without this the tight
+             // loop starves that fetch's completion callback and the login links
+             // (asfunction hyperlinks in the translated IDS strings) never load.
++            // PS5_RUFFLE_DIRPLAYER_NATIVE: counts the web page publishes; none off the web (where
++            // this loop runs a linked movie's sub-player).
++            #[cfg(target_arch = "wasm32")]
+             let read_window_count = |key: &str| -> f64 {
+                 web_sys::window()
+                     .and_then(|w| {
+@@ -7119,6 +7259,8 @@ pub async fn run_frame_loop() {
+                     .and_then(|v| v.as_f64())
+                     .unwrap_or(0.0)
+             };
++            #[cfg(not(target_arch = "wasm32"))]
++            let read_window_count = |_key: &str| -> f64 { 0.0 };
+             let browser_fetch_pending = read_window_count("__dirplayerPendingNetCount") > 0.0;
+             // Offscreen Ruffle instances self-tick via requestAnimationFrame; a
+             // tight high-tempo Director loop (DGS puppetTempo(999) guest-gate
 diff --git a/vm-rust/src/player/native.rs b/vm-rust/src/player/native.rs
 new file mode 100644
-index 0000000..a1e9bb6
+index 0000000..e90af50
 --- /dev/null
 +++ b/vm-rust/src/player/native.rs
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,583 @@
 +//! PS5_RUFFLE_DIRPLAYER_NATIVE — DirPlayer inside another program, without a browser.
 +//!
 +//! The web front end drives the VM from JavaScript: it loads the movie, runs the frame loop on
@@ -1458,6 +2931,295 @@ index 0000000..a1e9bb6
 +    crate::player::native_rt::block_on(f)
 +}
 +
++// ---- what the web gives a movie and the host gives it here ----
++
++/// `setPref` / `getPref`: the web keeps them in the browser's localStorage; here they are files
++/// in the folder the host names ([`NativePlayer::set_prefs_dir`]), one per pref, or — without a
++/// folder — kept for as long as the program runs.
++static PREFS: std::sync::Mutex<(Option<std::path::PathBuf>, Vec<(String, String)>)> = std::sync::Mutex::new((None, Vec::new()));
++
++/// A pref's file name: Director wants a valid file name; anything else becomes `_`.
++fn pref_file_name(name: &str) -> String {
++    let s: String = name.chars().take(64).map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
++    let s = s.trim_start_matches('.').to_string();
++    if s.is_empty() { "_".into() } else { s }
++}
++
++pub(crate) fn read_pref(name: &str) -> Option<String> {
++    let p = PREFS.lock().ok()?;
++    match &p.0 {
++        Some(dir) => std::fs::read_to_string(dir.join(pref_file_name(name))).ok(),
++        None => p.1.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()),
++    }
++}
++
++pub(crate) fn write_pref(name: &str, value: &str) {
++    let Ok(mut p) = PREFS.lock() else {
++        return;
++    };
++    match p.0.clone() {
++        Some(dir) => {
++            let file = dir.join(pref_file_name(name));
++            let tmp = dir.join(format!(".{}.tmp", pref_file_name(name)));
++            let r = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&tmp, value)).and_then(|_| std::fs::rename(&tmp, &file));
++            match r {
++                Ok(()) => log::info!("setPref {name}: {} bytes to {}", value.len(), file.display()),
++                Err(e) => log::warn!("setPref {name}: {}: {e}", file.display()),
++            }
++        }
++        None => match p.1.iter_mut().find(|(k, _)| k == name) {
++            Some(kv) => kv.1 = value.to_string(),
++            None => p.1.push((name.to_string(), value.to_string())),
++        },
++    }
++}
++
++/// What a movie asked for that only a browser does (`gotoNetPage`), for the host to tell the
++/// player about: taken with [`take_notices`].
++static NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
++
++pub(crate) fn notice(text: String) {
++    log::info!("{text}");
++    if let Ok(mut n) = NOTICES.lock() {
++        if n.len() < 16 {
++            n.push(text);
++        }
++    }
++}
++
++/// The notices since the last call, oldest first.
++pub fn take_notices() -> Vec<String> {
++    NOTICES.lock().map(|mut n| std::mem::take(&mut *n)).unwrap_or_default()
++}
++
++// ---- a Shockwave Projector launch command (Flashpoint's entries) ----
++
++/// A Shockwave Projector (SPR) launch command as archives publish it — the movie's address, then
++/// projector flags — parsed as DirPlayer's web front end parses it (src/utils/launchCommand.js,
++/// `parseLaunchCommand`, ported line for line): the LeechProtectionRemovalHelp flags become Lingo
++/// calls run with `--do` once the movie is loaded (`forceTheExitLock(0)`, `setTheRunMode("Plugin")`),
++/// `--doBefore` runs before it loads, `--go N` goes to a frame once it runs, `--setExternalParam`
++/// sets an external param; projector-only flags are noted and skipped.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct LaunchCommand {
++    pub movie_url: Option<String>,
++    pub external_params: Vec<(String, String)>,
++    pub startup_do: String,
++    pub startup_do_before: String,
++    pub startup_go: u32,
++    pub ignored: Vec<String>,
++}
++
++const LPRH_STRING: [&str; 8] = [
++    "setTheMoviePath",
++    "setTheMovieName",
++    "setTheEnvironment_shockMachineVersion",
++    "setThePlatform",
++    "setTheRunMode",
++    "setTheEnvironment_productBuildVersion",
++    "setTheProductVersion",
++    "setTheEnvironment_osVersion",
++];
++const LPRH_INT: [&str; 4] = ["setTheEnvironment_shockMachine", "setTheMachineType", "forceTheExitLock", "forceTheSafePlayer"];
++const LPRH_BARE: [&str; 3] = ["disableGoToNetMovie", "disableGoToNetPage", "bugfixShockwave3DBadDriverList"];
++const IGNORED_WITH_VALUE: [&str; 7] = ["preload", "newScriptName", "newScriptText", "newScriptType", "trace", "traceLoad", "traceLogFile"];
++const IGNORED_BARE: [&str; 2] = ["versionStrict", "noDirectX7"];
++
++fn find_flag<'a>(list: &[&'a str], name: &str) -> Option<&'a str> {
++    list.iter().find(|f| f.eq_ignore_ascii_case(name)).copied()
++}
++
++/// JavaScript's `/\s/`: Unicode white space and U+FEFF.
++fn js_space(c: char) -> bool {
++    c.is_whitespace() || c == '\u{feff}'
++}
++
++/// The command's tokens: `"…"` quotes one (a `\"` in it is a quote), else white space ends one.
++fn launch_tokens(cmd: &str) -> Vec<String> {
++    let c: Vec<char> = cmd.chars().collect();
++    let mut tokens = Vec::new();
++    let mut i = 0;
++    while i < c.len() {
++        while i < c.len() && js_space(c[i]) {
++            i += 1;
++        }
++        if i >= c.len() {
++            break;
++        }
++        let mut buf = String::new();
++        if c[i] == '"' {
++            i += 1;
++            while i < c.len() {
++                if c[i] == '\\' && c.get(i + 1) == Some(&'"') {
++                    buf.push('"');
++                    i += 2;
++                    continue;
++                }
++                if c[i] == '"' {
++                    i += 1;
++                    break;
++                }
++                buf.push(c[i]);
++                i += 1;
++            }
++        } else {
++            while i < c.len() && !js_space(c[i]) {
++                buf.push(c[i]);
++                i += 1;
++            }
++        }
++        tokens.push(buf);
++    }
++    tokens
++}
++
++/// Lingo has one string delimiter, `"`; a payload written with `'` (inside the command's own
++/// double quotes) gets them back, unless it already has a `"`.
++fn normalize_quotes(code: &str) -> String {
++    if code.contains('"') || !code.contains('\'') {
++        code.to_string()
++    } else {
++        code.replace('\'', "\"")
++    }
++}
++
++/// JavaScript's `parseInt(s, 10)`: an optional sign and the digits at the start, after white space.
++fn js_parse_int(s: &str) -> Option<i64> {
++    let t = s.trim_start_matches(js_space);
++    let (neg, rest) = match t.strip_prefix('-') {
++        Some(r) => (true, r),
++        None => (false, t.strip_prefix('+').unwrap_or(t)),
++    };
++    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
++    let n: i64 = digits.parse().ok()?;
++    Some(if neg { -n } else { n })
++}
++
++/// `…SPR.exe ` in front of a command (some entries name the projector), dropped.
++fn strip_projector(cmd: &str) -> &str {
++    let t = cmd.trim_start_matches(js_space);
++    let end = t.find(js_space).unwrap_or(t.len());
++    let first = t[..end].to_ascii_lowercase();
++    let is_spr = first.strip_suffix(".exe").is_some_and(|stem| stem.rfind("spr").is_some_and(|i| stem[i + 3..].chars().all(|c| c.is_ascii_alphabetic())));
++    let rest = &t[end..];
++    if is_spr && rest.starts_with(js_space) {
++        rest.trim_start_matches(js_space)
++    } else {
++        cmd
++    }
++}
++
++pub fn parse_launch_command(cmd: &str) -> LaunchCommand {
++    let mut result = LaunchCommand::default();
++    let tokens = launch_tokens(strip_projector(cmd));
++    let mut lprh = Vec::new();
++    let mut doing = Vec::new();
++    let mut i = 0;
++    let next = |i: &mut usize| -> String {
++        if *i + 1 < tokens.len() {
++            *i += 1;
++            tokens[*i].clone()
++        } else {
++            String::new()
++        }
++    };
++    while i < tokens.len() {
++        let raw = tokens[i].clone();
++        let Some(flag) = raw.strip_prefix("--") else {
++            if result.movie_url.is_none() {
++                result.movie_url = Some(raw);
++            }
++            i += 1;
++            continue;
++        };
++        let lower = flag.to_ascii_lowercase();
++        if lower == "do" {
++            doing.push(normalize_quotes(&next(&mut i)));
++        } else if lower == "dobefore" {
++            let before = normalize_quotes(&next(&mut i));
++            if result.startup_do_before.is_empty() {
++                result.startup_do_before = before;
++            } else {
++                result.startup_do_before = format!("{}\n{before}", result.startup_do_before);
++            }
++        } else if lower == "go" {
++            if let Some(frame) = js_parse_int(&next(&mut i)) {
++                result.startup_go = frame.clamp(0, u32::MAX as i64) as u32;
++            }
++        } else if lower == "setexternalparam" {
++            let key = next(&mut i);
++            let value = next(&mut i);
++            if !key.is_empty() {
++                match result.external_params.iter_mut().find(|(k, _)| *k == key) {
++                    Some(kv) => kv.1 = value,
++                    None => result.external_params.push((key, value)),
++                }
++            }
++        } else if let Some(f) = find_flag(&LPRH_STRING, flag) {
++            lprh.push(format!("{f}(\"{}\")", next(&mut i).replace('"', "")));
++        } else if let Some(f) = find_flag(&LPRH_INT, flag) {
++            lprh.push(format!("{f}({})", js_parse_int(&next(&mut i)).unwrap_or(0)));
++        } else if let Some(f) = find_flag(&LPRH_BARE, flag) {
++            lprh.push(format!("{f}()"));
++        } else if find_flag(&IGNORED_WITH_VALUE, flag).is_some() {
++            next(&mut i);
++            result.ignored.push(flag.to_string());
++        } else if find_flag(&IGNORED_BARE, flag).is_some() {
++            result.ignored.push(flag.to_string());
++        } else {
++            // unknown: a value after it that is not a flag is its own, not the movie
++            if i + 1 < tokens.len() && !tokens[i + 1].starts_with("--") {
++                i += 1;
++            }
++            result.ignored.push(flag.to_string());
++        }
++        i += 1;
++    }
++    result.startup_do = lprh.into_iter().chain(doing).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
++    result
++}
++
++/// What a launch command asks for (`parse_launch_command`), as the web front end's
++/// `applyLaunchCommand` hands it to the VM: its external params, and the Lingo for before the
++/// movie loads (`--doBefore`, run by [`NativePlayer::load`]), after it loads (`--do`, before its
++/// `prepareMovie`), and the frame to go to once it runs (`--go`). For the movie about to load.
++pub fn apply_launch_command(lc: &LaunchCommand) {
++    reserve_player_mut(|player| {
++        for (k, v) in &lc.external_params {
++            player.external_params.insert(k.to_string(), v.to_string());
++        }
++        player.startup_do_before = Some(lc.startup_do_before.clone()).filter(|s| !s.is_empty());
++        player.startup_do = Some(lc.startup_do.clone()).filter(|s| !s.is_empty());
++        player.startup_go = Some(lc.startup_go).filter(|&f| f != 0);
++    });
++    if !lc.ignored.is_empty() {
++        log::info!("launch command: projector-only flags skipped: {}", lc.ignored.join(", "));
++    }
++}
++
++/// The address the movie was published at (`http://host/path/movie.dcr`): `the moviePath` and
++/// `the movieName` say it, as on its old site — a sitelocked movie checks them — and the files it
++/// asks for under that address are read from the folder it was loaded from (DirPlayer's movie
++/// path override, `set_movie_path_override` on the web). For the movie about to load.
++pub fn set_movie_address(url: &str) {
++    reserve_player_mut(|player| {
++        player.movie_path_override = Some(url.to_string()).filter(|s| !s.is_empty());
++    });
++}
++
++/// The folder web addresses are read from: `http://host/dir/file` is `<dir>/host/dir/file`, as
++/// an archive's game data holds a game's captured files (Flashpoint: its `content/` folder).
++/// Without one (and [`NativePlayer::new`] clears it) a web address the movie asks for is not read.
++pub fn set_web_root(dir: &str) {
++    crate::player::net_task::set_web_root(Some(std::path::PathBuf::from(dir)).filter(|d| !d.as_os_str().is_empty()));
++}
++
++/// The launch command's `--doBefore`, run once (a host that loads the movie itself runs it just
++/// before; [`NativePlayer::load`] does).
++pub async fn run_launch_do_before() {
++    crate::player::run_startup_do_before().await;
++}
++
 +/// One score frame the way the web front end's frame loop (`run_frame_loop`) runs one, without
 +/// its pacing (the host decides when frames run, at the movie's tempo):
 +///
@@ -1473,6 +3235,12 @@ index 0000000..a1e9bb6
 +/// sound ending never reached it — every channel a game had used stayed busy, and once a game
 +/// had used them all (Teen Titans: Battle Blitz, about a minute in) it found no free channel and
 +/// played nothing more; its fight music, restarted when it ends, stopped too.
++///
++/// 1.000.028: last, the tasks the frame spawned get their turn ([`super::native_rt::yield_now`]),
++/// which a host running every frame in one `block_on` gave them only when something in a frame
++/// waited — among them the event loop, so mouseEnter, mouseLeave and mouseWithin now reach the
++/// movie as the mouse moves (and Teen Titans: Battle Blitz's START button needed the film-loop
++/// `go` of DirPlayer::go_tell_film_loop).
 +pub async fn run_native_frame() -> bool {
 +    if reserve_player_ref(|player| player.pending_restart) {
 +        super::restart_current_movie().await;
@@ -1523,6 +3291,9 @@ index 0000000..a1e9bb6
 +    }
 +
 +    reserve_player_mut(|player| player.refresh_frame_tempo());
++    // the tasks this frame started (a sound channel's playlist, a download, the event loop's
++    // mouseEnter / mouseLeave / mouseWithin) get their turn now
++    crate::player::native_rt::yield_now().await;
 +    true
 +}
 +
@@ -1534,6 +3305,12 @@ index 0000000..a1e9bb6
 +impl NativePlayer {
 +    /// Sets up the global VM. Call inside [`block_on`].
 +    pub fn new() -> NativePlayer {
++        // a new movie: no prefs folder until the host names one, no notices from the last one
++        if let Ok(mut p) = PREFS.lock() {
++            *p = (None, Vec::new());
++        }
++        crate::player::net_task::set_web_root(None);
++        let _ = take_notices();
 +        let (tx, _rx) = channel::unbounded();
 +        let (event_tx, event_rx) = channel::unbounded();
 +        unsafe {
@@ -1546,6 +3323,10 @@ index 0000000..a1e9bb6
 +            crate::player::xtra::curl::CURL_XTRA_MANAGER_OPT = Some(crate::player::xtra::curl::CurlXtraManager::new());
 +            PLAYER_OPT = Some(DirPlayer::new(tx.clone()));
 +        }
++        // the system font the web front end has the VM fetch at start (SetSystemFontPath)
++        if let Err(e) = reserve_player_mut(|player| crate::player::font::native_load_system_font(player)) {
++            log::warn!("system font: {e}");
++        }
 +        crate::player::spawn_player_local(async move {
 +            run_event_loop(event_rx).await;
 +        });
@@ -1553,8 +3334,10 @@ index 0000000..a1e9bb6
 +    }
 +
 +    /// Loads the movie at `path` (a .dir, .dxr or .dcr); its casts and the movies it goes to are
-+    /// looked up in the same folder.
++    /// looked up in the same folder. A launch command's `--doBefore` runs first, as the web front
++    /// end runs it (LoadMovieFromFile).
 +    pub async fn load(&mut self, path: &str) -> Result<(), String> {
++        run_launch_do_before().await;
 +        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
 +        let path = Path::new(path);
 +        let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -1575,12 +3358,36 @@ index 0000000..a1e9bb6
 +        Ok(())
 +    }
 +
++    /// Where `setPref` writes and `getPref` reads (created when first written to). Without it
++    /// they last as long as the program.
++    pub fn set_prefs_dir(&mut self, dir: &str) {
++        if let Ok(mut p) = PREFS.lock() {
++            p.0 = Some(std::path::PathBuf::from(dir));
++        }
++    }
++
 +    /// `externalParamValue(name)` for the movie, as an embedding page's `<param>` would set it.
 +    /// Call before [`Self::init`].
 +    pub fn set_external_param(&mut self, name: &str, value: &str) {
 +        reserve_player_mut(|player| {
 +            player.external_params.insert(name.to_string(), value.to_string());
 +        });
++    }
++
++    /// What a launch command asks for: see [`apply_launch_command`]. Call before [`Self::load`].
++    pub fn apply_launch_command(&mut self, lc: &LaunchCommand) {
++        apply_launch_command(lc);
++    }
++
++    /// The address the movie was published at: see [`set_movie_address`]. Call before
++    /// [`Self::load`].
++    pub fn set_movie_address(&mut self, url: &str) {
++        set_movie_address(url);
++    }
++
++    /// The folder the movie's web addresses are read from: see [`set_web_root`].
++    pub fn set_web_root(&mut self, dir: &str) {
++        set_web_root(dir);
 +    }
 +
 +    /// Starts the movie (prepareMovie, startMovie, the first frame's scripts).
@@ -1940,10 +3747,10 @@ index 0000000..fbf3183
 +}
 diff --git a/vm-rust/src/player/native_rt.rs b/vm-rust/src/player/native_rt.rs
 new file mode 100644
-index 0000000..9e20f21
+index 0000000..27ca6b1
 --- /dev/null
 +++ b/vm-rust/src/player/native_rt.rs
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,255 @@
 +//! PS5_RUFFLE_DIRPLAYER_NATIVE — DirPlayer's task executor and timers off the web, without
 +//! async-std's runtime.
 +//!
@@ -2007,6 +3814,30 @@ index 0000000..9e20f21
 +    if spawner().spawn_local(fut).is_err() {
 +        log::warn!("native_rt: the executor is gone; task dropped");
 +    }
++}
++
++/// Gives the tasks [`spawn_local`] started their turn: pending once, so [`block_on`] runs the
++/// pool until it stalls (and wakes the timers that are due) before carrying on.
++///
++/// 1.000.028: the host's frame loop (Ruffle5's src/shockwave.rs, dcr-probe) runs the whole game
++/// in one `block_on` and waits for the display with a plain sleep, so a frame that awaits nothing
++/// pending never gave the pool a turn: work DirPlayer spawns — a sound channel's playlist
++/// (`queue` + `play()`, `setPlayList`), net tasks — waited until some script happened to sleep
++/// (updateStage, nothing()). Trick or Treat Beat queues every sound and played none.
++pub async fn yield_now() {
++    struct YieldNow(bool);
++    impl Future for YieldNow {
++        type Output = ();
++        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
++            if self.0 {
++                return Poll::Ready(());
++            }
++            self.0 = true;
++            cx.waker().wake_by_ref();
++            Poll::Pending
++        }
++    }
++    YieldNow(false).await
 +}
 +
 +/// A future ready once `deadline` has passed.
@@ -2175,29 +4006,839 @@ index 0000000..9e20f21
 +        assert_eq!(got, 42);
 +    }
 +}
+diff --git a/vm-rust/src/player/native_text.rs b/vm-rust/src/player/native_text.rs
+new file mode 100644
+index 0000000..a159f90
+--- /dev/null
++++ b/vm-rust/src/player/native_text.rs
+@@ -0,0 +1,685 @@
++//! PS5_RUFFLE_DIRPLAYER_NATIVE: text in a system font, measured and drawn without a browser.
++//!
++//! A text or field member whose font the movie does not carry ("Arial", "Verdana", ...) is laid
++//! out and drawn by font.rs's native path (and measured by charPosToLoc in handlers/manager.rs),
++//! which on the web asks a Canvas2D context for it: `ctx.font = "bold 12px Arial"`,
++//! `textBaseline = "top"`, `measureText(s).width`, `fillText`, an underline's
++//! `beginPath`/`moveTo`/`lineTo`/`stroke`, and `getImageData` to read the coverage back. Off the
++//! web there is no document, and those calls panic. TextCtx does those things itself, with the
++//! fonts the host gives it (`add_font`): Ruffle5 and dcr-probe give it Liberation Sans, Serif and
++//! Mono 2.1.5 (SIL Open Font License 1.1), which have the advance widths of Arial, Times New Roman
++//! and Courier New.
++//!
++//! Matched against headless Chromium's canvas drawing the same fonts (on Linux Chromium gets them
++//! for "Arial", "Times New Roman" and "Courier New" through fontconfig), with the measurements
++//! and drawings in dcr-probe's textcheck:
++//!   * `measureText().width` is the sum of the glyphs' advances at the font size, unhinted, plus
++//!     the font's kerning pairs within a word: in 100px Arial "AV" measures 125.9765625, A and V
++//!     alone 66.69921875 each, and the font's A-V pair is -152/2048 em; " A" is a space and an A;
++//!   * `textBaseline = "top"` puts the alphabetic baseline sTypoAscender / (sTypoAscender -
++//!     sTypoDescender) of the font size below y, rounded to 1/64 px: 77.578125 for 100px Arial,
++//!     9.3125 for 12px;
++//!   * tabs and line breaks in a string measure and draw as spaces (the canvas spec replaces ASCII
++//!     whitespace with U+0020 before shaping).
++//! The glyphs land where Chromium's do; their edges differ by hinting and Skia's contrast boost.
++//! A family is chosen by its name: Courier-, mono- and typewriter-like names get Mono, Times-like
++//! serif names Serif, every other name Sans (Chromium draws a family it does not have in its
++//! default font, Times New Roman; for the Verdanas, Tahomas and Genevas of Director movies a sans
++//! is the nearer stand-in). A name a browser would refuse as CSS ("12px *Arial", a name starting
++//! with a digit) is used all the same: Chromium ignores such a string and keeps the font before
++//! it. Bold and italic come from the font string's keywords. Drawing is grayscale-antialiased
++//! coverage composited source-over, through the context's scale and translate.
++// SPDX-License-Identifier: GPL-3.0-only
++
++use std::cell::{Cell, RefCell};
++use std::sync::RwLock;
++
++use ab_glyph::{Font, FontArc, GlyphId, PxScale};
++
++/// The three kinds of face a system font is drawn in.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Family {
++    Sans,
++    Serif,
++    Mono,
++}
++
++struct Face {
++    family: Family,
++    bold: bool,
++    italic: bool,
++    font: FontArc,
++    /// sTypoAscender and sTypoDescender (OS/2), else the hhea ascent and descent, in font units.
++    ascent: f32,
++    descent: f32,
++    /// The ascent and descent the font gives its line (hhea), in font units.
++    line_ascent: f32,
++    line_descent: f32,
++    units: f32,
++    height: f32,
++}
++
++static FACES: RwLock<Vec<Face>> = RwLock::new(Vec::new());
++static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++static MEASURED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static DRAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++/// How many strings have been measured and drawn so far (for a host's log).
++pub fn counts() -> (u64, u64) {
++    use std::sync::atomic::Ordering::Relaxed;
++    (MEASURED.load(Relaxed), DRAWN.load(Relaxed))
++}
++
++fn be16(b: &[u8], at: usize) -> Option<i16> {
++    Some(i16::from_be_bytes([*b.get(at)?, *b.get(at + 1)?]))
++}
++
++fn be32(b: &[u8], at: usize) -> Option<u32> {
++    Some(u32::from_be_bytes([*b.get(at)?, *b.get(at + 1)?, *b.get(at + 2)?, *b.get(at + 3)?]))
++}
++
++/// sTypoAscender and sTypoDescender from a TrueType/OpenType file's OS/2 table.
++fn typo_metrics(data: &[u8]) -> Option<(f32, f32)> {
++    let tables = u16::from_be_bytes([*data.get(4)?, *data.get(5)?]) as usize;
++    for i in 0..tables {
++        let rec = 12 + 16 * i;
++        if data.get(rec..rec + 4)? == b"OS/2" {
++            let off = be32(data, rec + 8)? as usize;
++            let asc = be16(data, off + 68)? as f32;
++            let desc = be16(data, off + 70)? as f32;
++            return (asc - desc > 0.0).then_some((asc, desc));
++        }
++    }
++    None
++}
++
++fn add(family: Family, bold: bool, italic: bool, font: FontArc, typo: Option<(f32, f32)>) {
++    let units = font.units_per_em().unwrap_or(2048.0);
++    let (ascent, descent) = typo.unwrap_or((font.ascent_unscaled(), font.descent_unscaled()));
++    let height = font.height_unscaled();
++    let (line_ascent, line_descent) = (font.ascent_unscaled(), font.descent_unscaled());
++    let face = Face { family, bold, italic, font, ascent, descent, line_ascent, line_descent, units, height };
++    let mut faces = FACES.write().unwrap_or_else(|e| e.into_inner());
++    faces.retain(|f| !(f.family == family && f.bold == bold && f.italic == italic));
++    faces.push(face);
++}
++
++/// Give the text drawing a font for `family` in this weight and slant (a font built into the
++/// host). A later font for the same family and style replaces the earlier one.
++pub fn add_font(family: Family, bold: bool, italic: bool, data: &'static [u8]) -> Result<(), String> {
++    let font = FontArc::try_from_slice(data).map_err(|e| format!("{family:?}: {e}"))?;
++    add(family, bold, italic, font, typo_metrics(data));
++    Ok(())
++}
++
++/// The same, from a font file read at run time.
++pub fn add_font_file(family: Family, bold: bool, italic: bool, data: Vec<u8>) -> Result<(), String> {
++    let typo = typo_metrics(&data);
++    let font = FontArc::try_from_vec(data).map_err(|e| format!("{family:?}: {e}"))?;
++    add(family, bold, italic, font, typo);
++    Ok(())
++}
++
++/// The Liberation fonts' file names, and what each stands in for.
++pub const LIBERATION: [(&str, Family, bool, bool); 12] = [
++    ("LiberationSans-Regular.ttf", Family::Sans, false, false),
++    ("LiberationSans-Bold.ttf", Family::Sans, true, false),
++    ("LiberationSans-Italic.ttf", Family::Sans, false, true),
++    ("LiberationSans-BoldItalic.ttf", Family::Sans, true, true),
++    ("LiberationSerif-Regular.ttf", Family::Serif, false, false),
++    ("LiberationSerif-Bold.ttf", Family::Serif, true, false),
++    ("LiberationSerif-Italic.ttf", Family::Serif, false, true),
++    ("LiberationSerif-BoldItalic.ttf", Family::Serif, true, true),
++    ("LiberationMono-Regular.ttf", Family::Mono, false, false),
++    ("LiberationMono-Bold.ttf", Family::Mono, true, false),
++    ("LiberationMono-Italic.ttf", Family::Mono, false, true),
++    ("LiberationMono-BoldItalic.ttf", Family::Mono, true, true),
++];
++
++/// Read the Liberation fonts in `dir` (by the names in LIBERATION). Returns how many were read.
++pub fn add_liberation_fonts(dir: &str) -> usize {
++    let mut n = 0;
++    for (name, family, bold, italic) in LIBERATION {
++        let path = std::path::Path::new(dir).join(name);
++        match std::fs::read(&path) {
++            Ok(data) => match add_font_file(family, bold, italic, data) {
++                Ok(()) => n += 1,
++                Err(e) => log::warn!("native_text: {}: {e}", path.display()),
++            },
++            Err(e) => log::warn!("native_text: {}: {e}", path.display()),
++        }
++    }
++    n
++}
++
++/// How many fonts the text drawing has.
++pub fn fonts() -> usize {
++    FACES.read().map(|f| f.len()).unwrap_or(0)
++}
++
++/// Whether text in `name` is drawn with that font's own advance widths: one of the families the
++/// Liberation fonts (and the Arimo, Tinos and Cousine they come from) have the metrics of, and
++/// a font for it was given. BudAPI's baFontInstalled asks this.
++pub fn has_font(name: &str) -> bool {
++    let n = name.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase();
++    let family = match n.as_str() {
++        "arial" | "helvetica" | "liberation sans" | "arimo" => Family::Sans,
++        "times new roman" | "times" | "liberation serif" | "tinos" => Family::Serif,
++        "courier new" | "courier" | "liberation mono" | "cousine" => Family::Mono,
++        _ => return false,
++    };
++    FACES.read().map(|f| f.iter().any(|face| face.family == family)).unwrap_or(false)
++}
++
++/// The face a family name stands for.
++pub fn family_of(name: &str) -> Family {
++    let first = name.split(',').next().unwrap_or("");
++    let n = first.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase();
++    const MONO: [&str; 11] = ["courier", "mono", "consol", "lucida console", "typewriter", "andale", "fixedsys", "terminal", "monaco", "ocr", "prestige"];
++    const SERIF: [&str; 16] = ["times", "georgia", "garamond", "palatino", "book antiqua", "bookman", "century schoolbook", "new york", "baskerville", "cambria", "didot", "bodoni", "caslon", "goudy", "perpetua", "minion"];
++    if MONO.iter().any(|k| n.contains(k)) {
++        Family::Mono
++    } else if SERIF.iter().any(|k| n.contains(k)) || (n.contains("serif") && !n.contains("sans")) {
++        Family::Serif
++    } else {
++        Family::Sans
++    }
++}
++
++/// A CSS font shorthand as DirPlayer writes it ("bold italic 12px Arial", "12px Times New Roman"):
++/// (bold, italic, size in px, family). None when it has no size, as a canvas ignores such a string.
++pub fn parse_font(s: &str) -> Option<(bool, bool, f64, String)> {
++    let mut bold = false;
++    let mut italic = false;
++    let mut rest = s.trim();
++    loop {
++        let (word, after) = match rest.find(char::is_whitespace) {
++            Some(i) => (&rest[..i], rest[i..].trim_start()),
++            None => (rest, ""),
++        };
++        let lower = word.to_ascii_lowercase();
++        let size_part = lower.split('/').next().unwrap_or("");
++        let size = if let Some(n) = size_part.strip_suffix("px") {
++            n.parse::<f64>().ok()
++        } else if let Some(n) = size_part.strip_suffix("pt") {
++            n.parse::<f64>().ok().map(|p| p * 4.0 / 3.0)
++        } else {
++            None
++        };
++        if let Some(size) = size {
++            if !(size.is_finite() && size > 0.0) {
++                return None;
++            }
++            let family = after.trim().to_string();
++            return Some((bold, italic, size, if family.is_empty() { "sans-serif".into() } else { family }));
++        }
++        match lower.as_str() {
++            "bold" | "bolder" => bold = true,
++            "italic" | "oblique" => italic = true,
++            w if w.parse::<u32>().is_ok_and(|n| n >= 600) => bold = true,
++            "" => return None,
++            _ => {}
++        }
++        if after.is_empty() {
++            return None;
++        }
++        rest = after;
++    }
++}
++
++/// The current font: its face, the size in px, and the face's units, height and typo ascent and
++/// descent as fractions of their sum (the em box "top" and "bottom" are measured from).
++#[derive(Clone)]
++struct Current {
++    font: FontArc,
++    size: f64,
++    units: f64,
++    height: f32,
++    ascent_ratio: f64,
++    descent_ratio: f64,
++    line_ascent: f64,
++    line_descent: f64,
++}
++
++/// The face for a family and style: the family's own (Sans when it has none), then the weight,
++/// then the slant.
++fn pick(bold: bool, italic: bool, family: Family) -> Option<Current> {
++    let faces = FACES.read().ok()?;
++    let score = |f: &Face| -> u32 {
++        (if f.family == family { 100 } else if f.family == Family::Sans { 10 } else { 0 })
++            + (if f.bold == bold { 2 } else { 0 })
++            + (if f.italic == italic { 1 } else { 0 })
++    };
++    let f = faces.iter().max_by_key(|f| score(f))?;
++    let em = f.ascent - f.descent;
++    Some(Current {
++        font: f.font.clone(),
++        size: 0.0,
++        units: f.units as f64,
++        height: f.height,
++        ascent_ratio: (f.ascent / em) as f64,
++        descent_ratio: (-f.descent / em) as f64,
++        line_ascent: f.line_ascent as f64,
++        line_descent: -f.line_descent as f64,
++    })
++}
++
++fn round_64th(v: f64) -> f64 {
++    (v * 64.0).round() / 64.0
++}
++
++/// A canvas's colour string: rgb()/rgba(), #rgb/#rrggbb, black/white/transparent.
++fn parse_color(s: &str) -> Option<[f64; 4]> {
++    let s = s.trim().to_ascii_lowercase();
++    match s.as_str() {
++        "black" => return Some([0.0, 0.0, 0.0, 1.0]),
++        "white" => return Some([255.0, 255.0, 255.0, 1.0]),
++        "transparent" => return Some([0.0, 0.0, 0.0, 0.0]),
++        _ => {}
++    }
++    if let Some(hex) = s.strip_prefix('#') {
++        let v: Vec<u32> = hex.chars().map(|c| c.to_digit(16)).collect::<Option<_>>()?;
++        return match v.len() {
++            3 => Some([(v[0] * 17) as f64, (v[1] * 17) as f64, (v[2] * 17) as f64, 1.0]),
++            6 => Some([(v[0] * 16 + v[1]) as f64, (v[2] * 16 + v[3]) as f64, (v[4] * 16 + v[5]) as f64, 1.0]),
++            _ => None,
++        };
++    }
++    let inner = s.strip_prefix("rgba(").or_else(|| s.strip_prefix("rgb("))?.strip_suffix(')')?;
++    let parts: Vec<f64> = inner.split(',').map(|p| p.trim().parse::<f64>().ok()).collect::<Option<_>>()?;
++    match parts.len() {
++        3 => Some([parts[0].clamp(0.0, 255.0), parts[1].clamp(0.0, 255.0), parts[2].clamp(0.0, 255.0), 1.0]),
++        4 => Some([parts[0].clamp(0.0, 255.0), parts[1].clamp(0.0, 255.0), parts[2].clamp(0.0, 255.0), parts[3].clamp(0.0, 1.0)]),
++        _ => None,
++    }
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum Baseline {
++    Alphabetic,
++    Top,
++    Middle,
++    Bottom,
++}
++
++/// What `measure_text` returns: TextMetrics' width, and its fontBoundingBoxAscent / Descent
++/// (the font's line ascent and descent, rounded to whole pixels as Chromium has them — 91 and 21
++/// for 100px Arial — measured from the baseline the context is set to).
++pub struct TextMetrics {
++    width: f64,
++    ascent: f64,
++    descent: f64,
++}
++
++impl TextMetrics {
++    pub fn width(&self) -> f64 {
++        self.width
++    }
++
++    pub fn font_bounding_box_ascent(&self) -> f64 {
++        self.ascent
++    }
++
++    pub fn font_bounding_box_descent(&self) -> f64 {
++        self.descent
++    }
++}
++
++/// What `get_image_data` returns: RGBA, not premultiplied, row by row.
++pub struct ImageData {
++    data: Vec<u8>,
++}
++
++impl ImageData {
++    pub fn data(self) -> Vec<u8> {
++        self.data
++    }
++}
++
++/// The Canvas2D context font.rs and charPosToLoc draw and measure text with off the web.
++pub struct TextCtx {
++    w: usize,
++    h: usize,
++    px: RefCell<Vec<u8>>,
++    font_str: RefCell<String>,
++    font: RefCell<Option<Current>>,
++    baseline: Cell<Baseline>,
++    fill: Cell<[f64; 4]>,
++    stroke_color: Cell<[f64; 4]>,
++    line_width: Cell<f64>,
++    /// sx, sy, tx, ty: device = (sx·x + tx, sy·y + ty).
++    m: Cell<[f64; 4]>,
++    /// Sub-paths in device coordinates.
++    path: RefCell<Vec<Vec<(f64, f64)>>>,
++}
++
++impl TextCtx {
++    /// A canvas of `width` × `height` transparent black pixels, with a canvas's defaults (black
++    /// fill and stroke, line width 1, "10px sans-serif", alphabetic baseline).
++    pub fn new(width: u32, height: u32) -> TextCtx {
++        let (w, h) = (width as usize, height as usize);
++        let ctx = TextCtx {
++            w,
++            h,
++            px: RefCell::new(vec![0; w * h * 4]),
++            font_str: RefCell::new(String::new()),
++            font: RefCell::new(None),
++            baseline: Cell::new(Baseline::Alphabetic),
++            fill: Cell::new([0.0, 0.0, 0.0, 1.0]),
++            stroke_color: Cell::new([0.0, 0.0, 0.0, 1.0]),
++            line_width: Cell::new(1.0),
++            m: Cell::new([1.0, 1.0, 0.0, 0.0]),
++            path: RefCell::new(Vec::new()),
++        };
++        ctx.set_font("10px sans-serif");
++        ctx
++    }
++
++    pub fn set_font(&self, font: &str) {
++        if *self.font_str.borrow() == font {
++            return;
++        }
++        let Some((bold, italic, size, family)) = parse_font(font) else {
++            return;
++        };
++        let picked = pick(bold, italic, family_of(&family)).map(|mut c| {
++            c.size = size;
++            c
++        });
++        if picked.is_none() && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
++            log::warn!("native_text: no fonts were given; text in system fonts is not drawn");
++        }
++        *self.font.borrow_mut() = picked;
++        *self.font_str.borrow_mut() = font.to_string();
++    }
++
++    pub fn set_text_baseline(&self, baseline: &str) {
++        self.baseline.set(match baseline {
++            "top" | "hanging" => Baseline::Top,
++            "middle" => Baseline::Middle,
++            "bottom" | "ideographic" => Baseline::Bottom,
++            _ => Baseline::Alphabetic,
++        });
++    }
++
++    pub fn set_fill_style_str(&self, color: &str) {
++        if let Some(c) = parse_color(color) {
++            self.fill.set(c);
++        }
++    }
++
++    pub fn set_stroke_style_str(&self, color: &str) {
++        if let Some(c) = parse_color(color) {
++            self.stroke_color.set(c);
++        }
++    }
++
++    pub fn set_line_width(&self, w: f64) {
++        if w.is_finite() && w > 0.0 {
++            self.line_width.set(w);
++        }
++    }
++
++    pub fn scale(&self, x: f64, y: f64) -> Result<(), ()> {
++        let [sx, sy, tx, ty] = self.m.get();
++        self.m.set([sx * x, sy * y, tx, ty]);
++        Ok(())
++    }
++
++    pub fn translate(&self, x: f64, y: f64) -> Result<(), ()> {
++        let [sx, sy, tx, ty] = self.m.get();
++        self.m.set([sx, sy, tx + sx * x, ty + sy * y]);
++        Ok(())
++    }
++
++    fn device(&self, x: f64, y: f64) -> (f64, f64) {
++        let [sx, sy, tx, ty] = self.m.get();
++        (sx * x + tx, sy * y + ty)
++    }
++
++    /// Composite `color` at `coverage` onto one pixel (source-over).
++    fn blend(px: &mut [u8], w: usize, h: usize, x: i64, y: i64, color: [f64; 4], coverage: f64) {
++        if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
++            return;
++        }
++        let a = (coverage.clamp(0.0, 1.0) * color[3]).clamp(0.0, 1.0);
++        if a <= 0.0 {
++            return;
++        }
++        let i = (y as usize * w + x as usize) * 4;
++        let da = px[i + 3] as f64 / 255.0;
++        let out_a = a + da * (1.0 - a);
++        for k in 0..3 {
++            let d = px[i + k] as f64;
++            let v = if out_a > 0.0 { (color[k] * a + d * da * (1.0 - a)) / out_a } else { 0.0 };
++            px[i + k] = v.round().clamp(0.0, 255.0) as u8;
++        }
++        px[i + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
++    }
++
++    pub fn fill_rect(&self, x: f64, y: f64, w: f64, h: f64) {
++        let (ax, ay) = self.device(x, y);
++        let (bx, by) = self.device(x + w, y + h);
++        let (x0, x1) = (ax.min(bx).max(0.0), ax.max(bx).min(self.w as f64));
++        let (y0, y1) = (ay.min(by).max(0.0), ay.max(by).min(self.h as f64));
++        if x1 <= x0 || y1 <= y0 {
++            return;
++        }
++        let color = self.fill.get();
++        let mut px = self.px.borrow_mut();
++        for py in y0.floor() as i64..y1.ceil() as i64 {
++            let cy = (y1.min(py as f64 + 1.0) - y0.max(py as f64)).clamp(0.0, 1.0);
++            for pxx in x0.floor() as i64..x1.ceil() as i64 {
++                let cx = (x1.min(pxx as f64 + 1.0) - x0.max(pxx as f64)).clamp(0.0, 1.0);
++                Self::blend(&mut px, self.w, self.h, pxx, py, color, cx * cy);
++            }
++        }
++    }
++
++    /// Characters as a canvas shapes them: ASCII whitespace becomes a space.
++    fn chars(text: &str) -> impl Iterator<Item = char> + '_ {
++        text.chars().map(|c| if matches!(c, '\t' | '\n' | '\x0C' | '\r') { ' ' } else { c })
++    }
++
++    /// The glyphs of `text` and each one's pen position in font units from the start. Kerning
++    /// pairs apply within a word only: Chromium shapes a string a word at a time, split at spaces,
++    /// so the font's pairs with a space never apply there (" A" in 100px Arial measures 94.482421875,
++    /// a space and an A; the font's space-A pair is -113/2048 em).
++    fn layout(cur: &Current, text: &str) -> (Vec<(GlyphId, f64)>, f64) {
++        let mut out = Vec::new();
++        let mut pen = 0.0f64;
++        let mut prev: Option<(GlyphId, char)> = None;
++        for c in Self::chars(text) {
++            let id = cur.font.glyph_id(c);
++            if let Some((p, pc)) = prev {
++                if pc != ' ' && c != ' ' {
++                    pen += cur.font.kern_unscaled(p, id) as f64;
++                }
++            }
++            out.push((id, pen));
++            pen += cur.font.h_advance_unscaled(id) as f64;
++            prev = Some((id, c));
++        }
++        (out, pen)
++    }
++
++    pub fn measure_text(&self, text: &str) -> Result<TextMetrics, ()> {
++        MEASURED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        let cur = self.font.borrow();
++        let Some(cur) = cur.as_ref() else {
++            // no fonts: font.rs's own estimate for a failed measure
++            let size = parse_font(&self.font_str.borrow()).map(|f| f.2).unwrap_or(10.0);
++            return Ok(TextMetrics { width: Self::chars(text).count() as f64 * size * 0.55, ascent: size * 0.9, descent: size * 0.2 });
++        };
++        let (_, units) = Self::layout(cur, text);
++        let offset = self.baseline_offset(cur);
++        Ok(TextMetrics {
++            width: units * cur.size / cur.units,
++            ascent: (cur.line_ascent * cur.size / cur.units).round() - offset,
++            descent: (cur.line_descent * cur.size / cur.units).round() + offset,
++        })
++    }
++
++    /// How far below y the alphabetic baseline is for the current baseline setting (CSS px).
++    fn baseline_offset(&self, cur: &Current) -> f64 {
++        match self.baseline.get() {
++            Baseline::Alphabetic => 0.0,
++            Baseline::Top => round_64th(cur.size * cur.ascent_ratio),
++            Baseline::Bottom => -round_64th(cur.size * cur.descent_ratio),
++            Baseline::Middle => (round_64th(cur.size * cur.ascent_ratio) - round_64th(cur.size * cur.descent_ratio)) / 2.0,
++        }
++    }
++
++    pub fn fill_text(&self, text: &str, x: f64, y: f64) -> Result<(), ()> {
++        DRAWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        let cur = self.font.borrow();
++        let Some(cur) = cur.as_ref() else {
++            return Ok(());
++        };
++        let [sx, sy, _, _] = self.m.get();
++        let (glyphs, _) = Self::layout(cur, text);
++        let per_unit = cur.size / cur.units;
++        let base_y = y + self.baseline_offset(cur);
++        // ab_glyph's PxScale is the font's ascent-to-descent height in pixels
++        let scale = PxScale {
++            x: (cur.size * sx.abs()) as f32 * cur.height / cur.units as f32,
++            y: (cur.size * sy.abs()) as f32 * cur.height / cur.units as f32,
++        };
++        let color = self.fill.get();
++        let mut px = self.px.borrow_mut();
++        for (id, pen) in glyphs {
++            if id.0 == 0 {
++                continue;
++            }
++            let (dx, dy) = self.device(x + pen * per_unit, base_y);
++            let glyph = id.with_scale_and_position(scale, ab_glyph::point(dx as f32, dy as f32));
++            if let Some(outlined) = cur.font.outline_glyph(glyph) {
++                let b = outlined.px_bounds();
++                let (ox, oy) = (b.min.x as i64, b.min.y as i64);
++                outlined.draw(|gx, gy, c| {
++                    Self::blend(&mut px, self.w, self.h, ox + gx as i64, oy + gy as i64, color, c as f64);
++                });
++            }
++        }
++        Ok(())
++    }
++
++    pub fn begin_path(&self) {
++        self.path.borrow_mut().clear();
++    }
++
++    pub fn move_to(&self, x: f64, y: f64) {
++        let p = self.device(x, y);
++        self.path.borrow_mut().push(vec![p]);
++    }
++
++    pub fn line_to(&self, x: f64, y: f64) {
++        let p = self.device(x, y);
++        let mut path = self.path.borrow_mut();
++        match path.last_mut() {
++            Some(sub) => sub.push(p),
++            None => path.push(vec![p]),
++        }
++    }
++
++    /// Each segment as a line `line_width` wide with butt ends, 4×4 samples a pixel.
++    pub fn stroke(&self) {
++        let [sx, sy, _, _] = self.m.get();
++        let half = self.line_width.get() * (sx * sy).abs().sqrt() / 2.0;
++        let color = self.stroke_color.get();
++        let path = self.path.borrow();
++        let mut px = self.px.borrow_mut();
++        for sub in path.iter() {
++            for seg in sub.windows(2) {
++                let ((x0, y0), (x1, y1)) = (seg[0], seg[1]);
++                let (dx, dy) = (x1 - x0, y1 - y0);
++                let len2 = dx * dx + dy * dy;
++                if len2 <= 0.0 {
++                    continue;
++                }
++                let len = len2.sqrt();
++                let lo_x = (x0.min(x1) - half).floor().max(0.0) as i64;
++                let hi_x = (x0.max(x1) + half).ceil().min(self.w as f64) as i64;
++                let lo_y = (y0.min(y1) - half).floor().max(0.0) as i64;
++                let hi_y = (y0.max(y1) + half).ceil().min(self.h as f64) as i64;
++                for py in lo_y..hi_y {
++                    for pxx in lo_x..hi_x {
++                        let mut inside = 0;
++                        for j in 0..4 {
++                            for i in 0..4 {
++                                let (qx, qy) = (pxx as f64 + (i as f64 + 0.5) / 4.0 - x0, py as f64 + (j as f64 + 0.5) / 4.0 - y0);
++                                let t = (qx * dx + qy * dy) / len2;
++                                let dist = (qx * dy - qy * dx).abs() / len;
++                                if (0.0..=1.0).contains(&t) && dist <= half {
++                                    inside += 1;
++                                }
++                            }
++                        }
++                        if inside > 0 {
++                            Self::blend(&mut px, self.w, self.h, pxx, py, color, inside as f64 / 16.0);
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    pub fn get_image_data(&self, x: f64, y: f64, w: f64, h: f64) -> Result<ImageData, ()> {
++        if !(w.is_finite() && h.is_finite()) || w < 1.0 || h < 1.0 {
++            return Err(());
++        }
++        let (x, y, w, h) = (x as i64, y as i64, w as usize, h as usize);
++        let src = self.px.borrow();
++        let mut data = vec![0u8; w * h * 4];
++        for row in 0..h {
++            let sy = y + row as i64;
++            if sy < 0 || sy as usize >= self.h {
++                continue;
++            }
++            for col in 0..w {
++                let sx = x + col as i64;
++                if sx < 0 || sx as usize >= self.w {
++                    continue;
++                }
++                let s = (sy as usize * self.w + sx as usize) * 4;
++                let d = (row * w + col) * 4;
++                data[d..d + 4].copy_from_slice(&src[s..s + 4]);
++            }
++        }
++        Ok(ImageData { data })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn font_strings_parse_as_a_canvas_reads_them() {
++        assert_eq!(parse_font("12px Arial"), Some((false, false, 12.0, "Arial".into())));
++        assert_eq!(parse_font("bold italic 12px Arial"), Some((true, true, 12.0, "Arial".into())));
++        assert_eq!(parse_font("italic bold 12px Times New Roman"), Some((true, true, 12.0, "Times New Roman".into())));
++        assert_eq!(parse_font("700 9.5px \"Courier New\""), Some((true, false, 9.5, "\"Courier New\"".into())));
++        assert_eq!(parse_font("Arial"), None);
++        assert_eq!(parse_font("bold Arial"), None);
++        assert_eq!(parse_font("0px Arial"), None);
++    }
++
++    #[test]
++    fn families_by_name() {
++        assert_eq!(family_of("Arial"), Family::Sans);
++        assert_eq!(family_of("Verdana"), Family::Sans);
++        assert_eq!(family_of("Times New Roman"), Family::Serif);
++        assert_eq!(family_of("\"Courier New\""), Family::Mono);
++        assert_eq!(family_of("sans-serif"), Family::Sans);
++        assert_eq!(family_of("serif"), Family::Serif);
++        assert_eq!(family_of("Monaco, Courier"), Family::Mono);
++    }
++
++    #[test]
++    fn colours() {
++        assert_eq!(parse_color("rgb(255,255,255)"), Some([255.0, 255.0, 255.0, 1.0]));
++        assert_eq!(parse_color("#0f0"), Some([0.0, 255.0, 0.0, 1.0]));
++        assert_eq!(parse_color("nonsense"), None);
++    }
++}
+diff --git a/vm-rust/src/player/net_manager.rs b/vm-rust/src/player/net_manager.rs
+index 0a4cb09..2ce9606 100644
+--- a/vm-rust/src/player/net_manager.rs
++++ b/vm-rust/src/player/net_manager.rs
+@@ -291,15 +291,9 @@ impl NetManager {
+                 // slash before the drive letter makes `fs::read` fail on Windows
+                 // while working by accident on macOS/Linux. `to_file_path` decodes
+                 // percent-escapes and yields a real platform path on all three.
+-                let result: super::net_task::NetResult = match net_task
+-                    .resolved_url
+-                    .to_file_path()
+-                    .map_err(|_| ())
+-                    .and_then(|p| std::fs::read(p).map_err(|_| ()))
+-                {
+-                    Ok(bytes) => Ok(bytes),
+-                    Err(_) => Err(-1),
+-                };
++                // PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.028): through net_task::native_read, so a
++                // name that differs in case from the file's is found as on Windows.
++                let result: super::net_task::NetResult = super::net_task::native_read(&net_task.resolved_url, true);
+                 let mut shared_state = self.shared_state.try_lock().unwrap();
+                 let final_bytes = match &result {
+                     Ok(bytes) => bytes.len() as u64,
 diff --git a/vm-rust/src/player/net_task.rs b/vm-rust/src/player/net_task.rs
-index e684a93..4c2cbc9 100644
+index e684a93..cb0442e 100644
 --- a/vm-rust/src/player/net_task.rs
 +++ b/vm-rust/src/player/net_task.rs
-@@ -85,6 +85,17 @@ pub async fn fetch_net_task(
+@@ -85,6 +85,15 @@ pub async fn fetch_net_task(
          task.id, task.url, resolved_url_str
      );
  
-+    // PS5_RUFFLE_DIRPLAYER_NATIVE: no browser to fetch with off the web. A local file is read;
-+    // anything else (a tracker, an ad server, a high-score page) fails as an unreachable host does.
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: no browser to fetch with off the web: what `native_read`
++    // finds on disk, else the request fails as an unreachable host does.
 +    #[cfg(not(target_arch = "wasm32"))]
 +    {
 +        let _ = &shared_state;
-+        return match task.resolved_url.to_file_path() {
-+            Ok(path) => std::fs::read(path).map_err(|_| -1),
-+            Err(_) => Err(-1),
-+        };
++        let is_get = matches!(task.method, HttpMethod::Get);
++        return native_read(&task.resolved_url, is_get);
 +    }
 +
      // Normal HTTP(S) fetch
      // Note: file:// URLs are handled in preload_net_thing and never reach this function
      let window = web_sys::window().unwrap();
-@@ -237,7 +248,7 @@ async fn maybe_hold_dcr_for_preloader(url: &str) {
+@@ -207,6 +216,97 @@ pub async fn fetch_net_task(
+     }
+ }
+ 
++/// PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.028): the folder web addresses are read from, as an
++/// archive's local web server serves a game's captured files — `http://host/dir/file` is
++/// `<root>/host/dir/file` (Flashpoint's game data has them so, under `content/`). None: a web
++/// address is not read at all (a tracker, an ad server, a high-score page fail as unreachable).
++#[cfg(not(target_arch = "wasm32"))]
++static WEB_ROOT: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
++
++#[cfg(not(target_arch = "wasm32"))]
++pub fn set_web_root(dir: Option<std::path::PathBuf>) {
++    if let Ok(mut r) = WEB_ROOT.lock() {
++        *r = dir;
++    }
++}
++
++/// The file a web address is under the web root: its host, then its path's parts decoded. The
++/// query is not part of it (a captured file is the same file whatever was asked of it). None
++/// without a web root, or for a part that would leave its folder.
++#[cfg(not(target_arch = "wasm32"))]
++pub fn web_root_path(url: &Url) -> Option<std::path::PathBuf> {
++    let root = WEB_ROOT.lock().ok()?.clone()?;
++    let host = url.host_str()?;
++    if host.is_empty() || host.contains(['/', '\\']) || host.starts_with('.') {
++        return None;
++    }
++    let mut path = root.join(host);
++    for seg in url.path_segments()? {
++        let part = percent_decode_str(seg).decode_utf8().ok()?;
++        if part.is_empty() {
++            continue;
++        }
++        if part == "." || part == ".." || part.contains(['/', '\\', '\0']) {
++            return None;
++        }
++        path.push(part.as_ref());
++    }
++    Some(path)
++}
++
++/// A request read off disk: a file address as its file; a web address (GET only) as its file
++/// under the web root. A name not there as written is looked for ignoring case, as the Windows
++/// file systems and servers these movies were made on and served from found it.
++#[cfg(not(target_arch = "wasm32"))]
++pub fn native_read(url: &Url, is_get: bool) -> NetResult {
++    let path = match url.scheme() {
++        "file" => url.to_file_path().ok(),
++        "http" | "https" if is_get => web_root_path(url),
++        _ => None,
++    };
++    let Some(path) = path else {
++        return Err(-1);
++    };
++    match std::fs::read(&path) {
++        Ok(bytes) => Ok(bytes),
++        Err(_) => match find_ignoring_case(&path) {
++            Some(found) if found.is_file() => {
++                log::info!("{} read as {}", path.display(), found.display());
++                std::fs::read(found).map_err(|_| -1)
++            }
++            _ => Err(-1),
++        },
++    }
++}
++
++/// PS5_RUFFLE_DIRPLAYER_NATIVE: `path` as a case-blind file system finds it: from the deepest
++/// part that is there as written, each further part matched ignoring case in its folder.
++#[cfg(not(target_arch = "wasm32"))]
++pub fn find_ignoring_case(path: &std::path::Path) -> Option<std::path::PathBuf> {
++    use std::path::{Component, PathBuf};
++    if path.exists() {
++        return Some(path.to_path_buf());
++    }
++    let mut cur = PathBuf::new();
++    for comp in path.components() {
++        match comp {
++            Component::Normal(name) => {
++                let exact = cur.join(name);
++                if exact.exists() {
++                    cur = exact;
++                    continue;
++                }
++                let want = name.to_string_lossy().to_lowercase();
++                let dir = if cur.as_os_str().is_empty() { PathBuf::from(".") } else { cur.clone() };
++                let found = std::fs::read_dir(&dir).ok()?.filter_map(|e| e.ok()).find(|e| e.file_name().to_string_lossy().to_lowercase() == want)?;
++                cur = cur.join(found.file_name());
++            }
++            other => cur.push(other.as_os_str()),
++        }
++    }
++    cur.exists().then_some(cur)
++}
++
+ /// Neopets DGS shows a Flash preloader whose guest-login prompt is only
+ /// (re)painted while the nested game `.dcr` is still streaming — the Director
+ /// loader sits at load-state 34 calling the SWF's `showLoadingProcess` each
+@@ -237,7 +337,7 @@ async fn maybe_hold_dcr_for_preloader(url: &str) {
      if !crate::player::is_flash_loading().unwrap_or(false) {
          return;
      }
@@ -2207,10 +4848,45 @@ index e684a93..4c2cbc9 100644
          std::future::pending::<()>(),
      )
 diff --git a/vm-rust/src/player/score.rs b/vm-rust/src/player/score.rs
-index 25330f7..1513d64 100644
+index 25330f7..5d049f5 100644
 --- a/vm-rust/src/player/score.rs
 +++ b/vm-rust/src/player/score.rs
-@@ -398,7 +398,7 @@ impl Score {
+@@ -41,6 +41,7 @@ use super::{
+ // collide with stock Ruffle if both are loaded on the same page (e.g. via a
+ // browser extension). Matching JS-side definitions live in
+ // src/services/flashPlayerManager.ts::initFlashBridge.
++#[cfg(target_arch = "wasm32")]
+ #[wasm_bindgen]
+ extern "C" {
+     // All sprite-method Flash bridge calls now key by sprite_num — each
+@@ -67,6 +68,26 @@ extern "C" {
+     #[wasm_bindgen(js_name = "dirplayer_ruffleHitTest")]
+     fn ruffle_hit_test(sprite_num: i32, x: f64, y: f64) -> i32;
+ }
++// PS5_RUFFLE_DIRPLAYER_NATIVE: off the web no Ruffle instance stands behind a Flash member (the
++// web front end runs one per Flash sprite): its sprite is not playing, has no frames, hits nothing.
++#[cfg(not(target_arch = "wasm32"))]
++fn ruffle_is_playing(_sprite_num: i32) -> bool {
++    false
++}
++#[cfg(not(target_arch = "wasm32"))]
++fn ruffle_get_frame_count(_sprite_num: i32) -> i32 {
++    0
++}
++#[cfg(not(target_arch = "wasm32"))]
++fn ruffle_get_current_frame(_sprite_num: i32) -> i32 {
++    0
++}
++#[cfg(not(target_arch = "wasm32"))]
++fn ruffle_goto_frame_and_stop(_sprite_num: i32, _frame_or_label: &str) {}
++#[cfg(not(target_arch = "wasm32"))]
++fn ruffle_hit_test(_sprite_num: i32, _x: f64, _y: f64) -> i32 {
++    0
++}
+ 
+ #[derive(Clone, Debug)]
+ pub enum ScoreRef {
+@@ -398,7 +419,7 @@ impl Score {
                  Ok(result) => result,
  
                  Err(e) => {
@@ -2219,7 +4895,7 @@ index 25330f7..1513d64 100644
                          &format!("Failed to create script instance: {}", e.message).into(),
                      );
                      return None;
-@@ -1162,7 +1162,7 @@ impl Score {
+@@ -1162,7 +1183,7 @@ impl Score {
                      }
  
                      _ => {
@@ -2228,7 +4904,7 @@ index 25330f7..1513d64 100644
                              "Unexpected color flag: {}",
                              data.color_flag
                          )));
-@@ -2435,7 +2435,7 @@ impl Score {
+@@ -2435,7 +2456,7 @@ impl Score {
                      match player.get_datum(&datum_ref) {
                          Datum::ScriptInstanceRef(inst) => inst.clone(),
                          _ => {
@@ -2237,7 +4913,7 @@ index 25330f7..1513d64 100644
                              panic!("Expected ScriptInstanceRef");
                          }
                      }
-@@ -2763,7 +2763,7 @@ impl Score {
+@@ -2763,7 +2784,7 @@ impl Score {
                  }
  
                  _ => {
@@ -2246,7 +4922,7 @@ index 25330f7..1513d64 100644
                          "Unexpected color flag: {}",
                          data.color_flag
                      )));
-@@ -4176,6 +4176,16 @@ fn resolve_sprite_member_assignment(
+@@ -4176,6 +4197,16 @@ fn resolve_sprite_member_assignment(
                      let (l, t, r, b) = flash.effective_rect();
                      Some(((r - l) as i32, (b - t) as i32))
                  }
@@ -2276,6 +4952,152 @@ index 7096c71..8e9ad80 100644
  }
  
  // --- Snapshot comparison utilities ---
+diff --git a/vm-rust/src/player/xtra/budapi/mod.rs b/vm-rust/src/player/xtra/budapi/mod.rs
+index 665a7d0..7fe238d 100644
+--- a/vm-rust/src/player/xtra/budapi/mod.rs
++++ b/vm-rust/src/player/xtra/budapi/mod.rs
+@@ -215,6 +215,8 @@ fn ba_cpu_info(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+         "vendor" => "WebAssembly",
+         "name" => "WASM Virtual CPU",
+         "speed" => "0",
++        // PS5_RUFFLE_DIRPLAYER_NATIVE: "" off the web too (what the web arm gives)
++        #[cfg(target_arch = "wasm32")]
+         "cores" => web_sys::window()
+             .and_then(|w| w.navigator().hardware_concurrency().to_string().into())
+             .map(|_| "")
+@@ -226,6 +228,17 @@ fn ba_cpu_info(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+ 
+ fn ba_screen_info(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+     let kind = string_arg(args, 0)?;
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: the console's screen, 1920 x 1080 (what a browser reports for
++    // a 1080p or 4K television), in millions of colours.
++    #[cfg(not(target_arch = "wasm32"))]
++    if true {
++        return ok_int(match kind.to_ascii_lowercase().as_str() {
++            "width" => 1920,
++            "height" => 1080,
++            "depth" | "colordepth" | "pixeldepth" => 24,
++            _ => 0,
++        });
++    }
+     let screen = web_sys::window().and_then(|w| w.screen().ok());
+     let result = match kind.to_ascii_lowercase().as_str() {
+         "width" => screen.as_ref().and_then(|s| s.width().ok()).unwrap_or(0),
+@@ -242,6 +255,12 @@ fn ba_font_installed(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+     if name.is_empty() {
+         return ok_int(0);
+     }
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: off the web the fonts are native_text's, which draw the
++    // families they have the metrics of (Arial, Times New Roman, Courier New and their kin).
++    #[cfg(not(target_arch = "wasm32"))]
++    if true {
++        return ok_int(if crate::player::native_text::has_font(&name) { 1 } else { 0 });
++    }
+     // Canvas-based font detection: measure a probe string twice using two
+     // distinct fallback families plus the candidate. If both widths still
+     // match the fallbacks, the candidate isn't actually installed.
+@@ -311,6 +330,12 @@ use wasm_bindgen::JsCast;
+ 
+ fn ba_open_url(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+     let target = string_arg(args, 0)?;
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: no browser to open it in; the host tells the player
++    #[cfg(not(target_arch = "wasm32"))]
++    if true {
++        crate::player::native::notice(format!("baOpenURL {target:?}: the movie opens a web page or program; there is none here"));
++        return ok_int(0);
++    }
+     let ok = match web_sys::window() {
+         Some(w) => w.open_with_url_and_target(&target, "_blank").is_ok(),
+         None => false,
+@@ -326,15 +351,30 @@ fn ba_msg_box(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+     } else {
+         format!("{}\n\n{}", caption, message)
+     };
++    #[cfg(target_arch = "wasm32")]
+     if let Some(window) = web_sys::window() {
+         let _ = window.alert_with_message(&text);
+     }
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: no alert() off the web; the host shows the text
++    #[cfg(not(target_arch = "wasm32"))]
++    crate::player::native::notice(text.replace("\n\n", ": "));
+     ok_int(1)
+ }
+ 
++/// PS5_RUFFLE_DIRPLAYER_NATIVE: baCopyText / baPasteText's clipboard off the web: the movie's own.
++#[cfg(not(target_arch = "wasm32"))]
++static NATIVE_CLIPBOARD: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
++
+ fn ba_copy_text(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+     let text = string_arg(args, 0)?;
+     let _ = text;
++    #[cfg(not(target_arch = "wasm32"))]
++    if true {
++        if let Ok(mut c) = NATIVE_CLIPBOARD.lock() {
++            *c = text;
++        }
++        return ok_int(1);
++    }
+     // navigator.clipboard.writeText is async and requires a user gesture.
+     // Lingo expects a sync return — we kick off the write and return success
+     // optimistically.
+@@ -353,6 +393,10 @@ fn ba_paste_text() -> Result<DatumRef, ScriptError> {
+     // expect an immediate string. We return whatever was cached in the
+     // dirplayer-rs paste buffer (kept in localStorage by `baCopyText`-style
+     // writes from earlier sessions), or empty.
++    #[cfg(not(target_arch = "wasm32"))]
++    if true {
++        return ok_string(&NATIVE_CLIPBOARD.lock().map(|c| c.clone()).unwrap_or_default());
++    }
+     let cached = web_sys::window()
+         .and_then(|w| w.local_storage().ok().flatten())
+         .and_then(|s| s.get_item("dirplayer_budapi_clipboard").ok().flatten())
+@@ -362,6 +406,15 @@ fn ba_paste_text() -> Result<DatumRef, ScriptError> {
+ 
+ fn ba_environment(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+     let name = string_arg(args, 0)?;
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: English, as the movie's environment says (uiLanguage), and
++    // no browser user agent
++    #[cfg(not(target_arch = "wasm32"))]
++    if true {
++        return ok_string(match name.to_ascii_uppercase().as_str() {
++            "USERLANGUAGE" | "LANG" => "en-US",
++            _ => "",
++        });
++    }
+     let value = match name.to_ascii_uppercase().as_str() {
+         "USERLANGUAGE" | "LANG" => web_sys::window()
+             .map(|w| w.navigator().language().unwrap_or_default())
+@@ -379,6 +432,12 @@ fn ba_sleep(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+     // callers get the time delay they asked for (without making the page
+     // unresponsive — we cap at 500ms to avoid runaway scripts).
+     let ms = int_arg_or(args, 0, 0)?.clamp(0, 500) as f64;
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: a thread can sleep off the web
++    #[cfg(not(target_arch = "wasm32"))]
++    if true {
++        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
++        return ok_int(0);
++    }
+     if let Some(perf) = web_sys::window().and_then(|w| w.performance()) {
+         let end = perf.now() + ms;
+         while perf.now() < end {
+diff --git a/vm-rust/src/player/xtra/curl/mod.rs b/vm-rust/src/player/xtra/curl/mod.rs
+index 5f91f6a..67589dc 100644
+--- a/vm-rust/src/player/xtra/curl/mod.rs
++++ b/vm-rust/src/player/xtra/curl/mod.rs
+@@ -478,6 +478,13 @@ async fn perform_fetch(instance: &CurlInstance) -> (i32, Vec<u8>, String) {
+     if instance.url.is_empty() {
+         return (-CURLE_URL_MALFORMAT, Vec::new(), String::new());
+     }
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: requests go through the browser's fetch; off the web the
++    // request cannot connect.
++    #[cfg(not(target_arch = "wasm32"))]
++    if true {
++        log::warn!("Curl Xtra: {} {}: no network connection here", instance.effective_method(), instance.url);
++        return (-CURLE_COULDNT_CONNECT, Vec::new(), String::new());
++    }
+     let window = match web_sys::window() {
+         Some(w) => w,
+         None => return (-CURLE_FAILED_INIT, Vec::new(), String::new()),
 diff --git a/vm-rust/src/player/xtra/external.rs b/vm-rust/src/player/xtra/external.rs
 index 0011447..03ae620 100644
 --- a/vm-rust/src/player/xtra/external.rs
@@ -2290,7 +5112,7 @@ index 0011447..03ae620 100644
                  log::info!("[xtra] {}", msg);
              }
 diff --git a/vm-rust/src/player/xtra/multiuser/mod.rs b/vm-rust/src/player/xtra/multiuser/mod.rs
-index 9bc0ebe..2bb05ba 100644
+index 9bc0ebe..a22abef 100644
 --- a/vm-rust/src/player/xtra/multiuser/mod.rs
 +++ b/vm-rust/src/player/xtra/multiuser/mod.rs
 @@ -4,7 +4,8 @@ pub mod reader;
@@ -2312,8 +5134,48 @@ index 9bc0ebe..2bb05ba 100644
      };
  }
  
+@@ -220,6 +221,22 @@ impl MultiuserXtraManager {
+                     }
+                 })?;
+ 
++                // PS5_RUFFLE_DIRPLAYER_NATIVE: no WebSocket off the web. The movie hears the
++                // connection fail, as it does when a socket cannot be made (below).
++                #[cfg(not(target_arch = "wasm32"))]
++                if true {
++                    multiuser_log!("Multiuser: no network connection here ({}:{}, user={}, movie={}, mode={}, key {} chars)", host, port, username, movie_id, mode, encryption_key.len());
++                    let _ = &password;
++                    instance.dispatch_message(MultiuserMessage {
++                        error_code: -1,
++                        recipients: vec![],
++                        sender_id: "System".to_string(),
++                        subject: "ConnectToNetServer".to_string(),
++                        content: StaticDatum::String(format!("no network connection to {}:{} here", host, port)),
++                        time_stamp: 0,
++                    });
++                    return Ok(DatumRef::Void);
++                }
+                 let window_secure = web_sys::window()
+                     .and_then(|w| w.location().protocol().ok())
+                     .map_or(false, |p| p == "https:");
+diff --git a/vm-rust/src/player/xtra/openurl/mod.rs b/vm-rust/src/player/xtra/openurl/mod.rs
+index a3b62df..aa67b4d 100644
+--- a/vm-rust/src/player/xtra/openurl/mod.rs
++++ b/vm-rust/src/player/xtra/openurl/mod.rs
+@@ -46,6 +46,12 @@ fn gs_open_url(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+ }
+ 
+ fn open_url_in_browser(url: &str) -> bool {
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: no browser to open it in; the host tells the player
++    #[cfg(not(target_arch = "wasm32"))]
++    if true {
++        crate::player::native::notice(format!("gsOpenURL {url:?}: the movie opens a web page; there is no browser here"));
++        return false;
++    }
+     match web_sys::window() {
+         Some(window) => window.open_with_url_and_target(url, "_blank").is_ok(),
+         None => false,
 diff --git a/vm-rust/src/player/xtra/sysmenu/mod.rs b/vm-rust/src/player/xtra/sysmenu/mod.rs
-index cfef474..2435607 100644
+index cfef474..a278110 100644
 --- a/vm-rust/src/player/xtra/sysmenu/mod.rs
 +++ b/vm-rust/src/player/xtra/sysmenu/mod.rs
 @@ -224,7 +224,7 @@ fn use_dark_mode(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
@@ -2325,6 +5187,20 @@ index cfef474..2435607 100644
      ok_int(1)
  }
  
+@@ -241,9 +241,13 @@ fn message_box(args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+     } else {
+         format!("{}\n\n{}", caption, message)
+     };
++    #[cfg(target_arch = "wasm32")]
+     if let Some(window) = web_sys::window() {
+         let _ = window.alert_with_message(&text);
+     }
++    // PS5_RUFFLE_DIRPLAYER_NATIVE: no alert() off the web; the host shows the text
++    #[cfg(not(target_arch = "wasm32"))]
++    crate::player::native::notice(text.replace("\n\n", ": "));
+     // Windows MB_OK returns IDOK = 1.
+     ok_int(1)
+ }
 diff --git a/vm-rust/src/rendering.rs b/vm-rust/src/rendering.rs
 index 0a7e9d6..141640e 100644
 --- a/vm-rust/src/rendering.rs

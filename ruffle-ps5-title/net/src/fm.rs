@@ -2,13 +2,23 @@
 //! list them. A WordPress site, read as a browser reads it:
 //!   * the list: `/games/`, `/games/page/N/`; a search: `/?s=words` (`/page/N/?s=words`) — cards
 //!     whose links are `/game/<slug>/` or `/animation/<slug>/`, with the title and a picture;
-//!   * an item's page links its player, `https://player.flashmuseum.net/game/<slug>/`;
-//!   * the player page names the movie it plays (a .swf address), fetched with the player page as
-//!     Referer, as the browser would.
-//! Facts so far (2026-10-24, from the pages as fetched): the list's pagination, the item and player
-//! links, pictures as .webp under /wp-content/uploads/images/. How the player page names its movie
-//! has not been seen yet; any .swf address in it is taken, and the log says what was found.
+//!   * an item's page holds the player's settings, `var FM = {...}` (script
+//!     `fm-frame-host-js-extra`): gameUUID, playerURL, rootURL, fileName, launchCommand, gameType,
+//!     title, image; and embeds the player, `<iframe src="https://player.flashmuseum.net/game/<slug>/">`;
+//!   * the player page has the same settings as `window.FM_FRAME_PAGE = {..., "config": {...}}`.
+//!
+//! How the player plays a game — its own main.js (v3.5.0, flashmuseum.net/wp-content/themes/
+//! FlashMuseum/inc/flashplayer/main.js, as fetched 2026-10-25 UTC): it downloads
+//! `joinRootURL(fileName)` = rootURL without trailing '/', '/', fileName without leading '/'
+//! (rootURL was https://games.flashmuseum.net for every game seen). For gameType "GameZip" that is
+//! a .zip whose `content/<host>/<path>` entries are the movie (at launchCommand) and its files;
+//! anything else is a plain .swf, which Ruffle is told to load from launchCommand (the movie's old
+//! home, or http://localflash/<file>) with `base` its folder; requests the movie makes to that
+//! host go to rootURL + their path. Ruffle5 fetches plain movies; GameZip ones are refused, by
+//! name, until one has been seen.
 // SPDX-License-Identifier: GPL-3.0-or-later
+
+use serde_json::Value;
 
 use crate::http::{Client, Error, Request};
 use crate::source::{clip, decode_entities, html_text, search_words, Files, Item, Page, RemoteFile};
@@ -178,9 +188,113 @@ pub fn search(client: &Client, words: &str, page: u32) -> Result<Page, Error> {
     Ok(parse_list(&r.text(), page))
 }
 
-/// What an item's page says: its player's address, its picture, who made it.
+/// The player's settings for one item, as the site gives them to its player.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlayerConfig {
+    pub root_url: String,
+    pub file_name: String,
+    /// Where the movie is played as if it were (its old home, or http://localflash/<file>).
+    pub launch_command: String,
+    /// "Legacy" (a plain .swf) or "GameZip" (a .zip of the movie and its files).
+    pub game_type: String,
+    pub title: String,
+    pub image: String,
+    /// The item page's settings only: the player's page.
+    pub player_url: Option<String>,
+}
+
+impl PlayerConfig {
+    /// main.js `joinRootURL(fileName)`.
+    pub fn movie_url(&self) -> String {
+        format!("{}/{}", self.root_url.trim_end_matches('/'), self.file_name.trim_start_matches('/'))
+    }
+
+    pub fn is_zip(&self) -> bool {
+        self.game_type == "GameZip"
+    }
+
+    /// From the settings object: frame-runtime.js wants each value a string, or false for none.
+    fn from_json(v: &Value) -> Option<PlayerConfig> {
+        let s = |k: &str| match v.get(k) {
+            Some(Value::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        let c = PlayerConfig {
+            root_url: s("rootURL"),
+            file_name: s("fileName"),
+            launch_command: s("launchCommand"),
+            game_type: s("gameType"),
+            title: s("title"),
+            image: s("image"),
+            player_url: Some(s("playerURL")).filter(|p| !p.is_empty()),
+        };
+        (!c.root_url.is_empty() && !c.file_name.is_empty()).then_some(c)
+    }
+}
+
+/// Where `name = ` is assigned in a script (`var FM = {`, `window.FM_FRAME_PAGE = {`): just after
+/// the `=`. `name` must stand alone (not the end of a longer name, not followed by more of one).
+fn assignment(text: &str, name: &str) -> Option<usize> {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    let mut from = 0;
+    while let Some(i) = text[from..].find(name) {
+        let at = from + i;
+        from = at + name.len();
+        if text[..at].chars().next_back().is_some_and(ident) {
+            continue;
+        }
+        let rest = &text[at + name.len()..];
+        let trimmed = rest.trim_start();
+        if trimmed.starts_with('=') && !trimmed.starts_with("==") {
+            return Some(text.len() - trimmed.len() + 1);
+        }
+    }
+    None
+}
+
+/// The JSON object assigned to `name` in a page's script.
+fn json_assigned(html: &str, name: &str) -> Option<Value> {
+    let at = assignment(html, name)?;
+    let start = at + html[at..].find(|c: char| !c.is_whitespace())?;
+    if !html[start..].starts_with('{') {
+        return None;
+    }
+    let (mut depth, mut in_str, mut esc) = (0u32, false, false);
+    for (i, b) in html.as_bytes()[start..].iter().enumerate() {
+        if in_str {
+            match b {
+                _ if esc => esc = false,
+                b'\\' => esc = true,
+                b'"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return serde_json::from_str(&html[start..start + i + 1]).ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The player page's settings (`window.FM_FRAME_PAGE.config`).
+pub fn parse_player_page(html: &str) -> Option<PlayerConfig> {
+    let page = json_assigned(html, "FM_FRAME_PAGE")?;
+    PlayerConfig::from_json(page.get("config")?)
+}
+
+/// What an item's page says: the player's settings, its player's address, its picture and title.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ItemPage {
+    pub config: Option<PlayerConfig>,
     pub player: Option<String>,
     pub picture: Option<String>,
     pub title: Option<String>,
@@ -188,20 +302,20 @@ pub struct ItemPage {
 
 pub fn parse_item_page(html: &str) -> ItemPage {
     let lower = html.to_ascii_lowercase();
-    let mut out = ItemPage::default();
-    // the first link to the player
+    let mut out = ItemPage { config: json_assigned(html, "FM").as_ref().and_then(PlayerConfig::from_json), ..ItemPage::default() };
+    // the player: the settings' playerURL, else the first link to it or frame of it
+    out.player = out.config.as_ref().and_then(|c| c.player_url.clone());
     let mut at = 0;
-    while let Some(i) = lower[at..].find("href=") {
+    while out.player.is_none() {
+        let Some(i) = lower[at..].find("player.flashmuseum.net/") else {
+            break;
+        };
         let s = at + i;
-        at = s + 5;
+        at = s + 1;
         let tag_start = lower[..s].rfind('<').unwrap_or(0);
         let tag_end = lower[s..].find('>').map(|e| s + e).unwrap_or(html.len());
-        if let Some(h) = attr(&html[tag_start..tag_end], "href") {
-            if h.contains("player.flashmuseum.net/") {
-                out.player = Some(h);
-                break;
-            }
-        }
+        let tag = &html[tag_start..tag_end];
+        out.player = attr(tag, "src").or_else(|| attr(tag, "href")).filter(|h| h.contains("player.flashmuseum.net/"));
     }
     // og:image, og:title
     let mut at = 0;
@@ -219,72 +333,76 @@ pub fn parse_item_page(html: &str) -> ItemPage {
     out
 }
 
-/// Every .swf address in a page (script text included: JSON's "\/" is read as "/").
-pub fn swf_addresses(html: &str, base: &Url) -> Vec<String> {
-    let text = html.replace("\\/", "/").replace("&amp;", "&");
-    let lower = text.to_ascii_lowercase();
-    let stop = |c: char| c.is_ascii_whitespace() || "\"'`()<>,;[]{}".contains(c);
-    let mut found: Vec<String> = Vec::new();
-    let mut at = 0;
-    while let Some(i) = lower[at..].find(".swf") {
-        let dot = at + i;
-        at = dot + 4;
-        // the address ends at the .swf, or after its query
-        let mut end = dot + 4;
-        if let Some(c) = text[end..].chars().next() {
-            if c.is_alphanumeric() {
-                continue; // ".swfobject", ".swft"...
-            }
-            if c == '?' {
-                end += text[end..].find(stop).unwrap_or(text.len() - end);
-            }
-        }
-        let begin = text[..dot].rfind(stop).map(|b| b + 1).unwrap_or(0);
-        let mut raw = &text[begin..end];
-        // an unquoted attribute (src=movie.swf): its name is not part of the address
-        if let Some(eq) = raw.find('=') {
-            if raw[..eq].bytes().all(|b| b.is_ascii_alphabetic() || b == b'-') {
-                raw = &raw[eq + 1..];
-            }
-        }
-        if raw.len() <= 4 || raw.contains("swfobject") {
-            continue;
-        }
-        if let Ok(u) = base.join(raw) {
-            let s = u.to_string();
-            if !found.contains(&s) {
-                found.push(s);
-            }
-        }
-    }
-    found
+/// The player page of an item: the one its page names, else the address every item seen had.
+pub fn player_url(item: &Item, named: Option<&str>) -> String {
+    let kind = if item.kind.as_deref() == Some("Animation") { "animation" } else { "game" };
+    named.map(str::to_string).unwrap_or_else(|| format!("https://player.flashmuseum.net/{kind}/{}/", item.id))
 }
 
-pub fn files(client: &Client, item: &Item) -> Result<Files, Error> {
+/// `https://host/` of an address: what a browser sends as Referer from that page to another site
+/// (its default policy, strict-origin-when-cross-origin; the player page sets no other).
+fn origin(url: &str) -> Option<String> {
+    let u = Url::parse(url).ok()?;
+    Some(format!("{}://{}/", if u.https { "https" } else { "http" }, u.host_header()))
+}
+
+/// The player's settings for an item: from its page, else from its player page.
+pub fn player_config(client: &Client, item: &Item) -> Result<(PlayerConfig, &'static str), Error> {
     let mut req = Request::new(&item.page);
     req.accept = "text/html";
     let page = client.get_ok(&req)?;
-    let info = parse_item_page(&page.text());
-    let kind = if item.kind.as_deref() == Some("Animation") { "animation" } else { "game" };
-    let (player, note) = match info.player {
-        Some(p) => (p, "the player its page links"),
-        None => (format!("https://player.flashmuseum.net/{kind}/{}/", item.id), "its page links no player: the player's usual address"),
-    };
+    let html = page.text();
+    let info = parse_item_page(&html);
+    if let Some(c) = info.config {
+        return Ok((c, "its page"));
+    }
+    let player = player_url(item, info.player.as_deref());
     let mut req = Request::new(&player);
     req.accept = "text/html";
     req.referer = Some(&item.page);
     let pr = client.get_ok(&req)?;
-    let base = Url::parse(&pr.url).map_err(Error::Other)?;
-    let html = pr.text();
-    let swfs = swf_addresses(&html, &base);
-    log::info!(target: "net", "flashmuseum {}: {note} {}: {} .swf address(es){}", item.id, pr.url, swfs.len(), if swfs.is_empty() { String::new() } else { format!(": {}", swfs.join(" ")) });
-    let Some(main) = swfs.first().cloned() else {
-        // what the page has about movies, for the log
-        let hint: Vec<String> = html.lines().filter(|l| l.to_ascii_lowercase().contains("swf") || l.contains("ruffle")).take(3).map(|l| clip(l.trim(), 160)).collect();
-        return Err(Error::Other(format!("Flash Museum {}: no .swf address in its player page {}{}", item.id, pr.url, if hint.is_empty() { String::new() } else { format!(" (lines: {})", hint.join(" | ")) })));
-    };
-    let name = main.split('?').next().unwrap_or(&main).rsplit('/').next().map(crate::url::decode_percent).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("{}.swf", item.id));
-    Ok(Files { main: RemoteFile { name, url: main, size: None }, extra: Vec::new(), referer: Some(pr.url.clone()), note: format!("the first of {} .swf address(es) in its player page", swfs.len()) })
+    let text = pr.text();
+    match parse_player_page(&text) {
+        Some(mut c) => {
+            c.player_url.get_or_insert(pr.url.clone());
+            Ok((c, "its player page"))
+        }
+        None => {
+            let hint: Vec<String> = text.lines().chain(html.lines()).filter(|l| l.contains("rootURL") || l.contains("FM_FRAME_PAGE") || l.contains("var FM")).take(2).map(|l| clip(l.trim(), 160)).collect();
+            Err(Error::Other(format!(
+                "Flash Museum {}: neither its page nor its player page {} has the player's settings{}",
+                item.id,
+                pr.url,
+                if hint.is_empty() { String::new() } else { format!(" (lines: {})", hint.join(" | ")) }
+            )))
+        }
+    }
+}
+
+/// What the player fetches for a game, from its settings: the movie, for a plain one.
+pub fn files_for(item: &Item, c: &PlayerConfig, from: &str) -> Result<Files, Error> {
+    if c.is_zip() {
+        return Err(Error::Other(format!("Flash Museum {}: this game is a GameZip (a .zip of the movie and the files it loads); Ruffle5 does not fetch those yet", item.id)));
+    }
+    let url = c.movie_url();
+    let name = crate::url::decode_percent(c.file_name.rsplit('/').next().unwrap_or(&c.file_name));
+    let name = if name.is_empty() { format!("{}.swf", item.id) } else { name };
+    Ok(Files {
+        main: RemoteFile { name, url, size: None },
+        extra: Vec::new(),
+        referer: c.player_url.as_deref().and_then(origin),
+        note: format!("{from}: rootURL + fileName, as the site's player fetches it (gameType {:?})", c.game_type),
+        address: Some(c.launch_command.clone()).filter(|a| a.starts_with("http://") || a.starts_with("https://")),
+        archive: None,
+        launch: None,
+        beside: None,
+    })
+}
+
+pub fn files(client: &Client, item: &Item) -> Result<Files, Error> {
+    let (c, from) = player_config(client, item)?;
+    log::info!(target: "net", "flashmuseum {}: settings from {from}: gameType {:?}, rootURL {}, fileName {}, launchCommand {}", item.id, c.game_type, c.root_url, c.file_name, c.launch_command);
+    files_for(item, &c, from)
 }
 
 #[cfg(test)]
@@ -319,27 +437,61 @@ mod tests {
         assert!(!parse_list(html, 9110).more);
     }
 
+    fn insectonator() -> Item {
+        Item { id: "insectonator-mt5".into(), title: "Insectonator".into(), kind: Some("Game".into()), page: "https://flashmuseum.net/game/insectonator-mt5/".into(), ..Item::default() }
+    }
+
+    // The parts of the pages that matter, as the online check saved them on 2026-10-24.
+    const ITEM_PAGE: &str = r#"<meta property="og:title" content="Insectonator - Play Online on Flash Museum &#x1F579;&#xFE0F;" /><meta property="og:image" content="https://flashmuseum.net/wp-content/uploads/images/game-logo/i/insectonator-logo-mt5.webp" />
+<div class="gb-element-660c0b40 game-player"><iframe class="fm-player-frame" title="Game player" src="https://player.flashmuseum.net/game/insectonator-mt5/" allow="fullscreen; autoplay" allowfullscreen></iframe></div>
+<script id="fm-frame-host-js-extra">
+var FM = {"gameUUID":"f25e7cdc-923f-4a5a-a221-7c28e94f76af","playerURL":"https://player.flashmuseum.net/game/insectonator-mt5/","rootURL":"https://games.flashmuseum.net","fileName":"f25e7cdc-923f-4a5a-a221-7c28e94f76af.swf","launchCommand":"http://localflash/f25e7cdc-923f-4a5a-a221-7c28e94f76af.swf","gameType":"Legacy","title":"Insectonator","image":"https://flashmuseum.net/wp-content/uploads/images/game-logo/i/insectonator-logo-mt5.webp"};
+//# sourceURL=fm-frame-host-js-extra
+</script>"#;
+    const PLAYER_PAGE: &str = r#"<script>
+window.FM_FRAME_PAGE = {"identifier":"game\/square-face-icon-generator-g0x","siteOrigin":"https:\/\/flashmuseum.net","config":{"rootURL":"https:\/\/games.flashmuseum.net","fileName":"dc4e1306-b10f-4150-a830-e5f8fa8dc60e.swf","launchCommand":"http:\/\/www.icongenerators.net\/flash\/dc4e1306-b10f-4150-a830-e5f8fa8dc60e.swf","gameType":"Legacy","title":"Square Face Icon Generator","image":false},"assets":{"ruffle":"https:\/\/cdn.jsdelivr.net\/npm\/@ruffle-rs\/ruffle@0.4.1\/ruffle.js"},"earlyPlay":true};
+window.RufflePlayer = { config: { openUrlMode: 'deny' } };
+if (window === window.top) window.location.replace(window.FM_FRAME_PAGE.redirect);
+</script>"#;
+
     #[test]
-    fn reads_an_item_page_and_a_player_page() {
-        let html = r#"<meta property="og:title" content="Insectonator - Play Online on Flash Museum &#x1F579;&#xFE0F;" /><meta property="og:image" content="https://flashmuseum.net/wp-content/uploads/images/game-logo/i/insectonator-logo-mt5.webp" />
-            <a class="play" href="https://player.flashmuseum.net/game/insectonator-mt5/">Play</a>"#;
-        let p = parse_item_page(html);
-        assert_eq!(p.player.as_deref(), Some("https://player.flashmuseum.net/game/insectonator-mt5/"));
+    fn reads_the_players_settings_from_an_item_page() {
+        let p = parse_item_page(ITEM_PAGE);
         assert_eq!(p.title.as_deref(), Some("Insectonator"));
         assert_eq!(p.picture.as_deref(), Some("https://flashmuseum.net/wp-content/uploads/images/game-logo/i/insectonator-logo-mt5.webp"));
-        let base = Url::parse("https://player.flashmuseum.net/game/insectonator-mt5/").unwrap();
-        let player = r#"<script src="https://unpkg.com/@ruffle-rs/ruffle"></script><script src="/js/swfobject.js"></script>
-            <script>var cfg = {"url":"https:\/\/files.example.net\/games\/insectonator.swf?v=2","w":550};
-            player.load("/files/other.SWF"); var dup = 'https://files.example.net/games/insectonator.swf?v=2';</script>
-            <embed src="local.swf">"#;
-        assert_eq!(
-            swf_addresses(player, &base),
-            vec![
-                "https://files.example.net/games/insectonator.swf?v=2".to_string(),
-                "https://player.flashmuseum.net/files/other.SWF".to_string(),
-                "https://player.flashmuseum.net/game/insectonator-mt5/local.swf".to_string()
-            ]
-        );
+        assert_eq!(p.player.as_deref(), Some("https://player.flashmuseum.net/game/insectonator-mt5/"));
+        let c = p.config.expect("the settings");
+        assert_eq!((c.root_url.as_str(), c.file_name.as_str(), c.game_type.as_str()), ("https://games.flashmuseum.net", "f25e7cdc-923f-4a5a-a221-7c28e94f76af.swf", "Legacy"));
+        assert_eq!(c.movie_url(), "https://games.flashmuseum.net/f25e7cdc-923f-4a5a-a221-7c28e94f76af.swf");
+        let f = files_for(&insectonator(), &c, "its page").unwrap();
+        assert_eq!(f.main.url, "https://games.flashmuseum.net/f25e7cdc-923f-4a5a-a221-7c28e94f76af.swf");
+        assert_eq!(f.main.name, "f25e7cdc-923f-4a5a-a221-7c28e94f76af.swf");
+        assert_eq!(f.referer.as_deref(), Some("https://player.flashmuseum.net/"));
+        assert_eq!(f.address.as_deref(), Some("http://localflash/f25e7cdc-923f-4a5a-a221-7c28e94f76af.swf"));
+        // without the settings: the frame's address
+        let p = parse_item_page(&ITEM_PAGE.replace("var FM = ", "var FM2 = "));
+        assert_eq!((p.config, p.player.as_deref()), (None, Some("https://player.flashmuseum.net/game/insectonator-mt5/")));
+    }
+
+    #[test]
+    fn reads_the_players_settings_from_a_player_page() {
+        let c = parse_player_page(PLAYER_PAGE).expect("the settings");
+        assert_eq!(c.movie_url(), "https://games.flashmuseum.net/dc4e1306-b10f-4150-a830-e5f8fa8dc60e.swf");
+        assert_eq!(c.launch_command, "http://www.icongenerators.net/flash/dc4e1306-b10f-4150-a830-e5f8fa8dc60e.swf");
+        assert_eq!((c.image.as_str(), c.player_url.as_deref()), ("", None), "false is no value");
+        assert_eq!(parse_player_page("<script>window.FM_FRAME_PAGE == {}</script>"), None);
+    }
+
+    #[test]
+    fn join_root_url_and_game_zips() {
+        let mut c = PlayerConfig { root_url: "https://games.example.net//".into(), file_name: "//a/b c.swf".into(), game_type: "Legacy".into(), ..PlayerConfig::default() };
+        assert_eq!(c.movie_url(), "https://games.example.net/a/b c.swf");
+        c.game_type = "GameZip".into();
+        let e = files_for(&insectonator(), &c, "its page").unwrap_err().to_string();
+        assert!(e.contains("GameZip"), "{e}");
+        // braces and quotes inside strings do not end the object
+        assert_eq!(json_assigned(r#"var FM = {"t":"a } \" {","n":{"x":1}};"#, "FM").unwrap()["n"]["x"], 1);
+        assert_eq!(json_assigned(r#"var FMX = {"a":1}; var FM = {"a":2}"#, "FM").unwrap()["a"], 2);
     }
 
     #[test]

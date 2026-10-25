@@ -7,15 +7,18 @@ use crate::http::{Client, Error};
 pub enum Source {
     InternetArchive,
     FlashMuseum,
+    /// 1.000.028: Flashpoint Archive's Shockwave games (src/fp.rs).
+    Flashpoint,
 }
 
-pub const SOURCES: [Source; 2] = [Source::InternetArchive, Source::FlashMuseum];
+pub const SOURCES: [Source; 3] = [Source::InternetArchive, Source::FlashMuseum, Source::Flashpoint];
 
 impl Source {
     pub fn name(self) -> &'static str {
         match self {
             Source::InternetArchive => "Internet Archive",
             Source::FlashMuseum => "Flash Museum",
+            Source::Flashpoint => "Flashpoint",
         }
     }
 
@@ -24,6 +27,25 @@ impl Source {
         match self {
             Source::InternetArchive => "archive.org",
             Source::FlashMuseum => "flashmuseum.net",
+            Source::Flashpoint => "flashpointarchive.org",
+        }
+    }
+
+    /// What it lists: Flash movies, or (Flashpoint, as Ruffle5 asks it) Shockwave ones.
+    pub fn plays(self) -> &'static str {
+        match self {
+            Source::InternetArchive | Source::FlashMuseum => "Flash",
+            Source::Flashpoint => "Shockwave",
+        }
+    }
+
+    /// What its list without search words is: archive.org's sorted by downloads, Flash Museum's
+    /// games page as the site orders it, Flashpoint's sorted by title.
+    pub fn listing(self) -> &'static str {
+        match self {
+            Source::InternetArchive => "Most played",
+            Source::FlashMuseum => "Games",
+            Source::Flashpoint => "A to Z",
         }
     }
 
@@ -31,11 +53,12 @@ impl Source {
         SOURCES.into_iter().find(|x| x.site() == s.trim())
     }
 
-    /// A page of results: `words` empty lists the most played.
+    /// A page of results: `words` empty lists everything, as [`Source::listing`] says.
     pub fn search(self, client: &Client, words: &str, page: u32) -> Result<Page, Error> {
         match self {
             Source::InternetArchive => crate::ia::search(client, words, page),
             Source::FlashMuseum => crate::fm::search(client, words, page),
+            Source::Flashpoint => crate::fp::search(client, words, page),
         }
     }
 
@@ -44,6 +67,7 @@ impl Source {
         match self {
             Source::InternetArchive => crate::ia::files(client, &item.id),
             Source::FlashMuseum => crate::fm::files(client, item),
+            Source::Flashpoint => crate::fp::files(item),
         }
     }
 }
@@ -63,6 +87,9 @@ pub struct Item {
     /// Its page on the web.
     pub page: String,
     pub downloads: Option<u64>,
+    /// 1.000.028: what the source needs later to name the item's files, kept from the listing
+    /// (Flashpoint: the entry's game data and launch command, as JSON).
+    pub data: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -92,6 +119,33 @@ pub struct Files {
     pub referer: Option<String>,
     /// Why this file is the movie, for the log.
     pub note: String,
+    /// The address the movie is played as if it were loaded from, when its source plays it so
+    /// (Flash Museum: the player's `launchCommand`, the movie's old home or `http://localflash/`).
+    /// online.txt keeps it as `url`; Ruffle5 then gives it to the movie as its address.
+    pub address: Option<String>,
+    /// 1.000.028: `main` is a zip holding the game's files (Flashpoint's game data).
+    pub archive: Option<Archive>,
+    /// 1.000.028: the Shockwave Projector command the source starts the movie with (Flashpoint):
+    /// its address and flags (`--do`, `--forceTheExitLock 0`...), which Ruffle5 hands DirPlayer.
+    /// online.txt keeps it as `launch`.
+    pub launch: Option<String>,
+    /// 1.000.028: the folder (an address ending in `/`) that serves the files the movie loads by
+    /// name, when the source does not list them (Flashpoint's entries without game data): Ruffle5
+    /// fetches a Director movie's external casts from there.
+    pub beside: Option<String>,
+}
+
+/// A zip of a game's files, and where the movie is in it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Archive {
+    /// Its SHA-256 (lowercase hex), as the source records it.
+    pub sha256: String,
+    /// Other addresses of the same file, tried in turn when `main.url` fails.
+    pub mirrors: Vec<String>,
+    /// The movie's path inside the zip, as the source's address maps onto it
+    /// ("content/www.cartoonnetwork.com/games/x/game.dcr"); the movie is looked up by it after
+    /// the zip is opened (`fp::pick_movie`).
+    pub movie: String,
 }
 
 /// Text from HTML: tags dropped (a <br> or </p> is a space), entities decoded, spaces collapsed.

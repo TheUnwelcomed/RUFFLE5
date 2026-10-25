@@ -20,6 +20,10 @@ webpki-roots = "1"
 # Already in the title's tree (Ruffle, DirPlayer).
 serde_json = "1"
 log = "0.4"
+# 1.000.028, Flashpoint's game data: zips (deflate) and their SHA-256. flate2 is in the title's
+# tree (Ruffle, png); sha2 0.11 comes with rustls-rustcrypto.
+flate2 = "1"
+sha2 = "0.11"
 
 # The plain socket() path (src/http.rs), should the console refuse std's SOCK_CLOEXEC socket.
 [target.'cfg(unix)'.dependencies]

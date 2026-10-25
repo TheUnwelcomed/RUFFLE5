@@ -58,6 +58,9 @@ pub struct Settings {
     pub fps_counter: bool,
     pub auto_covers: bool,
     pub badges: bool,
+    /// 1.000.028: a game fetched from the Online tab stays in the games folder after it is played
+    /// (Off: it is deleted when the player leaves it; its saves stay).
+    pub keep_online: bool,
 }
 
 impl Default for Settings {
@@ -86,6 +89,7 @@ impl Default for Settings {
             fps_counter: false,
             auto_covers: true,
             badges: true,
+            keep_online: true,
         }
     }
 }
@@ -118,6 +122,7 @@ pub enum Row {
     Badges,
     Rescan,
     ClearRecent,
+    KeepOnline,
     Version,
     CreatedBy,
     Credits,
@@ -129,7 +134,7 @@ pub const CATEGORIES: [(&str, &[Row]); 6] = [
     ("Player", &[Row::FrameRate, Row::PlayerVersion, Row::Runtime, Row::LoadBehavior, Row::MaxExecution, Row::DummyExternalInterface, Row::SpoofSite]),
     ("Controls & Sound", &[Row::AllControls, Row::AutoKeyboard, Row::MouseSpeed, Row::Volume, Row::UiSounds]),
     ("App", &[Row::AnimatedBackground, Row::Screensaver, Row::FpsCounter, Row::AutoCovers, Row::Badges]),
-    ("Library", &[Row::Rescan, Row::ClearRecent]),
+    ("Library", &[Row::Rescan, Row::ClearRecent, Row::KeepOnline]),
     ("About", &[Row::Version, Row::CreatedBy, Row::Credits]),
 ];
 
@@ -140,7 +145,7 @@ pub fn category_help(name: &str) -> &'static str {
         "Player" => "How Ruffle runs games: speed, Flash version, and helpers for games that will not start.",
         "Controls & Sound" => "The controller, a USB mouse and keyboard, the on-screen keyboard, and the volume.",
         "App" => "Ruffle5 itself: the animated background, the screensaver, covers, badges and the FPS counter.",
-        "Library" => "Your games list: look again for new games, or forget what you played recently.",
+        "Library" => "Your games list: look again for new games, forget what you played recently, and keep or drop games from Online.",
         _ => "Ruffle5 plays Flash games on the PS5 with Ruffle, the open-source Flash Player emulator.",
     }
 }
@@ -196,6 +201,7 @@ impl Row {
             Row::Badges => "Badges",
             Row::Rescan => "Rescan games",
             Row::ClearRecent => "Clear recently played",
+            Row::KeepOnline => "Keep online games",
             Row::Version => "Version",
             Row::CreatedBy => "Created by",
             Row::Credits => "Built with",
@@ -241,8 +247,15 @@ impl Row {
             Row::Badges => "Little goals to unlock while you play. Off hides the Badges section and the popups (progress is kept).",
             Row::Rescan => "Looks again for games in the games folder and on USB drives.",
             Row::ClearRecent => "Empties Recent. Saves, play times and favorites are kept.",
+            Row::KeepOnline => {
+                if s.keep_online {
+                    "On: a game you fetch from Online stays in your games folder after you play it. Delete one yourself with OPTIONS on its tile."
+                } else {
+                    "Off: a game fetched from Online is deleted when you leave it and come back to the menu. Its saves are kept."
+                }
+            }
             Row::Version | Row::CreatedBy => "",
-            Row::Credits => "Ruffle (ruffle.rs) · PS5_Vulkan by Mihawk-99 · ideas from Ruffle-Flash-PS5 by ZiZc3 · menu after ProsperoStore · Inter and Montserrat fonts.",
+            Row::Credits => "Ruffle (ruffle.rs) · DirPlayer by Igor Lira for Shockwave · PS5_Vulkan by Mihawk-99 · ideas from Ruffle-Flash-PS5 by ZiZc3 · menu after ProsperoStore · Inter, Montserrat and Liberation fonts.",
         };
         text.to_string()
     }
@@ -282,6 +295,7 @@ impl Row {
             Row::Badges => on(s.badges),
             Row::Rescan => "Look again".to_string(),
             Row::ClearRecent => "Clear".to_string(),
+            Row::KeepOnline => on(s.keep_online),
             Row::Version => crate::APP_VERSION.to_string(),
             Row::CreatedBy => crate::AUTHOR.to_string(),
             Row::Credits => "Ruffle".to_string(),
@@ -326,6 +340,7 @@ impl Settings {
                 "fps_counter" => s.fps_counter = b,
                 "auto_covers" => s.auto_covers = b,
                 "badges" => s.badges = b,
+                "keep_online" => s.keep_online = b,
                 _ => {}
             }
         }
@@ -333,7 +348,7 @@ impl Settings {
     }
 
     pub fn to_text(&self) -> String {
-        let fields: [(&str, u8); 23] = [
+        let fields: [(&str, u8); 24] = [
             ("uhd", self.uhd as u8),
             ("quality", self.quality),
             ("scale_mode", self.scale_mode),
@@ -357,6 +372,7 @@ impl Settings {
             ("fps_counter", self.fps_counter as u8),
             ("auto_covers", self.auto_covers as u8),
             ("badges", self.badges as u8),
+            ("keep_online", self.keep_online as u8),
         ];
         let mut body = String::from("# Ruffle5 settings (Settings in the menu writes this file)\n");
         for (k, v) in fields {
@@ -402,6 +418,7 @@ impl Settings {
             Row::FpsCounter => flip(&mut self.fps_counter, dir),
             Row::AutoCovers => flip(&mut self.auto_covers, dir),
             Row::Badges => flip(&mut self.badges, dir),
+            Row::KeepOnline => flip(&mut self.keep_online, dir),
             _ => return false,
         }
         *self != before
@@ -435,6 +452,7 @@ mod tests {
         s.spoof_site = 3;
         s.volume = 7;
         s.animated_background = false;
+        s.keep_online = false;
         let dir = std::env::temp_dir().join(format!("ruffle5-settings-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.txt");
@@ -443,6 +461,8 @@ mod tests {
         std::fs::write(&path, "quality=99\nvolume=50\nspoof_site=200\nbogus\nuhd=1\n").unwrap();
         let t = Settings::load(path.to_str().unwrap());
         assert_eq!((t.quality, t.volume, t.spoof_site, t.uhd), (7, 10, 6, true));
+        // a settings file from before 1.000.028 keeps online games
+        assert!(t.keep_online);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -6,6 +6,11 @@
 //!     `metadata` (title, creator, `emulator_start`: the file archive.org's player starts);
 //!   * a file: `/download/{identifier}/{name}` (redirects to the server holding it);
 //!   * a picture: `/services/img/{identifier}` (the item's thumbnail).
+//!
+//! 1.000.028, from the answers archive.org gave the online check (2026-10-24): the collection
+//! also holds its sub-collections (softwarelibrary_flash_games, _kidzone, _nick, ... — mediatype
+//! "collection", no .swf of their own), and by downloads they are the whole first page of 48. The
+//! search leaves out items whose mediatype is collection.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use serde_json::Value;
@@ -22,18 +27,18 @@ const EXTRA_EXT: [&str; 12] = ["swf", "xml", "json", "txt", "mp3", "flv", "png",
 const EXTRA_MAX_FILES: usize = 64;
 const EXTRA_MAX_BYTES: u64 = 64 << 20;
 
-/// The Lucene query: the collection, and every search word.
+/// The Lucene query: the collection without its sub-collections, and every search word.
 pub fn query(words: &str) -> String {
     let w = search_words(words);
     if w.is_empty() {
-        format!("collection:{COLLECTION}")
+        format!("collection:{COLLECTION} AND NOT mediatype:collection")
     } else {
-        format!("collection:{COLLECTION} AND ({})", w.join(" AND "))
+        format!("collection:{COLLECTION} AND NOT mediatype:collection AND ({})", w.join(" AND "))
     }
 }
 
 pub fn search_url(words: &str, page: u32) -> String {
-    let fields = ["identifier", "title", "creator", "year", "date", "description", "downloads"];
+    let fields = ["identifier", "title", "creator", "year", "date", "description", "downloads", "mediatype"];
     let fl: String = fields.iter().map(|f| format!("&fl%5B%5D={f}")).collect();
     format!(
         "https://archive.org/advancedsearch.php?q={}{fl}&sort%5B%5D={}&rows={ROWS}&page={}&output=json",
@@ -94,6 +99,10 @@ pub fn parse_search(v: &Value, page: u32) -> Result<Page, Error> {
         let Some(id) = d.get("identifier").and_then(text) else {
             continue;
         };
+        // the query leaves collections out; one that comes anyway is not a game either
+        if d.get("mediatype").and_then(text).is_some_and(|m| m.eq_ignore_ascii_case("collection")) {
+            continue;
+        }
         let year = d.get("year").and_then(text).or_else(|| d.get("date").and_then(text).map(|s| s.chars().take(4).collect()));
         items.push(Item {
             title: d.get("title").and_then(text).map(|t| html_text(&t)).unwrap_or_else(|| id.clone()),
@@ -104,6 +113,7 @@ pub fn parse_search(v: &Value, page: u32) -> Result<Page, Error> {
             thumb: Some(thumb_url(&id)),
             page: details_url(&id),
             downloads: d.get("downloads").and_then(number),
+            data: None,
             id,
         });
     }
@@ -141,6 +151,9 @@ pub fn parse_files(id: &str, v: &Value) -> Result<Files, Error> {
         return Err(Error::Other(format!("archive.org {id}: the item is not public")));
     }
     let meta = v.get("metadata").cloned().unwrap_or(Value::Null);
+    if meta.get("mediatype").and_then(text).is_some_and(|m| m.eq_ignore_ascii_case("collection")) {
+        return Err(Error::Other(format!("archive.org {id} is a collection of items, not a game")));
+    }
     struct F {
         name: String,
         original: bool,
@@ -189,7 +202,7 @@ pub fn parse_files(id: &str, v: &Value) -> Result<Files, Error> {
         extra_bytes += size;
         extra.push(RemoteFile { name: f.name.clone(), url: download_url(id, &f.name), size: f.size });
     }
-    Ok(Files { main: RemoteFile { name: main.name.clone(), url: download_url(id, &main.name), size: main.size }, extra, referer: None, note })
+    Ok(Files { main: RemoteFile { name: main.name.clone(), url: download_url(id, &main.name), size: main.size }, extra, referer: None, note, address: None, archive: None, launch: None, beside: None })
 }
 
 pub fn files(client: &Client, id: &str) -> Result<Files, Error> {
@@ -203,10 +216,11 @@ mod tests {
 
     #[test]
     fn the_search_asks_the_collection_by_downloads() {
-        assert_eq!(query(""), "collection:softwarelibrary_flash");
-        assert_eq!(query("Duck Life (4)"), "collection:softwarelibrary_flash AND (duck AND life AND 4)");
+        assert_eq!(query(""), "collection:softwarelibrary_flash AND NOT mediatype:collection");
+        assert_eq!(query("Duck Life (4)"), "collection:softwarelibrary_flash AND NOT mediatype:collection AND (duck AND life AND 4)");
         let u = search_url("duck", 2);
-        assert!(u.starts_with("https://archive.org/advancedsearch.php?q=collection%3Asoftwarelibrary_flash%20AND%20%28duck%29&fl%5B%5D=identifier"), "{u}");
+        assert!(u.starts_with("https://archive.org/advancedsearch.php?q=collection%3Asoftwarelibrary_flash%20AND%20NOT%20mediatype%3Acollection%20AND%20%28duck%29&fl%5B%5D=identifier"), "{u}");
+        assert!(u.contains("&fl%5B%5D=downloads&fl%5B%5D=mediatype&sort"), "{u}");
         assert!(u.ends_with("&sort%5B%5D=downloads%20desc&rows=48&page=2&output=json"), "{u}");
     }
 
@@ -235,6 +249,26 @@ mod tests {
         assert!(!parse_search(&v, 1).unwrap().more);
         let v: Value = serde_json::from_str(r#"{"error":"bad query"}"#).unwrap();
         assert_eq!(parse_search(&v, 1).unwrap_err().to_string(), "archive.org search: bad query");
+    }
+
+    #[test]
+    fn sub_collections_are_not_games() {
+        // as archive.org answered on 2026-10-24 (the first page was all sub-collections)
+        let v: Value = serde_json::from_str(
+            r#"{"response":{"numFound":3,"docs":[
+                {"identifier":"softwarelibrary_flash_games","title":"Software Library: Flash Games","downloads":10843942,"mediatype":"collection"},
+                {"identifier":"duck-life","title":"Duck Life","downloads":3204,"mediatype":"software"},
+                {"identifier":"no-mediatype","title":"x"}]}}"#,
+        )
+        .unwrap();
+        let ids: Vec<String> = parse_search(&v, 1).unwrap().items.into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, ["duck-life", "no-mediatype"]);
+        let v: Value = serde_json::from_str(
+            r#"{"files":[{"name":"__ia_thumb.jpg","source":"original","format":"Item Tile","size":"9011"},{"name":"logo_header.jpg","source":"original","format":"JPEG","size":"17622"}],
+               "metadata":{"identifier":"softwarelibrary_flash_games","mediatype":"collection"}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_files("softwarelibrary_flash_games", &v).unwrap_err().to_string(), "archive.org softwarelibrary_flash_games is a collection of items, not a game");
     }
 
     #[test]

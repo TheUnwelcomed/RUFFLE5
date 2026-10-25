@@ -287,7 +287,15 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
         // A console app is always full screen; games see that, and "Fullscreen Only" does what it says.
         .with_fullscreen(true)
         .with_autoplay(true);
-    let spoof = s.spoofed_url(&path);
+    // The Pretend Site setting; else, for a game the Online tab fetched, the address its source
+    // plays it from (online.txt `url`: Flash Museum's launchCommand).
+    let spoof = s.spoofed_url(&path).or_else(|| {
+        let a = crate::online::address_for(&path);
+        if let Some(a) = &a {
+            say(&format!("     address {a} (online.txt)"));
+        }
+        a
+    });
     if spoof.is_some() {
         builder = builder.with_spoofed_url(spoof.clone());
     }

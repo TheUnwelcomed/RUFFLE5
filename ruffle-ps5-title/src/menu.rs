@@ -30,7 +30,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::badges::{self, Badges, Live, BADGES};
-use crate::input::{BTN_CIRCLE, BTN_CROSS, BTN_DOWN, BTN_L1, BTN_L2, BTN_LEFT, BTN_R1, BTN_RIGHT, BTN_SQUARE, BTN_TRIANGLE, BTN_UP};
+use crate::input::{BTN_CIRCLE, BTN_CROSS, BTN_DOWN, BTN_L1, BTN_L2, BTN_LEFT, BTN_OPTIONS, BTN_R1, BTN_RIGHT, BTN_SQUARE, BTN_TRIANGLE, BTN_UP};
 use crate::keyboard::Osk;
 use crate::library::{now_secs, Library};
 use crate::paths::{self, Paths};
@@ -133,6 +133,12 @@ pub struct Game {
     pub own_picture: bool,
     /// It has a mapping of its own in Custom Mappings.
     pub mapping: bool,
+    /// 1.000.028: the folder the game is in, in the games folder or a USB drive's (a game in a
+    /// folder of its own), which Delete removes; None for a movie on its own in one of those (Delete
+    /// removes the file and the picture beside it).
+    pub folder: Option<String>,
+    /// 1.000.028: fetched by the Online tab (its folder's online.txt names the movie).
+    pub online: bool,
     thumb_png: Option<Vec<u8>>,
     pub thumb: Option<ImageId>,
     pub accent: Color,
@@ -152,6 +158,8 @@ pub enum Action {
     ClearRecent,
     /// A setting changed (already applied to the Settings passed in).
     Setting(Row),
+    /// 1.000.028: the player confirmed deleting this game (Menu::delete_game).
+    Delete(usize),
 }
 
 /// What the menu needs from the pad this frame.
@@ -218,10 +226,36 @@ pub struct Menu {
     pub online: crate::online::Online,
     /// GPU pictures of the games before a rescan, reused for the games after it.
     spare_images: Vec<ImageId>,
+    /// 1.000.028: Delete asked for this game; seconds the question has been shown.
+    confirm_delete: Option<(usize, f32)>,
 }
 
 /// How long the ribbon wipe into a game takes.
 pub const LAUNCH_TIME: f32 = 0.5;
+
+/// A path as the player knows it: "games/…" inside the games folder, "USB: …" on a drive.
+fn short_path(p: &str, games_dir: &str) -> String {
+    if let Some(rest) = p.strip_prefix(games_dir).and_then(|r| r.strip_prefix('/')) {
+        return format!("games/{rest}");
+    }
+    for usb in ["/mnt/usb0/", "/mnt/usb1/"] {
+        if let Some(rest) = p.strip_prefix(usb) {
+            return format!("USB: {rest}");
+        }
+    }
+    p.to_string()
+}
+
+/// The folders the menu lists games in: the games folder, then each USB drive's ruffle5 folder
+/// and its root.
+pub fn scan_roots(games_dir: &str) -> Vec<String> {
+    let mut dirs = vec![games_dir.to_string()];
+    for usb in ["/mnt/usb0", "/mnt/usb1"] {
+        dirs.push(format!("{usb}/ruffle5"));
+        dirs.push(usb.to_string());
+    }
+    dirs
+}
 
 impl Menu {
     /// Scan the folders. Nothing is uploaded to the GPU yet (`load_pictures`).
@@ -264,6 +298,7 @@ impl Menu {
             uncover: 0.0,
             online: crate::online::Online::new(&paths.games),
             spare_images: Vec::new(),
+            confirm_delete: None,
         };
         m.scan(paths);
         m
@@ -273,11 +308,7 @@ impl Menu {
     pub fn scan(&mut self, paths: &Paths) {
         self.report.clear();
         let mut games = Vec::new();
-        let mut dirs = vec![paths.games.clone()];
-        for usb in ["/mnt/usb0", "/mnt/usb1"] {
-            dirs.push(format!("{usb}/ruffle5"));
-            dirs.push(usb.to_string());
-        }
+        let dirs = scan_roots(&paths.games);
         for dir in &dirs {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 if dir == &paths.games {
@@ -304,10 +335,16 @@ impl Menu {
                     // the games folder and a USB drive's ruffle5 folder, not a drive's root.
                     let logged = dir == &paths.games || dir.ends_with("/ruffle5");
                     if Self::folder_game(paths, &full, &n, &mut games, &mut self.report) {
+                        if let Some(g) = games.last_mut() {
+                            g.folder = Some(full.clone());
+                        }
                         continue;
                     }
                     let subdirs = Self::list(&full).into_iter().filter(|f| !f.starts_with('.') && std::path::Path::new(&format!("{full}/{f}")).is_dir()).collect::<Vec<_>>();
                     if subdirs.len() == 1 && Self::folder_game(paths, &format!("{full}/{}", subdirs[0]), &n, &mut games, &mut self.report) {
+                        if let Some(g) = games.last_mut() {
+                            g.folder = Some(full.clone());
+                        }
                         if logged {
                             self.report.push(format!("menu: {n}/ is one folder down, in {n}/{}/ (listed)", subdirs[0]));
                         }
@@ -341,6 +378,57 @@ impl Menu {
         self.games = games;
         self.focus = [0; 3];
         self.scroll.snap(0.0);
+        // indices into the old list mean nothing in the new one
+        self.pending_cover = None;
+        self.confirm_delete = None;
+        self.stage_game = None;
+        self.online.refresh_installed();
+    }
+
+    /// Where the shelves' focus is (to put it back after a rescan).
+    pub fn focus(&self) -> [usize; 3] {
+        self.focus
+    }
+
+    /// Put the shelves' focus back (each is kept inside its shelf as the menu updates).
+    pub fn set_focus(&mut self, focus: [usize; 3]) {
+        self.focus = focus;
+    }
+
+    /// 1.000.028: delete game `gi` — its own folder (a folder game), else its movie and the picture
+    /// beside it. Its saves, cover and play time stay (they are kept by its key, so a game fetched
+    /// again finds them). Never a folder the menu looks in itself. Returns what went, for the log.
+    pub fn delete_game(&self, gi: usize) -> Result<String, String> {
+        let g = self.games.get(gi).ok_or_else(|| "no such game".to_string())?;
+        let roots = scan_roots(&self.games_dir);
+        let in_root = |p: &str| std::path::Path::new(p).parent().map(|d| d.to_string_lossy().into_owned()).is_some_and(|d| roots.contains(&d));
+        match &g.folder {
+            Some(folder) => {
+                let name = std::path::Path::new(folder).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if !in_root(folder) || name.is_empty() || name.starts_with('.') || roots.contains(folder) {
+                    return Err(format!("{folder} is not a game's own folder"));
+                }
+                std::fs::remove_dir_all(folder).map_err(|e| format!("{folder}: {e}"))?;
+                Ok(format!("{folder}/"))
+            }
+            None => {
+                if !in_root(&g.path) {
+                    return Err(format!("{} is not in a games folder", g.path));
+                }
+                std::fs::remove_file(&g.path).map_err(|e| format!("{}: {e}", g.path))?;
+                let mut gone = vec![g.path.clone()];
+                if let Some((dir, file)) = g.path.rsplit_once('/') {
+                    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
+                    for ext in ["png", "PNG"] {
+                        let picture = format!("{dir}/{stem}.{ext}");
+                        if std::fs::remove_file(&picture).is_ok() {
+                            gone.push(picture);
+                        }
+                    }
+                }
+                Ok(gone.join(", "))
+            }
+        }
     }
 
     /// A folder's entry names, sorted case-insensitively (empty if it cannot be read).
@@ -357,15 +445,22 @@ impl Menu {
     fn folder_game(paths: &Paths, full: &str, name: &str, games: &mut Vec<Game>, report: &mut Vec<String>) -> bool {
         let files = Self::list(full);
         // V5: a game the Online tab fetched names its movie (the item may hold several .swf files)
-        // and its title in online.txt.
+        // and its title in online.txt. 1.000.028: the movie may be a Director one (Flashpoint),
+        // named, keyed and mapped after the folder as a Director game in its own folder is.
         let online = crate::online::read_online_txt(&format!("{full}/online.txt"));
         if let Some(movie) = online.get("movie").filter(|m| std::path::Path::new(&format!("{full}/{m}")).is_file()) {
             let thumb = [format!("{full}/cover.png"), format!("{full}/icon.png")].into_iter().find(|p| std::path::Path::new(p).is_file());
             let file = movie.rsplit('/').next().unwrap_or(movie).to_string();
-            let mut g = Self::game(paths, &format!("{full}/{movie}"), &file, Some(name), thumb, report);
+            let path = format!("{full}/{movie}");
+            let mut g = if crate::dirinfo::is_movie(&file) {
+                Self::director_game(paths, &path, name, &format!("{full}/{name}.dcr"), Some(name), thumb)
+            } else {
+                Self::game(paths, &path, &file, Some(name), thumb, report)
+            };
             if let Some(t) = online.get("title").filter(|t| !t.is_empty()) {
                 g.name = t.clone();
             }
+            g.online = true;
             games.push(g);
             return true;
         }
@@ -414,6 +509,8 @@ impl Menu {
             info,
             own_picture,
             mapping,
+            folder: None,
+            online: false,
             thumb_png,
             thumb: None,
             accent,
@@ -461,6 +558,8 @@ impl Menu {
             info: None,
             own_picture,
             mapping,
+            folder: None,
+            online: false,
             thumb_png,
             thumb: None,
             accent,
@@ -637,8 +736,11 @@ impl Menu {
             }
             return None;
         }
+        // a toast waits for the menu to have faded in (one made as a game ended)
         if let Some((_, t)) = self.toast.as_mut() {
-            *t += dt;
+            if self.intro >= 1.0 {
+                *t += dt;
+            }
         }
         for msg in self.online.take_toasts() {
             self.toast(&msg);
@@ -710,6 +812,22 @@ impl Menu {
                 self.hold_armed = false;
             }
         }
+        // 1.000.028: a delete waiting for its answer has the pad: Cross deletes, Circle keeps.
+        if let Some((gi, t)) = self.confirm_delete.as_mut() {
+            *t += dt;
+            let gi = *gi;
+            self.hold_armed = false;
+            if pressed & BTN_CROSS != 0 {
+                self.confirm_delete = None;
+                sounds::play(Sfx::Select);
+                return Some(Action::Delete(gi));
+            }
+            if pressed & (BTN_CIRCLE | BTN_OPTIONS) != 0 {
+                self.confirm_delete = None;
+                sounds::play(Sfx::Back);
+            }
+            return None;
+        }
         // Typing on a USB keyboard searches the shelves (and the Online tab).
         if tab.shelf().is_some() || tab == Tab::Online {
             for &c in pad.typed {
@@ -760,6 +878,10 @@ impl Menu {
                     } else if pressed & BTN_TRIANGLE != 0 {
                         sounds::play(Sfx::Select);
                         action = Some(Action::EditControls(gi));
+                    } else if pressed & BTN_OPTIONS != 0 {
+                        // 1.000.028: delete it (asked first)
+                        sounds::play(Sfx::Select);
+                        self.confirm_delete = Some((gi, 0.0));
                     } else if pressed & BTN_SQUARE != 0 {
                         let key = self.games[gi].key.clone();
                         let fav = library.toggle_favorite(&key);
@@ -1003,6 +1125,9 @@ impl Menu {
             draw_hold_bar(ui, scene, self.hold, CLOSE_DELAY, CLOSE_HOLD, "Keep holding to close Ruffle5", Glyph::Circle, HOLD_BAR_Y);
         }
         self.osk.draw(ui, scene, "Search");
+        if let Some((gi, t)) = self.confirm_delete {
+            self.draw_confirm_delete(ui, scene, gi, t);
+        }
         if let Some((msg, t)) = self.toast.clone() {
             toast(ui, scene, &msg, t, 2.4);
         }
@@ -1013,6 +1138,34 @@ impl Menu {
         } else if self.uncover < 0.45 {
             ribbon_wipe(scene, 1.0 - self.uncover / 0.45);
         }
+    }
+
+    /// 1.000.028: "Delete <game>?" over the menu, with what goes and what stays.
+    fn draw_confirm_delete(&self, ui: &mut Ui, scene: &mut Scene, gi: usize, t: f32) {
+        let Some(g) = self.games.get(gi) else {
+            return;
+        };
+        let a = ease((t / 0.18).min(1.0));
+        scene.push_opacity(a);
+        scene.rect(Rect::new(0.0, 0.0, W, H), 0.0, NIGHT.with_alpha(0.62));
+        let r = Rect::new((W - 1000.0) * 0.5, 330.0 - (1.0 - a) * 24.0, 1000.0, 380.0);
+        card(scene, r, 28.0, 1.0);
+        let inner = r.w - 112.0;
+        let title = ui.fit(Face::Display, 40.0, &format!("Delete {}?", g.name), inner);
+        scene.text(ui, Face::Display, 40.0, &title, r.x + 56.0, centred(r.y + 76.0, 40.0), INK, Align::Left, 0.0);
+        let what = match &g.folder {
+            Some(folder) => format!("Its folder goes: {}", short_path(folder, &self.games_dir)),
+            None => format!("Its file goes: {}", short_path(&g.path, &self.games_dir)),
+        };
+        let what = ui.fit(Face::SemiBold, 24.0, &what, inner);
+        scene.text(ui, Face::SemiBold, 24.0, &what, r.x + 56.0, centred(r.y + 150.0, 24.0), INK.with_alpha(0.9), Align::Left, 0.0);
+        let kept = if g.online { "Its saves, cover and play time stay: fetch it again from Online and they are back." } else { "Its saves, cover and play time stay." };
+        let kept = ui.fit(Face::Regular, 22.0, kept, inner);
+        scene.text(ui, Face::Regular, 22.0, &kept, r.x + 56.0, centred(r.y + 196.0, 22.0), INK.with_alpha(0.7), Align::Left, 0.0);
+        let mut x = r.x + 56.0;
+        x += button(ui, scene, x, r.y + r.h - 108.0, 64.0, Glyph::Cross, "Delete", true, 0.6) + 16.0;
+        button(ui, scene, x, r.y + r.h - 108.0, 64.0, Glyph::Circle, "Keep", false, 0.0);
+        scene.pop_opacity();
     }
 
     /// Without the animation: Ruffle blue, lit from the top right, the mark large and faint.
@@ -1431,6 +1584,7 @@ impl Menu {
                     hints.push((Glyph::Cross, "Play"));
                     hints.push((Glyph::Triangle, "Controls"));
                     hints.push((Glyph::Square, "Favorite"));
+                    hints.push((Glyph::Chip("OPTIONS"), "Delete"));
                 }
                 hints.push((Glyph::Chip("L2"), "Search"));
             }
@@ -1493,5 +1647,70 @@ mod tests {
         assert!(menu.report.iter().any(|l| l.contains("one folder down")), "{:?}", menu.report);
         assert!(menu.report.iter().any(|l| l.contains("notes/ not listed") && l.contains("readme.txt")), "{:?}", menu.report);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_takes_the_game_and_leaves_the_rest() {
+        let root = std::env::temp_dir().join(format!("ruffle5-menu-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let games = root.join("games");
+        let mk = |rel: &str, body: &[u8]| {
+            let p = games.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        let swf = b"FWS\x08\x15\0\0\0\x30\0\x01\x00\x0c\x01\x00";
+        mk("Loose.swf", swf);
+        mk("Loose.png", b"png");
+        mk("Other.swf", swf);
+        mk("Fetched/Fetched Game.swf", swf);
+        mk("Fetched/online.txt", b"site = archive.org\nid = fetched\ntitle = Fetched Game\nmovie = Fetched Game.swf\n");
+        mk("Unzipped/Unzipped/game.dcr", b"XFIR\0\0\0\0MDGF");
+        let p = |s: &str| {
+            let d = root.join(s);
+            std::fs::create_dir_all(&d).unwrap();
+            d.to_string_lossy().into_owned()
+        };
+        let paths = Paths::new(&p("data"), &p("games"), &p("maps"));
+        let saves = paths.saves("Fetched_Game");
+        std::fs::create_dir_all(&saves).unwrap();
+        let mut menu = Menu::new(&paths);
+        let find = |m: &Menu, name: &str| m.games.iter().position(|g| g.name == name).unwrap_or_else(|| panic!("{name} not in {:?}", m.games.iter().map(|g| &g.name).collect::<Vec<_>>()));
+
+        let f = find(&menu, "Fetched Game");
+        assert!(menu.games[f].online);
+        assert_eq!(menu.games[f].folder.as_deref(), Some(games.join("Fetched").to_str().unwrap()));
+        menu.delete_game(f).unwrap();
+        assert!(!games.join("Fetched").exists());
+        assert!(std::path::Path::new(&saves).is_dir(), "its saves stay");
+
+        menu.scan(&paths);
+        let u = find(&menu, "Unzipped");
+        assert!(!menu.games[u].online);
+        // the folder in the games folder, not the one inside it
+        assert_eq!(menu.games[u].folder.as_deref(), Some(games.join("Unzipped").to_str().unwrap()));
+        menu.delete_game(u).unwrap();
+        assert!(!games.join("Unzipped").exists());
+
+        menu.scan(&paths);
+        let l = find(&menu, "Loose");
+        assert_eq!(menu.games[l].folder, None);
+        let gone = menu.delete_game(l).unwrap();
+        assert!(gone.contains("Loose.swf") && gone.contains("Loose.png"), "{gone}");
+        assert!(games.join("Other.swf").is_file() && games.is_dir());
+
+        menu.scan(&paths);
+        assert_eq!(menu.games.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["Other"]);
+        // never the games folder itself
+        menu.games[0].folder = Some(games.to_string_lossy().into_owned());
+        assert!(menu.delete_game(0).is_err());
+        assert!(games.join("Other.swf").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn paths_are_shown_short() {
+        assert_eq!(short_path("/data/homebrew/PPSA99620/games/Ab/c.swf", "/data/homebrew/PPSA99620/games"), "games/Ab/c.swf");
+        assert_eq!(short_path("/mnt/usb0/ruffle5/x.dcr", "/data/g"), "USB: ruffle5/x.dcr");
     }
 }

@@ -1,6 +1,7 @@
 //! PS5_RUFFLE_ONLINE_V1 — the menu's Online tab (1.000.027): Flash games and movies from the
-//! Internet Archive's Flash collection and from Flash Museum, listed with their pictures; Cross
-//! fetches the chosen one into the games folder and plays it, Square only fetches it.
+//! Internet Archive's Flash collection and from Flash Museum — and (1.000.028) Shockwave games from
+//! Flashpoint Archive — listed with their pictures; Cross fetches the chosen one into the games
+//! folder and plays it, Square only fetches it.
 //!
 //! Network work runs on two threads of its own (r5net: HTTPS on the console's sockets, rustls with
 //! pure-Rust cryptography), so the menu never waits: "online" asks for pages of results and fetches
@@ -11,6 +12,8 @@
 //! the files beside it the item has, for movies that load them), `cover.png` from its picture, and
 //! `online.txt` — where it came from and which file is the movie, so the menu plays that one and
 //! shows the title as the source spells it (src/menu.rs). Deleting the folder removes the game.
+//! A Flashpoint game's folder holds its game data's `content/` — the files at the addresses the
+//! game was published at — and online.txt how the archive starts it (src/shockwave.rs).
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::collections::HashMap;
@@ -166,7 +169,59 @@ pub fn read_online_txt(path: &str) -> HashMap<String, String> {
         .collect()
 }
 
-fn online_txt(source: Source, item: &Item, movie: &str) -> String {
+/// The online.txt of the game folder the movie at `movie_path` is in (in it or below it), when it
+/// names that movie: the folder and its fields.
+fn online_txt_for(movie_path: &str) -> Option<(std::path::PathBuf, HashMap<String, String>)> {
+    let movie = std::path::Path::new(movie_path);
+    let mut dir = movie.parent();
+    // a Flashpoint game's movie is as deep as its address: content/<host>/<path>
+    for _ in 0..24 {
+        let d = dir?;
+        let txt = d.join("online.txt");
+        if txt.is_file() {
+            let o = read_online_txt(&txt.to_string_lossy());
+            let same = o.get("movie").is_some_and(|m| d.join(m) == movie);
+            return same.then(|| (d.to_path_buf(), o));
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// The address online.txt gives the movie at `movie_path` (its `url`), when the movie was fetched
+/// by the Online tab: online.txt is in the game's folder, the movie in it or below it.
+pub fn address_for(movie_path: &str) -> Option<String> {
+    let (_, o) = online_txt_for(movie_path)?;
+    o.get("url").filter(|u| u.starts_with("http://") || u.starts_with("https://")).cloned()
+}
+
+/// How a Shockwave game the Online tab fetched starts, as its source starts it (online.txt).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Launch {
+    /// The address the movie was published at (`url`).
+    pub url: Option<String>,
+    /// The source's Shockwave Projector command (`launch`: Flashpoint's launchCommand).
+    pub command: Option<String>,
+    /// The folder the movie's web addresses are read from (`webroot`, inside the game's folder:
+    /// a Flashpoint game data's `content`).
+    pub web_root: Option<String>,
+}
+
+pub fn launch_for(movie_path: &str) -> Option<Launch> {
+    let (dir, o) = online_txt_for(movie_path)?;
+    let url = o.get("url").filter(|u| u.starts_with("http://") || u.starts_with("https://")).cloned();
+    let command = o.get("launch").filter(|c| !c.is_empty()).cloned();
+    let web_root = o.get("webroot").and_then(|r| zip_rel(r)).map(|r| dir.join(r)).filter(|p| p.is_dir()).map(|p| p.to_string_lossy().into_owned());
+    Some(Launch { url, command, web_root })
+}
+
+/// What online.txt says. `url`: the address the movie is played as if it came from (its source
+/// plays it so; Flash Museum's launchCommand); Ruffle5 gives it to the movie when the Pretend Site
+/// setting is off (src/game.rs), and to a Shockwave movie as `the moviePath` (src/shockwave.rs).
+/// 1.000.028: `launch`, the source's Shockwave Projector command (Flashpoint); `webroot`, the
+/// folder in the game's folder that holds its files by web address (`content` of Flashpoint's
+/// game data).
+fn online_txt(source: Source, item: &Item, movie: &str, address: Option<&str>, launch: Option<&str>, web_root: Option<&str>) -> String {
     let one_line = |s: &str| s.replace(['\r', '\n'], " ");
     let mut s = String::from("# Ruffle5: where this game came from (the Online tab). Delete the folder to remove the game.\n");
     s.push_str(&format!("site = {}\n", source.site()));
@@ -174,6 +229,15 @@ fn online_txt(source: Source, item: &Item, movie: &str) -> String {
     s.push_str(&format!("title = {}\n", one_line(&item.title)));
     s.push_str(&format!("movie = {}\n", one_line(movie)));
     s.push_str(&format!("page = {}\n", one_line(&item.page)));
+    if let Some(a) = address {
+        s.push_str(&format!("url = {}\n", one_line(a)));
+    }
+    if let Some(l) = launch {
+        s.push_str(&format!("launch = {}\n", one_line(l)));
+    }
+    if let Some(r) = web_root {
+        s.push_str(&format!("webroot = {}\n", one_line(r)));
+    }
     if let Some(c) = &item.creator {
         s.push_str(&format!("creator = {}\n", one_line(c)));
     }
@@ -250,6 +314,11 @@ fn get_game(client: &Client, source: Source, item: &Item, games_dir: &str, cance
 
 /// The movie, the files beside it, the picture and online.txt into the game's folder. Returns the
 /// movie's path.
+///
+/// 1.000.028: a Director movie (Flashpoint) as well as a Flash one, each checked by its first
+/// bytes; a source's zip of the game's files (Flashpoint's game data: checked against its SHA-256,
+/// then unpacked); and for a Director movie fetched alone with a folder to fetch from (`beside`),
+/// the external casts it names.
 pub fn fetch_files(client: &Client, source: Source, item: &Item, files: &Files, games_dir: &str, cancel: &AtomicBool, progress: &mut dyn FnMut(&'static str, u64, Option<u64>)) -> Result<String, String> {
     let folder = choose_folder(games_dir, source, item);
     let created = !std::path::Path::new(&folder).exists();
@@ -260,22 +329,26 @@ pub fn fetch_files(client: &Client, source: Source, item: &Item, files: &Files, 
         }
         why
     };
-    let mut movie = safe_rel(&files.main.name);
-    if movie.is_empty() {
-        movie = format!("{}.swf", safe_name(&item.id));
-    }
-    if !movie.to_ascii_lowercase().ends_with(".swf") {
-        movie.push_str(".swf");
-    }
-    let movie_path = format!("{folder}/{movie}");
     let t0 = std::time::Instant::now();
-    let bytes = download_to(client, &files.main.url, files.referer.as_deref(), &movie_path, MOVIE_LIMIT, cancel, &mut |got, total| progress("Downloading", got, total)).map_err(&undo)?;
-    let head: Vec<u8> = std::fs::read(&movie_path).map(|b| b.into_iter().take(8).collect()).unwrap_or_default();
-    if !(head.starts_with(b"FWS") || head.starts_with(b"CWS") || head.starts_with(b"ZWS")) {
-        let hex: Vec<String> = head.iter().map(|b| format!("{b:02x}")).collect();
-        return Err(undo(format!("{} is not a Flash movie (it starts {})", files.main.url, hex.join(" "))));
-    }
-    crate::say(&format!("online: {movie_path}: {bytes} bytes in {:.1} s, SWF version {}", t0.elapsed().as_secs_f64(), head.get(3).copied().unwrap_or(0)));
+    let web_root = files.archive.as_ref().map(|_| "content");
+    let movie = match &files.archive {
+        Some(archive) => fetch_archive(client, files, archive, &folder, cancel, progress).map_err(&undo)?,
+        None => {
+            let mut movie = safe_rel(&files.main.name);
+            if movie.is_empty() {
+                movie = format!("{}.swf", safe_name(&item.id));
+            }
+            if movie_kind(&movie).is_none() {
+                movie.push_str(".swf");
+            }
+            let movie_path = format!("{folder}/{movie}");
+            let bytes = download_to(client, &files.main.url, files.referer.as_deref(), &movie_path, MOVIE_LIMIT, cancel, &mut |got, total| progress("Downloading", got, total)).map_err(&undo)?;
+            check_movie(&movie_path).map_err(|e| undo(format!("{} is {e}", files.main.url)))?;
+            crate::say(&format!("online: {movie_path}: {bytes} bytes in {:.1} s", t0.elapsed().as_secs_f64()));
+            movie
+        }
+    };
+    let movie_path = format!("{folder}/{movie}");
     let mut extra_ok = 0;
     for (i, f) in files.extra.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -294,6 +367,9 @@ pub fn fetch_files(client: &Client, source: Source, item: &Item, files: &Files, 
     if !files.extra.is_empty() {
         crate::say(&format!("online: {extra_ok} of {} file(s) beside the movie fetched", files.extra.len()));
     }
+    if let (Some(beside), Some(MovieKind::Director)) = (&files.beside, movie_kind(&movie)) {
+        fetch_casts(client, &movie_path, beside, cancel, progress);
+    }
     if let Some(url) = &item.thumb {
         progress("Its picture", 0, None);
         match fetch_picture(client, url, 1024, true).and_then(|(w, h, rgba)| encode_png(w, h, &rgba)) {
@@ -305,8 +381,200 @@ pub fn fetch_files(client: &Client, source: Source, item: &Item, files: &Files, 
             Err(e) => crate::say(&format!("online: no cover for {}: {e}", item.id)),
         }
     }
-    crate::fsutil::write_durably(format!("{folder}/online.txt"), online_txt(source, item, &movie)).map_err(|e| undo(format!("{folder}/online.txt: {e}")))?;
+    // the address the movie was published at: the source's, unless the zip's movie is another
+    // file than the one the launch command names (a web page that embeds it): then its own
+    let address = match (&files.archive, files.address.as_deref()) {
+        (Some(_), Some(a)) => Some(address_in_zip(a, &movie)),
+        (_, a) => a.map(str::to_string),
+    };
+    crate::fsutil::write_durably(format!("{folder}/online.txt"), online_txt(source, item, &movie, address.as_deref(), files.launch.as_deref(), web_root)).map_err(|e| undo(format!("{folder}/online.txt: {e}")))?;
     Ok(movie_path)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MovieKind {
+    Flash,
+    Director,
+}
+
+/// What plays a movie, by its name: .swf Flash; .dcr, .dir, .dxr Director.
+pub fn movie_kind(name: &str) -> Option<MovieKind> {
+    let n = name.to_ascii_lowercase();
+    if n.ends_with(".swf") {
+        Some(MovieKind::Flash)
+    } else if [".dcr", ".dir", ".dxr"].iter().any(|e| n.ends_with(e)) {
+        Some(MovieKind::Director)
+    } else {
+        None
+    }
+}
+
+/// The file is the movie its name says: a Flash movie starts FWS, CWS or ZWS; a Director one
+/// RIFX or XFIR (big- or little-endian RIFF).
+fn check_movie(path: &str) -> Result<(), String> {
+    let head: Vec<u8> = std::fs::File::open(path)
+        .and_then(|mut f| {
+            let mut b = [0u8; 12];
+            let n = std::io::Read::read(&mut f, &mut b)?;
+            Ok(b[..n].to_vec())
+        })
+        .unwrap_or_default();
+    let hex = || head.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+    match movie_kind(path) {
+        Some(MovieKind::Director) if head.starts_with(b"RIFX") || head.starts_with(b"XFIR") => Ok(()),
+        Some(MovieKind::Director) => Err(format!("not a Director movie (it starts {})", hex())),
+        _ if head.starts_with(b"FWS") || head.starts_with(b"CWS") || head.starts_with(b"ZWS") => Ok(()),
+        _ => Err(format!("not a Flash movie (it starts {})", hex())),
+    }
+}
+
+/// The address of the file a game data zip keeps at `rel` (`content/<host>/<path>`): `launch` when
+/// that is the address it keeps there, else `http(s)://<host>/<path>` with `launch`'s scheme.
+pub fn address_in_zip(launch: &str, rel: &str) -> String {
+    let norm = |s: &str| s.replace('\\', "/").to_lowercase();
+    if r5net::fp::zip_path(launch).is_some_and(|p| norm(&p) == norm(rel)) {
+        return launch.to_string();
+    }
+    let scheme = if launch.starts_with("https://") { "https" } else { "http" };
+    let path = rel.split_once('/').map(|(_, p)| p).unwrap_or(rel);
+    let encoded: Vec<String> = path.split('/').map(|part| r5net::url::encode_component(part)).collect();
+    format!("{scheme}://{}", encoded.join("/"))
+}
+
+/// The most a game data zip may weigh, and a file in it.
+const ARCHIVE_LIMIT: u64 = 1 << 30;
+const ARCHIVE_FILE_LIMIT: u64 = 512 << 20;
+
+/// A path inside a zip as a path inside the game's folder: its parts as they are (a movie asks for
+/// its files by these names), without empty, "." or ".." parts or control characters. None if
+/// nothing is left.
+pub fn zip_rel(name: &str) -> Option<String> {
+    let parts: Vec<&str> = name.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").collect();
+    if parts.iter().any(|p| *p == ".." || p.chars().any(char::is_control)) || parts.is_empty() || parts.len() > 32 {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+/// A source's zip of the game (Flashpoint's game data): downloaded (its mirrors when the first
+/// address fails), checked against its SHA-256, and its `content/` unpacked into `folder`.
+/// Returns the movie's path inside the folder.
+fn fetch_archive(client: &Client, files: &Files, archive: &r5net::Archive, folder: &str, cancel: &AtomicBool, progress: &mut dyn FnMut(&'static str, u64, Option<u64>)) -> Result<String, String> {
+    let zip_path = format!("{folder}/.game-data.zip");
+    let mut urls = vec![files.main.url.clone()];
+    urls.extend(archive.mirrors.iter().cloned());
+    let mut got = Err(String::from("no address"));
+    for url in &urls {
+        got = download_to(client, url, None, &zip_path, ARCHIVE_LIMIT, cancel, &mut |n, total| progress("Downloading", n, total));
+        match &got {
+            Ok(n) => {
+                crate::say(&format!("online: {url}: {n} bytes"));
+                break;
+            }
+            Err(e) if cancel.load(Ordering::Relaxed) => return Err(e.clone()),
+            Err(e) => crate::say(&format!("online: {url}: {e}")),
+        }
+    }
+    got?;
+    let result = (|| {
+        progress("Checking it", 0, None);
+        let sum = r5net::sha256_file(std::path::Path::new(&zip_path)).map_err(|e| format!("{zip_path}: {e}"))?;
+        if sum != archive.sha256 {
+            return Err(format!("its game data is not what the archive lists (SHA-256 {sum}, listed {})", archive.sha256));
+        }
+        let mut z = r5net::zip::Zip::open(std::path::Path::new(&zip_path))?;
+        let names: Vec<String> = z.entries.iter().map(|e| e.name.clone()).collect();
+        let movie = r5net::fp::pick_movie(&names, &archive.movie)?;
+        let movie_rel = zip_rel(&names[movie]).ok_or_else(|| format!("{}: not a usable path", names[movie]))?;
+        let n = z.entries.len();
+        let mut unpacked = 0;
+        for i in 0..n {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("cancelled".to_string());
+            }
+            let e = z.entries[i].clone();
+            if e.is_dir() || !e.name.replace('\\', "/").to_ascii_lowercase().starts_with("content/") {
+                continue;
+            }
+            let Some(rel) = zip_rel(&e.name) else {
+                crate::say(&format!("online: {}: not unpacked (not a usable path)", e.name));
+                continue;
+            };
+            progress("Unpacking", i as u64, Some(n as u64));
+            let path = format!("{folder}/{rel}");
+            if let Some(dir) = std::path::Path::new(&path).parent() {
+                std::fs::create_dir_all(dir).map_err(|err| format!("making {}: {err}", dir.display()))?;
+            }
+            let mut f = std::fs::File::create(&path).map_err(|err| format!("{path}: {err}"))?;
+            z.extract(i, &mut f, ARCHIVE_FILE_LIMIT)?;
+            unpacked += 1;
+        }
+        crate::say(&format!("online: unpacked {unpacked} file(s); the movie is {movie_rel}"));
+        check_movie(&format!("{folder}/{movie_rel}")).map_err(|e| format!("{movie_rel} is {e}"))?;
+        Ok(movie_rel)
+    })();
+    let _ = std::fs::remove_file(&zip_path);
+    result
+}
+
+/// A Director movie's external casts (its cast list names them; DirPlayer reads `<name>.cct`
+/// beside the movie), fetched from `beside` when they are not there yet. One that cannot be
+/// fetched is left out: the movie may not use it. The cast list is read by DirPlayer's
+/// `read_cast_list_bytes` (the patch: the file's map, config and cast list only, no player), and
+/// only from a whole file — its RIFX length + 8 is its size, as in every Director file seen — since
+/// DirPlayer's reader stops the program on a cut-off one.
+fn fetch_casts(client: &Client, movie_path: &str, beside: &str, cancel: &AtomicBool, progress: &mut dyn FnMut(&'static str, u64, Option<u64>)) {
+    let Ok(bytes) = std::fs::read(movie_path) else {
+        return;
+    };
+    let field = match bytes.get(..8) {
+        Some([b'R', b'I', b'F', b'X', a, b, c, d]) => Some(u32::from_be_bytes([*a, *b, *c, *d]) as u64),
+        Some([b'X', b'F', b'I', b'R', a, b, c, d]) => Some(u32::from_le_bytes([*a, *b, *c, *d]) as u64),
+        _ => None,
+    };
+    if field.map(|n| n + 8) != Some(bytes.len() as u64) {
+        crate::say(&format!("online: {movie_path}: its casts not read (its header gives {field:?} bytes + 8, the file has {})", bytes.len()));
+        return;
+    }
+    let names = match vm_rust::director::file::read_cast_list_bytes(&bytes) {
+        Ok(list) => list.iter().filter_map(|(_, path)| cast_file_name(path)).collect::<Vec<_>>(),
+        Err(e) => {
+            crate::say(&format!("online: {movie_path}: its casts not read: {e}"));
+            return;
+        }
+    };
+    crate::say(&format!("online: {movie_path} names {} external cast(s)", names.len()));
+    let dir = movie_path.rsplit_once('/').map(|(d, _)| d).unwrap_or(".");
+    for (i, name) in names.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let path = format!("{dir}/{name}");
+        if std::path::Path::new(&path).is_file() {
+            continue;
+        }
+        progress("Its casts", i as u64, Some(names.len() as u64));
+        let url = format!("{beside}{}", r5net::url::encode_component(name));
+        match download_to(client, &url, None, &path, 128 << 20, cancel, &mut |_, _| {}) {
+            Ok(n) => crate::say(&format!("online: cast {name}: {n} bytes")),
+            Err(e) => crate::say(&format!("online: cast {name}: not fetched: {e}")),
+        }
+    }
+}
+
+/// The file an external cast is read from, as DirPlayer names it (cast_manager.rs,
+/// normalize_cast_lib_path): the last part of its path, `.cct` for its extension.
+pub fn cast_file_name(file_path: &str) -> Option<String> {
+    let normalized = file_path.replace('\\', "/");
+    let base = normalized.split(['/', ':']).next_back().unwrap_or("");
+    if base.is_empty() {
+        return None;
+    }
+    let stem = match base.rsplit_once('.') {
+        Some((s, _)) => s,
+        None => base,
+    };
+    Some(format!("{stem}.cct"))
 }
 
 fn encode_png(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
@@ -388,7 +656,8 @@ pub enum Outcome {
 
 pub struct Online {
     pub source: usize,
-    lists: [List; 2],
+    /// One per source (SOURCES), in its order.
+    lists: Vec<List>,
     workers: Option<Workers>,
     start_error: Option<String>,
     pictures: HashMap<String, Picture>,
@@ -418,7 +687,7 @@ impl Online {
     pub fn new(games_dir: &str) -> Online {
         Online {
             source: 0,
-            lists: [List::default(), List::default()],
+            lists: SOURCES.iter().map(|_| List::default()).collect(),
             workers: None,
             start_error: None,
             pictures: HashMap::new(),
@@ -447,14 +716,21 @@ impl Online {
     }
 
     fn list(&self) -> &List {
-        &self.lists[self.source.min(1)]
+        &self.lists[self.source.min(SOURCES.len() - 1)]
     }
 
     fn list_mut(&mut self) -> &mut List {
-        &mut self.lists[self.source.min(1)]
+        &mut self.lists[self.source.min(SOURCES.len() - 1)]
     }
 
     /// The menu took what the tab handed over.
+    /// The games fetched before, looked up again (after a rescan: one may have been deleted).
+    pub fn refresh_installed(&mut self) {
+        if self.workers.is_some() {
+            self.installed = installed(&self.games_dir);
+        }
+    }
+
     pub fn take_outcome(&mut self) -> Option<Outcome> {
         self.outcome.take()
     }
@@ -508,7 +784,7 @@ impl Online {
         let Some(w) = &self.workers else {
             return;
         };
-        let l = &mut self.lists[self.source.min(1)];
+        let l = &mut self.lists[self.source.min(SOURCES.len() - 1)];
         l.loading = true;
         l.asked = true;
         l.error = None;
@@ -655,7 +931,7 @@ impl Online {
             return;
         }
         let source = self.src();
-        let l = &self.lists[self.source.min(1)];
+        let l = &self.lists[self.source.min(SOURCES.len() - 1)];
         let n = l.items.len();
         if n == 0 {
             return;
@@ -862,12 +1138,12 @@ impl Online {
                 (
                     source.name().to_uppercase(),
                     format!("{} did not answer", source.site()),
-                    vec![e.clone(), "Triangle tries again; R2 switches to the other source. Is the console online?".into()],
+                    vec![e.clone(), "Triangle tries again; R2 switches to another source. Is the console online?".into()],
                 )
             } else if l.loading || !l.asked {
-                (source.name().to_uppercase(), "Looking\u{2026}".into(), vec![if l.words.is_empty() { format!("Asking {} for its Flash games.", source.site()) } else { format!("Searching {} for \u{201c}{}\u{201d}.", source.site(), l.words) }])
+                (source.name().to_uppercase(), "Looking\u{2026}".into(), vec![if l.words.is_empty() { format!("Asking {} for its {} games.", source.site(), source.plays()) } else { format!("Searching {} for \u{201c}{}\u{201d}.", source.site(), l.words) }])
             } else if !l.words.is_empty() {
-                (source.name().to_uppercase(), "Nothing found".into(), vec![format!("{} has nothing for \u{201c}{}\u{201d}.", source.name(), l.words), "Circle clears the search; R2 tries the other source.".into()])
+                (source.name().to_uppercase(), "Nothing found".into(), vec![format!("{} has nothing for \u{201c}{}\u{201d}.", source.name(), l.words), "Circle clears the search; R2 tries another source.".into()])
             } else {
                 (source.name().to_uppercase(), "Nothing listed".into(), vec![format!("{} listed nothing.", source.site())])
             };
@@ -914,7 +1190,7 @@ impl Online {
         scene.push_opacity(come);
         let mx = MARGIN - 28.0 * (1.0 - come);
         ribbon_fold(scene, Rect::new(mx + 2.0, STAGE_KICKER_Y - 12.0, 28.0 * come.max(0.2), 6.0), ORANGE, 1.0);
-        let kind = item.kind.as_deref().unwrap_or("Flash").to_uppercase();
+        let kind = item.kind.as_deref().unwrap_or(source.plays()).to_uppercase();
         let kicker = format!("{} \u{b7} {kind}", source.name().to_uppercase());
         scene.text(ui, Face::SemiBold, 18.0, &kicker, mx + 40.0, STAGE_KICKER_Y, ORANGE, Align::Left, 4.0);
         let headline = ui.fit(Face::Display, 88.0, &item.title, 1080.0);
@@ -946,7 +1222,7 @@ impl Online {
             let track = Rect::new(mx, y + 18.0, 640.0, 8.0);
             scene.rect(track, 4.0, WHITE.with_alpha(0.14));
             let f = match g.total {
-                Some(t) if t > 0 && g.stage == "Downloading" => (g.got as f32 / t as f32).clamp(0.0, 1.0),
+                Some(t) if t > 0 && g.stage != "Cancelling" => (g.got as f32 / t as f32).clamp(0.0, 1.0),
                 _ => 0.0,
             };
             if f > 0.0 {
@@ -987,7 +1263,7 @@ impl Online {
         self.draw_shelf(ui, scene);
     }
 
-    /// "Internet Archive | Flash Museum" with the current one lit, at the shelf's head.
+    /// "Internet Archive | Flash Museum | Flashpoint" with the current one lit, at the shelf's head.
     fn draw_source_switch(&self, ui: &mut Ui, scene: &mut Scene) {
         let mut x = crate::menu::RIGHT;
         for (i, s) in SOURCES.iter().enumerate().rev() {
@@ -1006,7 +1282,7 @@ impl Online {
         use crate::menu::{LIFT, MARGIN, SHELF_HEAD_Y, SHELF_TILES_Y, TILE_GAP, TILE_H, TILE_RADIUS, TILE_W};
         let source = self.src();
         let l = self.list();
-        let head = if l.words.is_empty() { "Most played".to_string() } else { format!("\u{201c}{}\u{201d}", l.words) };
+        let head = if l.words.is_empty() { source.listing().to_string() } else { format!("\u{201c}{}\u{201d}", l.words) };
         let hw = scene.text(ui, Face::SemiBold, 30.0, &head, MARGIN, SHELF_HEAD_Y, INK, Align::Left, 0.0);
         let count = match (l.total, l.loading) {
             (Some(t), _) => format!("{} of {}", l.items.len(), thousands(t)),
@@ -1130,7 +1406,7 @@ mod tests {
         let first = choose_folder(&games, Source::InternetArchive, &item);
         assert_eq!(first, format!("{games}/Alien Hominid"));
         std::fs::create_dir_all(&first).unwrap();
-        std::fs::write(format!("{first}/online.txt"), online_txt(Source::InternetArchive, &item, "ah.swf")).unwrap();
+        std::fs::write(format!("{first}/online.txt"), online_txt(Source::InternetArchive, &item, "ah.swf", None, None, None)).unwrap();
         // the same game: the same folder
         assert_eq!(choose_folder(&games, Source::InternetArchive, &item), first);
         // another game with that title: title and id
@@ -1190,6 +1466,10 @@ mod tests {
             ],
             referer: None,
             note: "test".into(),
+            address: Some("http://localflash/Game.swf".into()),
+            archive: None,
+            launch: None,
+            beside: None,
         };
         let client = Client::new("test");
         let cancel = AtomicBool::new(false);
@@ -1204,7 +1484,7 @@ mod tests {
         let cover = std::fs::read(format!("{folder}/cover.png")).unwrap();
         assert_eq!(crate::ui::decode_png(&cover).unwrap().0, 2);
         let o = read_online_txt(&format!("{folder}/online.txt"));
-        assert_eq!((o["movie"].as_str(), o["title"].as_str()), ("Game.swf", "A Game: Part 1"));
+        assert_eq!((o["movie"].as_str(), o["title"].as_str(), o["url"].as_str()), ("Game.swf", "A Game: Part 1", "http://localflash/Game.swf"));
         assert!(stages.contains(&"Downloading") && stages.contains(&"Its picture"), "{stages:?}");
         // no partial files left
         let leftovers: Vec<String> = walk(&folder).into_iter().filter(|p| p.ends_with(".part") || p.ends_with(".tmp")).collect();
@@ -1217,11 +1497,207 @@ mod tests {
         let games = temp("notswf");
         let (port, server) = serve(vec![("/x.swf", 200, b"<html>blocked</html>".to_vec())], 1);
         let item = Item { id: "x".into(), title: "X".into(), ..Item::default() };
-        let files = Files { main: r5net::RemoteFile { name: "x.swf".into(), url: format!("http://127.0.0.1:{port}/x.swf"), size: None }, extra: vec![], referer: None, note: String::new() };
+        let files = Files { main: r5net::RemoteFile { name: "x.swf".into(), url: format!("http://127.0.0.1:{port}/x.swf"), size: None }, extra: vec![], referer: None, note: String::new(), address: None, archive: None, launch: None, beside: None };
         let e = fetch_files(&Client::new("t"), Source::FlashMuseum, &item, &files, &games, &AtomicBool::new(false), &mut |_, _, _| {}).unwrap_err();
         server.join().unwrap();
         assert!(e.contains("is not a Flash movie (it starts 3c 68 74 6d"), "{e}");
         assert!(!std::path::Path::new(&format!("{games}/X")).exists());
+        let _ = std::fs::remove_dir_all(&games);
+    }
+
+    #[test]
+    fn movies_zip_paths_and_cast_names() {
+        assert_eq!(movie_kind("a/Game.SWF"), Some(MovieKind::Flash));
+        assert_eq!(movie_kind("game.dcr"), Some(MovieKind::Director));
+        assert_eq!(movie_kind("x.DXR"), Some(MovieKind::Director));
+        assert_eq!(movie_kind("x.dir"), Some(MovieKind::Director));
+        assert_eq!(movie_kind("x.cct"), None);
+        // zip paths stay as they are (a movie asks for its files by these names)...
+        assert_eq!(zip_rel("content/www.Example.com/My Games/game.dcr").as_deref(), Some("content/www.Example.com/My Games/game.dcr"));
+        assert_eq!(zip_rel("content\\a\\b.cct").as_deref(), Some("content/a/b.cct"));
+        assert_eq!(zip_rel("./content//a/./b.txt").as_deref(), Some("content/a/b.txt"));
+        // ...but never leave the folder
+        assert_eq!(zip_rel("content/../../x"), None);
+        assert_eq!(zip_rel("/"), None);
+        assert_eq!(zip_rel("content/a\u{0}b"), None);
+        // a cast as DirPlayer asks for it (cast_manager.rs, normalize_cast_lib_path): Teen Titans:
+        // Battle Blitz's cast list names "C:\_PROJECTS\Battle Blitz 2.0\_dev\source_11_26_03\empty_Robin.cst"
+        assert_eq!(cast_file_name("C:\\_PROJECTS\\Battle Blitz 2.0\\_dev\\source_11_26_03\\empty_Robin.cst").as_deref(), Some("empty_Robin.cct"));
+        assert_eq!(cast_file_name("Macintosh HD:Games:Shared.cxt").as_deref(), Some("Shared.cct"));
+        assert_eq!(cast_file_name("sounds").as_deref(), Some("sounds.cct"));
+        assert_eq!(cast_file_name("a.b.cst").as_deref(), Some("a.b.cct"));
+        assert_eq!(cast_file_name(""), None);
+    }
+
+    #[test]
+    fn a_movie_in_a_zip_has_its_own_address() {
+        let launch = "http://www.Example.test/games/tt/game.dcr";
+        assert_eq!(address_in_zip(launch, "content/www.Example.test/games/tt/game.dcr"), launch);
+        assert_eq!(address_in_zip(launch, "content/www.example.test/GAMES/tt/game.dcr"), launch);
+        // the entry starts at a web page; the movie in the zip is elsewhere
+        assert_eq!(address_in_zip("http://host.test/play/index.html", "content/host.test/play/swf/My Game.dcr"), "http://host.test/play/swf/My%20Game.dcr");
+        assert_eq!(address_in_zip("https://host.test/index.html", "content/host.test/a.dcr"), "https://host.test/a.dcr");
+    }
+
+    /// A zip of stored files, as a game data zip is laid out.
+    fn stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut cd = Vec::new();
+        for (name, body) in files {
+            let mut crc = flate2::Crc::new();
+            crc.update(body);
+            let offset = out.len() as u32;
+            let head = |sig: &[u8], v: &mut Vec<u8>| {
+                v.extend_from_slice(sig);
+            };
+            head(&[0x50, 0x4b, 0x03, 0x04, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0], &mut out);
+            out.extend_from_slice(&crc.sum().to_le_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(body);
+            head(&[0x50, 0x4b, 0x01, 0x02, 20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0], &mut cd);
+            cd.extend_from_slice(&crc.sum().to_le_bytes());
+            cd.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            cd.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            cd.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            cd.extend_from_slice(&[0; 12]);
+            cd.extend_from_slice(&offset.to_le_bytes());
+            cd.extend_from_slice(name.as_bytes());
+        }
+        let cd_offset = out.len() as u32;
+        out.extend_from_slice(&cd);
+        out.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0]);
+        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(cd.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out
+    }
+
+    fn sha256_of(bytes: &[u8]) -> String {
+        let dir = temp("sha");
+        let p = format!("{dir}/x");
+        std::fs::write(&p, bytes).unwrap();
+        let sum = r5net::sha256_file(std::path::Path::new(&p)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        sum
+    }
+
+    fn game_data_files(base: &str, zip_sha: String) -> Files {
+        let movie_url = "http://www.Example.test/games/tt/game.dcr".to_string();
+        Files {
+            main: r5net::RemoteFile { name: "id-1.zip".into(), url: format!("{base}/primary/id-1.zip"), size: None },
+            extra: vec![],
+            referer: None,
+            note: "test".into(),
+            address: Some(movie_url.clone()),
+            archive: Some(r5net::Archive { sha256: zip_sha, mirrors: vec![format!("{base}/mirror/id-1.zip")], movie: r5net::fp::zip_path(&movie_url).unwrap() }),
+            launch: Some(format!("{movie_url} --forceTheExitLock 0 --do \"member('u').text = 'x'\"")),
+            beside: None,
+        }
+    }
+
+    #[test]
+    fn a_game_data_zip_is_checked_unpacked_and_started_as_its_source_starts_it() {
+        let games = temp("gamedata");
+        let mut dcr = b"XFIR".to_vec();
+        dcr.extend_from_slice(&[7u8; 60]);
+        let zip = stored_zip(&[
+            ("content.json", b"{}"),
+            ("content/www.Example.test/games/tt/game.dcr", &dcr),
+            ("content/www.Example.test/games/tt/Sound.cct", b"XFIRcast"),
+            ("content/www.Example.test/shared/levels/one.txt", b"level one"),
+            ("content/../escape.txt", b"no"),
+        ]);
+        // the first address fails: the mirror serves it
+        let (port, server) = serve(vec![("/primary/id-1.zip", 404, vec![]), ("/mirror/id-1.zip", 200, zip.clone())], 2);
+        let base = format!("http://127.0.0.1:{port}");
+        let item = Item { id: "id-1".into(), title: "Battle: The Game".into(), ..Item::default() };
+        let files = game_data_files(&base, sha256_of(&zip));
+        let mut stages = Vec::new();
+        let movie = fetch_files(&Client::new("t"), Source::Flashpoint, &item, &files, &games, &AtomicBool::new(false), &mut |s, _, _| stages.push(s)).unwrap();
+        server.join().unwrap();
+        let folder = format!("{games}/Battle The Game");
+        assert_eq!(movie, format!("{folder}/content/www.Example.test/games/tt/game.dcr"));
+        assert_eq!(std::fs::read(&movie).unwrap(), dcr);
+        assert_eq!(std::fs::read(format!("{folder}/content/www.Example.test/games/tt/Sound.cct")).unwrap(), b"XFIRcast");
+        assert_eq!(std::fs::read_to_string(format!("{folder}/content/www.Example.test/shared/levels/one.txt")).unwrap(), "level one");
+        // content.json is not unpacked, nothing climbs out, the zip is gone
+        let mut all = walk(&folder);
+        all.sort();
+        let rel: Vec<String> = all.iter().map(|p| p[folder.len() + 1..].to_string()).collect();
+        assert_eq!(rel, ["content/www.Example.test/games/tt/Sound.cct", "content/www.Example.test/games/tt/game.dcr", "content/www.Example.test/shared/levels/one.txt", "online.txt"]);
+        assert!(!std::path::Path::new(&format!("{games}/escape.txt")).exists());
+        assert!(stages.contains(&"Downloading") && stages.contains(&"Checking it") && stages.contains(&"Unpacking"), "{stages:?}");
+        // online.txt: how it starts
+        let o = read_online_txt(&format!("{folder}/online.txt"));
+        assert_eq!(o["movie"], "content/www.Example.test/games/tt/game.dcr");
+        assert_eq!(o["webroot"], "content");
+        let l = launch_for(&movie).unwrap();
+        assert_eq!(l.url.as_deref(), Some("http://www.Example.test/games/tt/game.dcr"));
+        assert_eq!(l.command.as_deref(), files.launch.as_deref());
+        assert_eq!(l.web_root, Some(format!("{folder}/content")));
+        assert_eq!(address_for(&movie).as_deref(), Some("http://www.Example.test/games/tt/game.dcr"));
+        // another movie in the folder is not the one online.txt names
+        assert_eq!(launch_for(&format!("{folder}/content/www.Example.test/games/tt/Sound.cct")), None);
+        assert_eq!(installed(&games).get("flashpointarchive.org:id-1"), Some(&movie));
+        let _ = std::fs::remove_dir_all(&games);
+    }
+
+    #[test]
+    fn a_game_data_zip_that_is_not_the_one_listed_is_refused_and_leaves_nothing() {
+        let games = temp("gamedata-bad");
+        let zip = stored_zip(&[("content/www.Example.test/games/tt/game.dcr", b"XFIRXFIR")]);
+        let (port, server) = serve(vec![("/primary/id-1.zip", 200, zip.clone())], 1);
+        let item = Item { id: "id-1".into(), title: "Bad".into(), ..Item::default() };
+        let files = game_data_files(&format!("http://127.0.0.1:{port}"), "0".repeat(64));
+        let e = fetch_files(&Client::new("t"), Source::Flashpoint, &item, &files, &games, &AtomicBool::new(false), &mut |_, _, _| {}).unwrap_err();
+        server.join().unwrap();
+        assert!(e.contains("not what the archive lists"), "{e}");
+        assert!(!std::path::Path::new(&format!("{games}/Bad")).exists());
+        // a zip whose movie is not a Director movie
+        let zip = stored_zip(&[("content/www.Example.test/games/tt/game.dcr", b"<html>404</html>")]);
+        let (port, server) = serve(vec![("/primary/id-1.zip", 200, zip.clone())], 1);
+        let files = game_data_files(&format!("http://127.0.0.1:{port}"), sha256_of(&zip));
+        let e = fetch_files(&Client::new("t"), Source::Flashpoint, &item, &files, &games, &AtomicBool::new(false), &mut |_, _, _| {}).unwrap_err();
+        server.join().unwrap();
+        assert!(e.contains("game.dcr is not a Director movie (it starts 3c 68 74 6d"), "{e}");
+        assert!(!std::path::Path::new(&format!("{games}/Bad")).exists());
+        let _ = std::fs::remove_dir_all(&games);
+    }
+
+    #[test]
+    fn a_movie_alone_reads_no_casts_from_a_cut_off_file() {
+        // a Director movie fetched alone, with a folder to fetch its casts from: its cast list is
+        // read only from a whole file (RIFX length + 8 = its size); this one is cut off
+        let games = temp("legacy-cut");
+        let mut dcr = b"XFIR".to_vec();
+        dcr.extend_from_slice(&5000u32.to_le_bytes());
+        dcr.extend_from_slice(b"MDGF");
+        dcr.extend_from_slice(&[0u8; 100]);
+        let (port, server) = serve(vec![("/htdocs/h/game.dcr", 200, dcr.clone())], 1);
+        let base = format!("http://127.0.0.1:{port}/htdocs/h/");
+        let item = Item { id: "cut".into(), title: "Cut".into(), ..Item::default() };
+        let files = Files {
+            main: r5net::RemoteFile { name: "game.dcr".into(), url: format!("{base}game.dcr"), size: None },
+            extra: vec![],
+            referer: None,
+            note: "legacy".into(),
+            address: Some("http://h/game.dcr".into()),
+            archive: None,
+            launch: Some("http://h/game.dcr".into()),
+            beside: Some(base),
+        };
+        let movie = fetch_files(&Client::new("t"), Source::Flashpoint, &item, &files, &games, &AtomicBool::new(false), &mut |_, _, _| {}).unwrap();
+        server.join().unwrap();
+        assert_eq!(movie, format!("{games}/Cut/game.dcr"));
+        let o = read_online_txt(&format!("{games}/Cut/online.txt"));
+        assert_eq!((o["movie"].as_str(), o["url"].as_str(), o["launch"].as_str()), ("game.dcr", "http://h/game.dcr", "http://h/game.dcr"));
+        assert!(o.get("webroot").is_none());
         let _ = std::fs::remove_dir_all(&games);
     }
 

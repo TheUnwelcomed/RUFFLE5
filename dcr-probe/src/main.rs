@@ -25,6 +25,17 @@
 //! Sound goes nowhere, but it is mixed as the console would (`native_audio::mix`, in step with the
 //! clock), so a sound's end reaches the movie as it would there; the status line counts the voices.
 //!
+//! Text in a font the movie does not carry is drawn with the Liberation fonts, as Ruffle5 draws it:
+//! from /usr/share/fonts/truetype/liberation (Debian/Ubuntu: fonts-liberation), or the folder in
+//! DCR_PROBE_FONTS. The movie gets DirPlayer's system font as on the console (NativePlayer::new);
+//! DCR_PROBE_NO_SYSTEM_FONT=1 leaves it out. The state at the end counts the strings drawn so.
+//! Note: a scripted `click` moves the mouse and clicks at once, so a mouseEnter the move causes
+//! reaches the movie after the click; put a `move` to the spot before it, as a player would.
+//!
+//! A game the Online tab fetched starts as Ruffle5 starts it: DCR_PROBE_LAUNCH its launch command
+//! (online.txt `launch`), DCR_PROBE_ADDRESS the address it was published at (`url`),
+//! DCR_PROBE_WEBROOT the folder its web addresses are read from (`webroot`: Flashpoint's content/).
+//!
 //! DCR_PROBE_BENCH=1 first prints the CPU / clock / memory benchmark Ruffle5 logs on the console.
 //! DCR_PROBE_FAST=1: no waiting for the display refresh (frames still at most at the tempo).
 //! DCR_PROBE_COMPARE=1: every stage rendered a second time without DirPlayer's upright blit fast
@@ -265,6 +276,8 @@ async fn show(player: &TestPlayer, expr: &str) {
 /// The movie's state, for telling where a game waits.
 async fn dump(player: &TestPlayer) {
     println!("[probe] ---- state ----");
+    let (measured, drawn) = vm_rust::player::native_text::counts();
+    println!("[probe] system-font text: {measured} strings measured, {drawn} drawn");
     for e in ["_movie.name", "_movie.path", "_movie.frame", "_movie.frameLabel", "_player.productVersion", "_system.environmentPropList"] {
         show(player, e).await;
     }
@@ -594,8 +607,34 @@ fn main() {
     }
     let prof_out = out.join("prof.txt");
     println!("[probe] movie {} for {seconds} s, a picture every {every} s, {} scripted inputs", movie.display(), script.len());
+    // text in system fonts: the Liberation fonts, as Ruffle5 gives them (DCR_PROBE_FONTS: their folder)
+    let fonts_dir = std::env::var("DCR_PROBE_FONTS").unwrap_or_else(|_| "/usr/share/fonts/truetype/liberation".into());
+    let fonts = vm_rust::player::native_text::add_liberation_fonts(&fonts_dir);
+    println!("[probe] {fonts} fonts for system-font text from {fonts_dir}");
     run_test(async move {
         let mut player = TestPlayer::new();
+        // the system font, as NativePlayer::new loads it (DCR_PROBE_NO_SYSTEM_FONT=1: without it)
+        if std::env::var_os("DCR_PROBE_NO_SYSTEM_FONT").is_none() {
+            if let Err(e) = vm_rust::player::reserve_player_mut(|p| vm_rust::player::font::native_load_system_font(p)) {
+                println!("[probe] system font: {e}");
+            }
+        }
+        // as Ruffle5 starts a game the Online tab fetched (src/shockwave.rs): its launch command,
+        // the address it was published at, the folder its web addresses are read from
+        if let Ok(cmd) = std::env::var("DCR_PROBE_LAUNCH") {
+            let lc = vm_rust::player::native::parse_launch_command(&cmd);
+            println!("[probe] launch command: {lc:?}");
+            vm_rust::player::native::apply_launch_command(&lc);
+        }
+        if let Ok(address) = std::env::var("DCR_PROBE_ADDRESS") {
+            println!("[probe] movie address {address}");
+            vm_rust::player::native::set_movie_address(&address);
+        }
+        if let Ok(root) = std::env::var("DCR_PROBE_WEBROOT") {
+            println!("[probe] web addresses read from {root}");
+            vm_rust::player::native::set_web_root(&root);
+        }
+        vm_rust::player::native::run_launch_do_before().await;
         let t0 = Instant::now();
         player.load_movie(movie.to_str().expect("UTF-8 path")).await;
         println!("[probe] loaded in {:.2} s", t0.elapsed().as_secs_f64());

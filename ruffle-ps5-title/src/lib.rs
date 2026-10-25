@@ -50,6 +50,16 @@
 //! from the menu, over HTTPS (rustls with RustCrypto) on the console's sockets; `sceNetInit` from the
 //! shell (V6) before the first socket; a rescan reuses the GPU pictures it replaces.
 //!
+//! 1.000.028 (2026-10-25): Shockwave (DirPlayer patch): text in fonts a movie does not carry drawn
+//! with the Liberation fonts as a browser's canvas measures it, DirPlayer's system font, the event
+//! loop after each frame (mouseEnter / mouseLeave / mouseWithin), a film loop's own `go`, what a
+//! movie asks of a browser answered with a notice instead of stopping the title, setPref/getPref in
+//! the game's saves folder, file names found whatever their case. The Online tab: Flashpoint
+//! Archive's Shockwave games (net/src/fp.rs; its game data zips checked against their SHA-256 and
+//! unpacked, net/src/zip.rs), started as the archive starts them (online.txt `launch`, `url`,
+//! `webroot`: src/shockwave.rs); archive.org without its sub-collections; Flash Museum through its
+//! player's settings. The menu: OPTIONS deletes a game; Settings › Library › Keep online games.
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -57,7 +67,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.027";
+pub const APP_VERSION: &str = "1.000.028";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 
@@ -416,6 +426,9 @@ fn run_app(gpu: gpu::Gpu, paths: paths::Paths) -> Result<(), String> {
                 }
                 Some(menu::Action::ClearRecent) => {}
                 Some(menu::Action::Setting(row)) => apply_setting(&mut app, row, &mut bg),
+                Some(menu::Action::Delete(gi)) => {
+                    delete_game(&mut app, gi, "");
+                }
                 None => {}
             }
             if app.input.nav != 0 {
@@ -458,6 +471,32 @@ fn run_app(gpu: gpu::Gpu, paths: paths::Paths) -> Result<(), String> {
                 break;
             }
             say("game: restarting");
+        }
+        // 1.000.028: Settings › Library › Keep online games Off: a game the Online tab fetched goes
+        // when it is left
+        if !app.settings.keep_online && app.menu.games.get(gi).is_some_and(|g| g.online) {
+            delete_game(&mut app, gi, " (Keep online games is Off)");
+        }
+    }
+}
+
+/// Delete game `gi` (Menu::delete_game: its folder or file; saves stay), look again, and say so.
+#[cfg(feature = "ruffle")]
+fn delete_game(app: &mut App, gi: usize, why: &str) {
+    let Some(name) = app.menu.games.get(gi).map(|g| g.name.clone()) else {
+        return;
+    };
+    match app.menu.delete_game(gi) {
+        Ok(gone) => {
+            say(&format!("menu: deleted {name}{why}: {gone}"));
+            let focus = app.menu.focus();
+            rescan(app);
+            app.menu.set_focus(focus);
+            app.menu.toast(&format!("Deleted {name}{why}"));
+        }
+        Err(e) => {
+            say(&format!("warn menu: {name} not deleted: {e}"));
+            app.menu.toast(&format!("{name} was not deleted (see ruffle.log)"));
         }
     }
 }
