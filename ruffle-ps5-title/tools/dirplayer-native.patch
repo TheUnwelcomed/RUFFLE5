@@ -857,7 +857,7 @@ index 9d1fa62f..596427ac 100644
          }
      }
 diff --git a/vm-rust/src/player/events.rs b/vm-rust/src/player/events.rs
-index 184a4962..04080f5c 100644
+index 184a4962..d35d06e5 100644
 --- a/vm-rust/src/player/events.rs
 +++ b/vm-rust/src/player/events.rs
 @@ -115,13 +115,27 @@ pub fn player_dispatch_event_to_sprite(
@@ -872,13 +872,13 @@ index 184a4962..04080f5c 100644
 +/// `getMouseSpriteIDFromPos`, sprite.cpp `respondsToMouse`: from D6 any behaviour, a
 +/// script with mouse handlers; also a moveable sprite or a button, which this does not
 +/// count). The front-most sprite of any kind made Teen Titans Battle Blitz's select
-+/// screen flicker every frame: a fighter's tile (channel 25, its behaviour shows
-+/// sprite(fighterID + 50) on mouseEnter and hides it on mouseLeave) is covered by that
-+/// highlight (channel 52, no script) once shown, so the tile was left, the highlight
-+/// hidden, the tile entered again on the next frame... A sprite without scripts in
-+/// front also took the events from Merlin's Revenge's Start button (its label, sprite 66,
-+/// over the button, sprite 65 — see `get_sprites_at`). Matematik i Maaneby's houses
-+/// carry behaviours, so the front-most one is still the only one hovered.
++/// screen flicker every frame: a fighter's tile (Cyborg's: channel 25, one behaviour, which
++/// shows sprite(fighterID + 50) on mouseEnter and hides it on mouseLeave) is covered by that
++/// highlight (channel 53, "cyborg_white.stroke", no script) once shown, so the tile was
++/// left, the highlight hidden, the tile entered again on the next frame. A sprite without
++/// scripts in front also took the events from Merlin's Revenge's Start button (its label,
++/// sprite 66, over the button, sprite 65 — see `get_sprites_at`). Matematik i Maaneby's
++/// houses carry behaviours, so the front-most one is still the only one hovered.
  pub fn dispatch_rollover_events() {
      let (now_hovered, prev_hovered) = reserve_player_mut(|player| {
          let (x, y) = player.mouse_loc;
