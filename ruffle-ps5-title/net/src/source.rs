@@ -9,20 +9,24 @@ pub enum Source {
     FlashMuseum,
     /// 1.000.028: Flashpoint Archive's Shockwave games (src/fp.rs).
     Flashpoint,
+    /// 1.000.033: Flashpoint Archive's Flash games (src/fp.rs, the same archive and API).
+    FlashpointFlash,
 }
 
 /// The sources Flash Browser lists, in its order. 1.000.032: Flash Museum is no longer one of them.
 /// Its file server refused the movies on the console ("403 Forbidden" for games.flashmuseum.net,
 /// 2026-10-25), and Ruffle5 does not try to get around a site refusing it. Its code (src/fm.rs)
 /// stays; games fetched from it before still play (their online.txt names the movie).
-pub const SOURCES: [Source; 2] = [Source::InternetArchive, Source::Flashpoint];
+/// 1.000.033: Flashpoint's Flash games, beside its Shockwave ones.
+pub const SOURCES: [Source; 3] = [Source::InternetArchive, Source::FlashpointFlash, Source::Flashpoint];
 
 impl Source {
     pub fn name(self) -> &'static str {
         match self {
             Source::InternetArchive => "Internet Archive",
             Source::FlashMuseum => "Flash Museum",
-            Source::Flashpoint => "Flashpoint",
+            Source::Flashpoint => "Flashpoint Shockwave",
+            Source::FlashpointFlash => "Flashpoint Flash",
         }
     }
 
@@ -31,14 +35,15 @@ impl Source {
         match self {
             Source::InternetArchive => "archive.org",
             Source::FlashMuseum => "flashmuseum.net",
-            Source::Flashpoint => "flashpointarchive.org",
+            // one archive, one id space: a game is the same game whichever list it came from
+            Source::Flashpoint | Source::FlashpointFlash => "flashpointarchive.org",
         }
     }
 
     /// What it lists: Flash movies, or (Flashpoint, as Ruffle5 asks it) Shockwave ones.
     pub fn plays(self) -> &'static str {
         match self {
-            Source::InternetArchive | Source::FlashMuseum => "Flash",
+            Source::InternetArchive | Source::FlashMuseum | Source::FlashpointFlash => "Flash",
             Source::Flashpoint => "Shockwave",
         }
     }
@@ -49,12 +54,13 @@ impl Source {
         match self {
             Source::InternetArchive => "Most played",
             Source::FlashMuseum => "Games",
-            Source::Flashpoint => "A to Z",
+            Source::Flashpoint | Source::FlashpointFlash => "A to Z",
         }
     }
 
     pub fn from_site(s: &str) -> Option<Source> {
         [Source::InternetArchive, Source::FlashMuseum, Source::Flashpoint].into_iter().find(|x| x.site() == s.trim())
+        // (Flashpoint's Flash list shares the site; the key a game is known by is the site's)
     }
 
     /// A page of results: `words` empty lists everything, as [`Source::listing`] says.
@@ -62,7 +68,8 @@ impl Source {
         match self {
             Source::InternetArchive => crate::ia::search(client, words, page),
             Source::FlashMuseum => crate::fm::search(client, words, page),
-            Source::Flashpoint => crate::fp::search(client, words, page),
+            Source::Flashpoint => crate::fp::search(client, crate::fp::SHOCKWAVE, words, page),
+            Source::FlashpointFlash => crate::fp::search(client, crate::fp::FLASH, words, page),
         }
     }
 
@@ -71,7 +78,7 @@ impl Source {
         match self {
             Source::InternetArchive => crate::ia::files(client, &item.id),
             Source::FlashMuseum => crate::fm::files(client, item),
-            Source::Flashpoint => crate::fp::files(item),
+            Source::Flashpoint | Source::FlashpointFlash => crate::fp::files(item),
         }
     }
 }
@@ -94,6 +101,9 @@ pub struct Item {
     /// 1.000.028: what the source needs later to name the item's files, kept from the listing
     /// (Flashpoint: the entry's game data and launch command, as JSON).
     pub data: Option<String>,
+    /// 1.000.033: how the source itself plays it with Ruffle, when it does (Flashpoint's
+    /// `ruffleSupport`: "standalone", "webhosted"; its launcher then runs the game in Ruffle).
+    pub ruffle: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

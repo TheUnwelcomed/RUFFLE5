@@ -42,7 +42,7 @@ use crate::ui::{Align, Face, Rect, Scene, W};
 use crate::widgets::{self, centred, draw_hold_bar, ease, Glyph, BLACK, BLUE_2, BLUE_6, BLUE_9, INK, NIGHT, ORANGE};
 use crate::{say, App};
 use ruffle_core::backend::audio::{AudioBackend, NullAudioBackend};
-use ruffle_core::backend::navigator::{NullExecutor, NullNavigatorBackend};
+use ruffle_core::backend::navigator::NullExecutor;
 use ruffle_core::config::Letterbox;
 use ruffle_core::external::{ExternalInterfaceProvider, Value as ExternalValue};
 use ruffle_core::tag_utils::SwfMovieData;
@@ -253,13 +253,16 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
     };
     let mut executor = NullExecutor::new();
     let base = std::path::Path::new(&path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    let navigator = match NullNavigatorBackend::with_base_path(&base, &executor) {
-        Ok(n) => n,
-        Err(e) => {
-            say(&format!("warn navigator base path {}: {e} (relative loads off)", base.display()));
-            NullNavigatorBackend::new()
-        }
-    };
+    // 1.000.033: a game fetched from Flashpoint reads the files it loads by web address from its
+    // game data's `content` (online.txt `webroot`), as Flashpoint's proxy serves them (src/navigator.rs)
+    let web_root = crate::online::launch_for(&path).and_then(|l| l.web_root);
+    let (navigator, base_err) = crate::navigator::Ps5Navigator::new(&base, web_root.as_deref().map(std::path::Path::new), &executor);
+    if let Some(e) = base_err {
+        say(&format!("warn navigator base path {}: {e} (relative loads off)", base.display()));
+    }
+    if let Some(root) = navigator.web_root() {
+        say(&format!("     files by web address from {}", root.display()));
+    }
     let ui_state = std::sync::Arc::new(crate::ps5ui::UiState::default());
     let quality = [
         StageQuality::Low,
@@ -302,15 +305,17 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
         // A console app is always full screen; games see that, and "Fullscreen Only" does what it says.
         .with_fullscreen(true)
         .with_autoplay(true);
-    // The Pretend Site setting; else, for a game the Online tab fetched, the address its source
-    // plays it from (online.txt `url`: Flash Museum's launchCommand).
-    let spoof = s.spoofed_url(&path).or_else(|| {
-        let a = crate::online::address_for(&path);
-        if let Some(a) = &a {
+    // For a game Flash Browser fetched, the address its source plays it from (online.txt `url`:
+    // Flashpoint's launch address); else the Pretend Site setting. 1.000.033: the game's own address
+    // first — a Flashpoint game's files are read by their addresses (src/navigator.rs), and a movie
+    // that builds them from its own address would look under the pretend site's.
+    let spoof = match crate::online::address_for(&path) {
+        Some(a) => {
             say(&format!("     address {a} (online.txt)"));
+            Some(a)
         }
-        a
-    });
+        None => s.spoofed_url(&path),
+    };
     if spoof.is_some() {
         builder = builder.with_spoofed_url(spoof.clone());
     }

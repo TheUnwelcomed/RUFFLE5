@@ -17,6 +17,13 @@
 //!   * its picture: `infinity.flashpointarchive.org/images/<logoPath>` (PNG);
 //!   * how it starts: a Shockwave Projector command — the movie's address, then flags
 //!     (`--forceTheExitLock 0`, `--do "…"`) that Ruffle5 hands DirPlayer (online.txt `launch`).
+//!
+//! 1.000.033: its Flash games as well (`platform:Flash`, `!Flash words`). A Flash entry's launch
+//! command is the movie's address; Flashpoint's own launcher (FlashpointProject/launcher e5f45fc,
+//! extensions/core-ruffle) runs a game in standalone Ruffle when its `ruffleSupport` is
+//! "standalone" (in Ruffle's web player when "webhosted"), with that address as the movie and its
+//! proxy serving the game data's `content/<host>/<path>`; Ruffle5 plays the movie from the
+//! unpacked game data as if from that address, the files it loads read from `content/` (src/game.rs).
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use serde_json::Value;
@@ -33,18 +40,22 @@ pub const GAME_DATA: [&str; 2] = ["https://download.flashpointarchive.org/gib-ro
 pub const IMAGES: &str = "https://infinity.flashpointarchive.org/images/";
 pub const LEGACY: &str = "https://infinity.flashpointarchive.org/Flashpoint/Legacy/htdocs/";
 
-/// The search: every Shockwave entry, or those matching the words.
-pub fn query(words: &str) -> String {
+/// The platforms Ruffle5 lists, as the archive names them.
+pub const SHOCKWAVE: &str = "Shockwave";
+pub const FLASH: &str = "Flash";
+
+/// The search: every entry of the platform, or those matching the words.
+pub fn query(platform: &str, words: &str) -> String {
     let w = search_words(words);
     if w.is_empty() {
-        "platform:Shockwave".to_string()
+        format!("platform:{platform}")
     } else {
-        format!("!Shockwave {}", w.join(" "))
+        format!("!{platform} {}", w.join(" "))
     }
 }
 
-pub fn search_url(words: &str, page: u32) -> String {
-    format!("{API}?query={}&limit={ROWS}&page={}&sort=title", encode_component(&query(words)), page.max(1))
+pub fn search_url(platform: &str, words: &str, page: u32) -> String {
+    format!("{API}?query={}&limit={ROWS}&page={}&sort=title", encode_component(&query(platform, words)), page.max(1))
 }
 
 /// The API's answer for one entry (online.txt `page`).
@@ -89,6 +100,7 @@ pub fn parse_search(v: &Value, page: u32) -> Result<Page, Error> {
             page: entry_url(&id),
             downloads: None,
             data: Some(data.to_string()),
+            ruffle: text(g, "ruffleSupport").map(|r| r.to_ascii_lowercase()).filter(|r| r == "standalone" || r == "webhosted"),
             id,
         });
     }
@@ -99,8 +111,8 @@ pub fn parse_search(v: &Value, page: u32) -> Result<Page, Error> {
     Ok(Page { items, total, more })
 }
 
-pub fn search(client: &Client, words: &str, page: u32) -> Result<Page, Error> {
-    let v = client.get_json(&search_url(words, page))?;
+pub fn search(client: &Client, platform: &str, words: &str, page: u32) -> Result<Page, Error> {
+    let v = client.get_json(&search_url(platform, words, page))?;
     parse_search(&v, page)
 }
 
@@ -239,18 +251,35 @@ pub fn is_director_name(name: &str) -> bool {
     [".dcr", ".dir", ".dxr"].iter().any(|e| n.ends_with(e))
 }
 
+pub fn is_flash_name(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".swf")
+}
+
 /// The movie in a game data zip: the file at the launch address (`wanted`), else — the address
-/// being a web page or not in the zip — the zip's one Director movie. Returns its index.
+/// being a web page or not in the zip — the zip's one movie of the kind the address names (a
+/// .swf: Flash; .dcr/.dir/.dxr: Director; anything else: either). Returns its index.
 pub fn pick_movie(names: &[String], wanted: &str) -> Result<usize, String> {
     let norm = |s: &str| s.replace('\\', "/").to_lowercase();
     let want = norm(wanted);
-    if let Some(i) = names.iter().position(|n| norm(n) == want) {
+    let (flash, director) = (is_flash_name(&want), is_director_name(&want));
+    // the file at the address, when that is a movie (a web page in the zip is not the movie)
+    if let Some(i) = names.iter().position(|n| norm(n) == want).filter(|_| flash || director) {
         return Ok(i);
     }
-    let movies: Vec<usize> = (0..names.len()).filter(|&i| is_director_name(&names[i]) && norm(&names[i]).starts_with("content/")).collect();
+    let kind_ok = |n: &str| match (flash, director) {
+        (true, _) => is_flash_name(n),
+        (_, true) => is_director_name(n),
+        _ => is_flash_name(n) || is_director_name(n),
+    };
+    let movies: Vec<usize> = (0..names.len()).filter(|&i| kind_ok(&names[i]) && norm(&names[i]).starts_with("content/")).collect();
+    let what = match (flash, director) {
+        (true, _) => "Flash movie",
+        (_, true) => "Director movie",
+        _ => "movie",
+    };
     match movies.len() {
         1 => Ok(movies[0]),
-        0 => Err(format!("its game data has no Director movie (the entry starts at {wanted})")),
+        0 => Err(format!("its game data has no {what} (the entry starts at {wanted})")),
         n => {
             let shown: Vec<&str> = movies.iter().take(4).map(|&i| names[i].as_str()).collect();
             Err(format!("{wanted} is not in its game data, which has {n} movies ({}{})", shown.join(", "), if n > 4 { ", ..." } else { "" }))
@@ -301,15 +330,15 @@ pub fn files(item: &Item) -> Result<Files, Error> {
     let (host, path) = host_and_path(&movie_url).ok_or_else(|| Error::Other(format!("Flashpoint {}: its movie {movie_url:?} is not a web address", item.id)))?;
     let decoded = decode_percent(&path);
     let file = decoded.rsplit('/').next().unwrap_or("").to_string();
-    if !is_director_name(&file) {
-        return Err(Error::Other(format!("Flashpoint {}: it starts at {movie_url}, not a Director movie, and has no game data", item.id)));
+    if !is_director_name(&file) && !is_flash_name(&file) {
+        return Err(Error::Other(format!("Flashpoint {}: it starts at {movie_url}, not a Flash or Director movie, and has no game data", item.id)));
     }
     let dir = &decoded[..decoded.len() - file.len()];
     Ok(Files {
         main: RemoteFile { name: file, url: format!("{LEGACY}{host}{}", encode_path(&decoded)), size: None },
         extra: Vec::new(),
         referer: None,
-        note: "no game data: the movie from Flashpoint's legacy server".to_string(),
+        note: "no game data: the movie from Flashpoint's legacy server (files it loads are not fetched)".to_string(),
         address: Some(movie_url.clone()),
         archive: None,
         launch: Some(cmd),
@@ -391,8 +420,47 @@ mod tests {
         assert!(f.archive.is_none());
         let web = Item { id: "x".into(), data: Some(r#"{"gameData":[],"legacyLaunchCommand":"http://awesomehouseparty.com/index.html"}"#.into()), ..Item::default() };
         assert!(files(&web).is_err());
-        assert_eq!(query("Duck  Life!"), "!Shockwave duck life");
-        assert_eq!(query(""), "platform:Shockwave");
-        assert_eq!(search_url("", 2), "https://flashpointarchive.org/api/search?query=platform%3AShockwave&limit=48&page=2&sort=title");
+        assert_eq!(query(SHOCKWAVE, "Duck  Life!"), "!Shockwave duck life");
+        assert_eq!(query(SHOCKWAVE, ""), "platform:Shockwave");
+        assert_eq!(search_url(SHOCKWAVE, "", 2), "https://flashpointarchive.org/api/search?query=platform%3AShockwave&limit=48&page=2&sort=title");
+        assert_eq!(query(FLASH, "duck life"), "!Flash duck life");
+        assert_eq!(search_url(FLASH, "", 1), "https://flashpointarchive.org/api/search?query=platform%3AFlash&limit=48&page=1&sort=title");
+    }
+
+    /// A Flash entry, in the shape of the archive's answers (fields as in the 2026-10-24 probe;
+    /// `ruffleSupport` as Flashpoint's launcher reads it).
+    const FLASH_ENTRY: &str = r#"{"total":2,"pages":1,"page":1,"games":[
+        {"id":"aaaa-1","title":"Bounce","developer":"Someone","primaryPlatform":"Flash","platforms":["Flash"],"library":"arcade","ruffleSupport":"Standalone","releaseDate":"2006-05-01","legacyLaunchCommand":"","logoPath":"Logos/aa/aa/aaaa-1.png",
+         "gameData":[{"dateAdded":"2021-04-18T03:28:06.41Z","size":12345,"sha256":"5016dba0bf2a3141489fdeeacd82d63329ecc662bfcc0617dcc186642abeda5c","applicationPath":"FPSoftware\\Flash\\flashplayer_32_sa.exe","launchCommand":"http://www.example.com/games/bounce/bounce.swf"}]},
+        {"id":"bbbb-2","title":"Old One","library":"theatre","ruffleSupport":"","legacyLaunchCommand":"http://old.example.org/toons/old%20one.swf","gameData":[]}]}"#;
+
+    #[test]
+    fn flash_entries_their_ruffle_mark_and_their_movies() {
+        let v: Value = serde_json::from_str(FLASH_ENTRY).unwrap();
+        let page = parse_search(&v, 1).unwrap();
+        assert_eq!(page.items.len(), 2);
+        let (a, b) = (&page.items[0], &page.items[1]);
+        assert_eq!(a.ruffle.as_deref(), Some("standalone"));
+        assert_eq!(b.ruffle, None);
+        assert_eq!(b.kind.as_deref(), Some("Animation"));
+        // game data: the zip, the movie at its address inside it
+        let f = files(a).unwrap();
+        assert_eq!(f.main.url, "https://download.flashpointarchive.org/gib-roms/Games/aaaa-1-1618716486410.zip");
+        assert_eq!(f.archive.as_ref().unwrap().movie, "content/www.example.com/games/bounce/bounce.swf");
+        assert_eq!(f.address.as_deref(), Some("http://www.example.com/games/bounce/bounce.swf"));
+        // no game data: the movie from the legacy server
+        let g = files(b).unwrap();
+        assert_eq!(g.main.url, "https://infinity.flashpointarchive.org/Flashpoint/Legacy/htdocs/old.example.org/toons/old%20one.swf");
+        assert_eq!(g.main.name, "old one.swf");
+        assert!(g.archive.is_none());
+        // a zip whose entry starts at a web page: its one .swf
+        let names: Vec<String> = ["content.json", "content/www.example.com/play.html", "content/www.example.com/game.swf", "content/www.example.com/music.mp3"].map(String::from).to_vec();
+        assert_eq!(pick_movie(&names, "content/www.example.com/play.html"), Ok(2));
+        // a .swf address that is not in the zip: the zip's one .swf, never a Director movie
+        let mixed: Vec<String> = ["content/a/x.dcr", "content/a/y.swf"].map(String::from).to_vec();
+        assert_eq!(pick_movie(&mixed, "content/a/missing.swf"), Ok(1));
+        assert_eq!(pick_movie(&mixed, "content/a/missing.dcr"), Ok(0));
+        assert!(pick_movie(&mixed, "content/a/index.html").unwrap_err().contains("2 movies"));
+        assert!(pick_movie(&names[..2], "content/www.example.com/x.swf").unwrap_err().contains("no Flash movie"));
     }
 }

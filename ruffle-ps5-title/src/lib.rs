@@ -102,6 +102,12 @@
 //! Flash Browser lists the Internet Archive and Flashpoint: Flash Museum's file server refused
 //! the movies (403 Forbidden), so it is no longer a source.
 //!
+//! 1.000.033 (2026-10-25): Flashpoint's Flash games in Flash Browser ("Flashpoint Flash", beside
+//! "Flashpoint Shockwave"), those Flashpoint's own launcher plays with Ruffle marked "Ruffle". A
+//! game from its game data plays as if from its address (online.txt `url`, ahead of the Pretend
+//! Site setting now), and the files it loads by web address are read from the game data's
+//! `content/` (src/navigator.rs), as Flashpoint's proxy serves them.
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -109,7 +115,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.032";
+pub const APP_VERSION: &str = "1.000.033";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 
@@ -146,6 +152,8 @@ mod keyboard;
 mod library;
 #[cfg(feature = "ruffle")]
 mod menu;
+#[cfg(feature = "ruffle")]
+mod navigator;
 #[cfg(feature = "ruffle")]
 mod online;
 #[cfg(feature = "ruffle")]

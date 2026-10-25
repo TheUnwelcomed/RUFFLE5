@@ -114,6 +114,7 @@ pub fn parse_search(v: &Value, page: u32) -> Result<Page, Error> {
             page: details_url(&id),
             downloads: d.get("downloads").and_then(number),
             data: None,
+            ruffle: None,
             id,
         });
     }

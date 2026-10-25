@@ -14,6 +14,11 @@
 //! shows the title as the source spells it (src/menu.rs). Deleting the folder removes the game.
 //! A Flashpoint game's folder holds its game data's `content/` — the files at the addresses the
 //! game was published at — and online.txt how the archive starts it (src/shockwave.rs).
+//!
+//! 1.000.032: Flash Museum is no longer listed (its file server refused the movies, 403). 1.000.033:
+//! Flashpoint's Flash games too ("Flashpoint Flash"; its Shockwave list is "Flashpoint Shockwave"),
+//! the ones Flashpoint itself plays with Ruffle marked "Ruffle"; a Flash game from its game data
+//! reads the files it loads by web address from `content/` (src/navigator.rs).
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::collections::HashMap;
@@ -519,7 +524,16 @@ fn fetch_archive(client: &Client, files: &Files, archive: &r5net::Archive, folde
         check_movie(&format!("{folder}/{movie_rel}")).map_err(|e| format!("{movie_rel} is {e}"))?;
         Ok(movie_rel)
     })();
-    let _ = std::fs::remove_file(&zip_path);
+    // 1.000.032: the console refuses removing files in the games folder; then the zip (up to 1 GB)
+    // goes to the trash folder with the rest of what could not be removed
+    if std::fs::remove_file(&zip_path).is_err() {
+        let root = std::path::Path::new(folder).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        match crate::fsutil::remove_or_trash(&zip_path, &root) {
+            Ok(crate::fsutil::Removed::Trashed(to, _)) => crate::say(&format!("online: the game data zip moved to {to} (the console refused removing it)")),
+            Ok(crate::fsutil::Removed::Gone) => {}
+            Err(e) => crate::say(&format!("warn online: {zip_path} not removed: {e}")),
+        }
+    }
     result
 }
 
@@ -1211,6 +1225,10 @@ impl Online {
         if let Some(d) = item.downloads {
             meta.push(format!("{} downloads", thousands(d)));
         }
+        // 1.000.033: Flashpoint marks the games its own launcher plays with Ruffle
+        if item.ruffle.is_some() {
+            meta.push("Flashpoint plays it with Ruffle".to_string());
+        }
         meta.push(source.site().to_string());
         let meta = ui.fit(Face::Regular, 25.0, &meta.join("  \u{b7}  "), 1080.0);
         scene.text(ui, Face::Regular, 25.0, &meta, mx, STAGE_META_Y, BLUE_2, Align::Left, 0.0);
@@ -1337,6 +1355,9 @@ impl Online {
             let name = ui.fit(Face::SemiBold, 24.0, &item.title, rs.w - 40.0);
             scene.text(ui, Face::SemiBold, 24.0, &name, rs.x + 20.0, rs.y + rs.h - 42.0, INK, Align::Left, 0.0);
             let mut sub = Vec::new();
+            if item.ruffle.is_some() {
+                sub.push("Ruffle".to_string());
+            }
             if let Some(y) = &item.year {
                 sub.push(y.clone());
             }
@@ -1650,6 +1671,62 @@ mod tests {
         assert_eq!(address_for(&movie).as_deref(), Some("http://www.Example.test/games/tt/game.dcr"));
         // another movie in the folder is not the one online.txt names
         assert_eq!(launch_for(&format!("{folder}/content/www.Example.test/games/tt/Sound.cct")), None);
+        assert_eq!(installed(&games).get("flashpointarchive.org:id-1"), Some(&movie));
+        let _ = std::fs::remove_dir_all(&games);
+    }
+
+    /// 1.000.033: a Flash game from Flashpoint's game data: unpacked as the zip keeps it, played as
+    /// from its address, and the files it loads by web address read from `content/`.
+    #[test]
+    fn a_flash_game_data_zip_plays_from_its_address_and_reads_its_files_by_web_address() {
+        use ruffle_core::backend::navigator::{NavigatorBackend, NullExecutor, Request};
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        fn now<T>(f: impl Future<Output = T>) -> T {
+            let mut f = std::pin::pin!(f);
+            match f.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(v) => v,
+                Poll::Pending => panic!("not ready"),
+            }
+        }
+        let games = temp("gamedata-flash");
+        let swf = b"FWS\x08\x15\0\0\0\x30\0\x01\x00\x0c\x01\x00".to_vec();
+        let zip = stored_zip(&[
+            ("content.json", b"{}"),
+            ("content/www.example.com/games/bounce/bounce.swf", &swf),
+            ("content/www.example.com/games/bounce/levels/one.xml", b"<level/>"),
+            ("content/cdn.example.com/sound/main theme.mp3", b"ID3"),
+        ]);
+        let (port, server) = serve(vec![("/primary/id-1.zip", 200, zip.clone())], 1);
+        let base = format!("http://127.0.0.1:{port}");
+        let movie_url = "http://www.example.com/games/bounce/bounce.swf".to_string();
+        let files = Files {
+            main: r5net::RemoteFile { name: "id-1.zip".into(), url: format!("{base}/primary/id-1.zip"), size: None },
+            extra: vec![],
+            referer: None,
+            note: "test".into(),
+            address: Some(movie_url.clone()),
+            archive: Some(r5net::Archive { sha256: sha256_of(&zip), mirrors: vec![], movie: r5net::fp::zip_path(&movie_url).unwrap() }),
+            launch: Some(movie_url.clone()),
+            beside: None,
+        };
+        let item = Item { id: "id-1".into(), title: "Bounce".into(), ruffle: Some("standalone".into()), ..Item::default() };
+        let movie = fetch_files(&Client::new("t"), Source::FlashpointFlash, &item, &files, &games, &AtomicBool::new(false), &mut |_, _, _| {}).unwrap();
+        server.join().unwrap();
+        let folder = format!("{games}/Bounce");
+        assert_eq!(movie, format!("{folder}/content/www.example.com/games/bounce/bounce.swf"));
+        // as Ruffle5 starts it: from its address, its files by web address from content/
+        assert_eq!(address_for(&movie).as_deref(), Some("http://www.example.com/games/bounce/bounce.swf"));
+        let web_root = launch_for(&movie).and_then(|l| l.web_root);
+        assert_eq!(web_root, Some(format!("{folder}/content")));
+        let movie_dir = std::path::Path::new(&movie).parent().unwrap().to_path_buf();
+        let (nav, err) = crate::navigator::Ps5Navigator::new(&movie_dir, web_root.as_deref().map(std::path::Path::new), &NullExecutor::new());
+        assert!(err.is_none());
+        let read = |url: &str| now(now(nav.fetch(Request::get(url.to_string()))).map_err(|e| e.error.to_string()).unwrap().body()).unwrap();
+        assert_eq!(read("levels/one.xml"), b"<level/>");
+        assert_eq!(read("http://www.example.com/games/bounce/levels/one.xml"), b"<level/>");
+        assert_eq!(read("http://cdn.example.com/sound/main%20theme.mp3"), b"ID3");
+        // the same game whichever Flashpoint list it came from
         assert_eq!(installed(&games).get("flashpointarchive.org:id-1"), Some(&movie));
         let _ = std::fs::remove_dir_all(&games);
     }

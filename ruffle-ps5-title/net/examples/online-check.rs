@@ -118,15 +118,25 @@ impl Tally {
     }
 }
 
+/// A Flash movie starts FWS, CWS or ZWS; a Director one RIFX or XFIR.
+fn is_movie_bytes(name: &str, head: &[u8]) -> bool {
+    if fp::is_flash_name(name) {
+        head.starts_with(b"FWS") || head.starts_with(b"CWS") || head.starts_with(b"ZWS")
+    } else {
+        head.starts_with(b"XFIR") || head.starts_with(b"RIFX")
+    }
+}
+
 fn show_items(items: &[r5net::Item], n: usize) {
     for it in items.iter().take(n) {
         out(&format!(
-            "     {} | {} | {} | {} | {} | thumb {}",
+            "     {} | {} | {} | {} | {} | ruffle {} | thumb {}",
             it.id,
             it.title,
             it.kind.as_deref().unwrap_or("-"),
             it.year.as_deref().unwrap_or("-"),
             it.creator.as_deref().unwrap_or("-"),
+            it.ruffle.as_deref().unwrap_or("-"),
             it.thumb.as_deref().unwrap_or("-")
         ));
     }
@@ -396,8 +406,8 @@ fn main() {
     }
 
     // ---- Flashpoint Archive (1.000.028) ----
-    let fp_page = |words: &str, file: &str| -> Result<r5net::Page, String> {
-        let url = fp::search_url(words, 1);
+    let fp_page = |platform: &str, words: &str, file: &str| -> Result<r5net::Page, String> {
+        let url = fp::search_url(platform, words, 1);
         out(&format!("     {url}"));
         let r = client.get_ok(&Request::new(&url)).map_err(|e| e.to_string())?;
         save(&dir, file, &r.body);
@@ -407,13 +417,30 @@ fn main() {
         show_items(&p.items, 12);
         Ok(p)
     };
-    let fp_all = t.step("flashpointarchive.org: every Shockwave entry, A to Z", || fp_page("", "fp-search-all.json"));
-    let fp_totb = t.step("flashpointarchive.org: search \"trick or treat beat\"", || fp_page("trick or treat beat", "fp-search-totb.json"));
+    let fp_all = t.step("flashpointarchive.org: every Shockwave entry, A to Z", || fp_page(fp::SHOCKWAVE, "", "fp-search-all.json"));
+    let fp_totb = t.step("flashpointarchive.org: search \"trick or treat beat\"", || fp_page(fp::SHOCKWAVE, "trick or treat beat", "fp-search-totb.json"));
+    // 1.000.033: the Flash entries, and how many of a page Flashpoint plays with Ruffle
+    let fp_flash = t.step("flashpointarchive.org: every Flash entry, A to Z", || fp_page(fp::FLASH, "", "fp-search-flash.json"));
+    let fp_flash_words = t.step("flashpointarchive.org: Flash entries matching \"bloxorz\"", || fp_page(fp::FLASH, "bloxorz", "fp-search-flash-bloxorz.json"));
+    for (what, p) in [("A to Z", &fp_flash), ("bloxorz", &fp_flash_words)] {
+        if let Some(p) = p {
+            let marked = p.items.iter().filter(|it| it.ruffle.is_some()).count();
+            out(&format!("     Flash, {what}: {marked} of {} on page 1 marked for Ruffle (ruffleSupport)", p.items.len()));
+        }
+    }
     // an entry with game data (Trick or Treat Beat!), and the first listed one without
     let mut fp_items: Vec<r5net::Item> = fp_totb.iter().flat_map(|p| p.items.iter().take(1).cloned()).collect();
     let no_game_data = |it: &r5net::Item| it.data.as_deref().and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok()).is_some_and(|v| v["gameData"].as_array().map_or(true, |a| a.is_empty()));
     if let Some(it) = fp_all.iter().flat_map(|p| p.items.iter()).find(|it| no_game_data(it)) {
         fp_items.push(it.clone());
+    }
+    // Flash: the first entry marked for Ruffle with game data, and the first without game data
+    let flash_items: Vec<&r5net::Item> = fp_flash.iter().chain(fp_flash_words.iter()).flat_map(|p| p.items.iter()).collect();
+    if let Some(it) = flash_items.iter().find(|it| it.ruffle.is_some() && !no_game_data(it)) {
+        fp_items.push((*it).clone());
+    }
+    if let Some(it) = flash_items.iter().find(|it| no_game_data(it)) {
+        fp_items.push((*it).clone());
     }
     for it in &fp_items {
         let files = t.step(&format!("flashpointarchive.org: the files of {} ({})", it.title, it.id), || {
@@ -454,8 +481,8 @@ fn main() {
                     if sum != a.sha256 {
                         return Err(format!("SHA-256 {sum}, listed {}", a.sha256));
                     }
-                    if !movie.starts_with(b"XFIR") && !movie.starts_with(b"RIFX") {
-                        return Err(format!("{} is not a Director movie", names[i]));
+                    if !is_movie_bytes(&names[i], &movie) {
+                        return Err(format!("{} is not the movie its name says: {}", names[i], magic(&movie[..movie.len().min(16)])));
                     }
                     Ok(())
                 });
@@ -464,8 +491,8 @@ fn main() {
                 t.step(&format!("flashpointarchive.org: the movie of {} from the legacy server", it.id), || {
                     let path = fetch_to(&client, &dir, &files.main.url, None, &files.main.name, 64 << 20)?;
                     let head = std::fs::read(&path).map(|b| b.into_iter().take(16).collect::<Vec<u8>>()).unwrap_or_default();
-                    if !head.starts_with(b"XFIR") && !head.starts_with(b"RIFX") {
-                        return Err(format!("not a Director movie: {}", magic(&head)));
+                    if !is_movie_bytes(&files.main.name, &head) {
+                        return Err(format!("not the movie its name says: {}", magic(&head)));
                     }
                     Ok(())
                 });

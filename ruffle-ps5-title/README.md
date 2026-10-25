@@ -84,9 +84,12 @@ two settings can be compared on the same game.
 | `src/lib.rs` | `ruffle_ps5_main`: 3a clear-screen; 3b the app — the menu loop, a player per game, back |
 | `src/shell.rs` | the display: the swapchain, a game's `RenderTarget` (direct at 4K, or 1080p + GPU scale), cover capture, frame timings |
 | `src/menu.rs` | the menu: Games / Favorites / Recent / Badges / Flash Browser / Settings; stage, shelf, search, screensaver |
-| `src/online.rs` | the Flash Browser tab (*Online* before 1.000.029): lists, pictures and fetching games from the Internet Archive and Flashpoint (Flash Museum until 1.000.032), on threads of its own |
+| `src/online.rs` | the Flash Browser tab (*Online* before 1.000.029): lists, pictures and fetching games from the Internet Archive and Flashpoint (its Flash and Shockwave games; Flash Museum until 1.000.032), on threads of its own |
 | `net/` | `r5net`, its own crate: HTTPS on the console's sockets (rustls + RustCrypto, Mozilla's roots), the three sources' APIs and pages, a zip reader for Flashpoint's game data; `examples/online-check.rs`, `examples/fetch.rs` |
 | `src/game.rs` | one game: loading screen, the player and its options, quick menu, overlay, the frame-time log |
+| `src/navigator.rs` | where a Flash game's files come from: beside the movie, and (a Flashpoint game) by web address from its game data's `content/` (1.000.033) |
+| `src/fsutil.rs` | writing files safely; removing a game's folder, or moving it to `games/.ruffle5-trash` when the console refuses (1.000.032) |
+| `src/watchdog.rs` | names the step of a game's loop that takes 5 s or more, in ruffle.log (1.000.032) |
 | `src/background.rs` | the menu's moving background: ruffle.rs's logo animation, played by Ruffle at the display's size |
 | `src/widgets.rs` | the shared look: Ruffle's colours, buttons, hints, focus halo/ring, ribbons, sparks, easing |
 | `src/ui.rs` | the 2D renderer: one instanced SDF-quad pipeline (rounded rects, rings, glows, sheared ribbons, pictures), text, clipping |
@@ -278,13 +281,19 @@ between games, and a ribbon wipe carries you into a game and back out.
 | Circle, held | close Ruffle5 |
 
 **Flash Browser** (1.000.027 as *Online*, Flashpoint 1.000.028, renamed and moved last before
-Settings 1.000.029): games and movies from two sources, R2 switching
+Settings 1.000.029): games and movies from three lists, R2 switching
 between them — the Internet Archive's Flash collection (`softwarelibrary_flash`, the movies
 archive.org itself plays with Ruffle: found through its search API, most downloaded first, its
-sub-collections left out) and Flashpoint Archive's Shockwave games (flashpointarchive.org's search
-API, `platform:Shockwave`, A to Z). Flash Museum was a third until 1.000.032: its file server
-refused the movies on the console (403 Forbidden), so it was taken out; games fetched from it
-before still play. L2 searches the current source.
+sub-collections left out), Flashpoint Archive's Flash games (1.000.033, `platform:Flash`, A to Z)
+and its Shockwave games (`platform:Shockwave`, A to Z), through flashpointarchive.org's search API.
+A Flash game Flashpoint's own launcher plays with Ruffle (its `ruffleSupport`) is marked *Ruffle*.
+A Flashpoint game comes as its game data (a zip, checked against its SHA-256) when it has one —
+`content/<host>/<path>`, the files at the addresses it was published at — and plays as if from its
+address; the files it loads by web address are read from `content/` (`src/navigator.rs`), as
+Flashpoint's own proxy serves them. One without game data comes as its movie alone, from
+Flashpoint's legacy server (the files such a movie loads are not fetched). Flash Museum was a
+source until 1.000.032: its file server refused the movies on the console (403 Forbidden), so it
+was taken out; games fetched from it before still play. L2 searches the current list.
 Cross fetches the focused one and plays it, Square only fetches it; it lands in the games folder in a
 folder of its own — the movie (and, from the Internet Archive, the small files beside it in the
 item: levels, sounds, XML), its picture as `cover.png`, and `online.txt`, which names the source,
