@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# PS5_RUFFLE_TITLE_BUILD_V8 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
+# PS5_RUFFLE_TITLE_BUILD_V9 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
 # under Games. Phase 3a by default (wgpu on the static RADV clears the display); 3b with --ruffle.
 # V8 (1.000.025): the first line of the log names the version and when the build started, so
 # tools/ruffle5-status.sh can tell a log of this build from the last one's.
+# V9 (1.000.028): --bg starts the build in the background itself (log in ~/ruffle5-build.log);
+# one build per folder at a time (a second one is refused before it touches anything — two at once
+# overwrote each other's objects and log, 2026-10-24); ~/.ruffle-radv-env is read when it was not
+# sourced.
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Three proven pieces, joined:
@@ -24,6 +28,8 @@
 #
 #   source ~/.ruffle-radv-env && ./build-title.sh           → build/app/PPSA99620/{eboot.bin,...}
 #   ./build-title.sh --ruffle     3b: Ruffle compiled in (--features ruffle): the Ruffle5 menu and player
+#   ./build-title.sh --ruffle --bg   the same in the background, its log in ~/ruffle5-build.log
+#                                    (~/ruffle5-status.sh shows where it is)
 #   ./build-title.sh --clean      remove build/ and target/ first
 #   JOBS=n                        parallel compile jobs (default 4: the build box is shared)
 #   PS5_RUST_KIT=<path>           ps5-rust-title (default ../ps5-rust-title)
@@ -36,9 +42,35 @@ ok()  { echo "   ✓ $*"; }
 die() { echo "error: $*" >&2; exit 1; }
 need() { [[ -e "$1" ]] || die "$2"; }
 
-RUFFLE=0; CLEAN=0
-for a in "$@"; do case "$a" in --ruffle) RUFFLE=1 ;; --clean) CLEAN=1 ;; -h|--help) sed -n '2,30p' "$0"; exit 0 ;; *) die "unknown option $a" ;; esac; done
+RUFFLE=0; CLEAN=0; BG=0; ARGS=()
+for a in "$@"; do case "$a" in --ruffle) RUFFLE=1; ARGS+=("$a") ;; --clean) CLEAN=1; ARGS+=("$a") ;; --bg) BG=1 ;; -h|--help) sed -n '2,36p' "$0"; exit 0 ;; *) die "unknown option $a" ;; esac; done
 JOBS="${JOBS:-4}"
+
+# One build of this folder at a time: a second one is refused before it changes anything.
+mkdir -p "$HERE/build"
+LOCK="$HERE/build/.build-lock"
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK"
+    if ! flock -n 9; then
+        pid="$(cat "$LOCK.pid" 2>/dev/null || true)"
+        pg="$( [[ -n "$pid" ]] && ps -o pgid= "$pid" 2>/dev/null | tr -d ' ' || true)"
+        die "a build of this folder is already running${pid:+ (PID $pid)}: wait for it (~/ruffle5-status.sh shows where it is)${pg:+, or stop it first with: kill -- -$pg}"
+    fi
+fi
+if [[ $BG == 1 ]]; then
+    # the background build takes the lock over: this one lets go of it first
+    exec 9>&-
+    nohup "$HERE/$(basename "$0")" "${ARGS[@]}" > "$HOME/ruffle5-build.log" 2>&1 &
+    echo "build started in the background (PID $!); its log: ~/ruffle5-build.log; where it is: ~/ruffle5-status.sh"
+    exit 0
+fi
+echo $$ > "$LOCK.pid"
+# The environment build-radv-server.sh wrote, when it was not sourced (its defaults are these too).
+if [[ -z "${PS5_VULKAN_DIR:-}" && -f "$HOME/.ruffle-radv-env" ]]; then
+    # shellcheck source=/dev/null
+    source "$HOME/.ruffle-radv-env"
+    echo "   (read ~/.ruffle-radv-env)"
+fi
 log "Ruffle5 $(sed -n 's/^pub const APP_VERSION: &str = "\(.*\)";/\1/p' src/lib.rs) — build started $(date '+%Y-%m-%d %H:%M')"
 NICE=(nice -n 19); command -v ionice >/dev/null 2>&1 && NICE+=(ionice -c 2 -n 7)
 
