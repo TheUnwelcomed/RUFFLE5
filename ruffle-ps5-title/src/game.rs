@@ -255,8 +255,15 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
     let base = std::path::Path::new(&path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
     // 1.000.033: a game fetched from Flashpoint reads the files it loads by web address from its
     // game data's `content` (online.txt `webroot`), as Flashpoint's proxy serves them (src/navigator.rs)
-    let web_root = crate::online::launch_for(&path).and_then(|l| l.web_root);
-    let (navigator, base_err) = crate::navigator::Ps5Navigator::new(&base, web_root.as_deref().map(std::path::Path::new), &executor);
+    // 1.000.034: and the files it asks for that are not on the console from Flashpoint's server
+    // (src/fpfetch.rs)
+    let launch = crate::online::launch_for(&path);
+    let web_root = launch.as_ref().and_then(|l| l.web_root_or_made());
+    let (mut navigator, base_err) = crate::navigator::Ps5Navigator::new(&base, web_root.as_deref().map(std::path::Path::new), &executor);
+    if let Some(l) = launch.as_ref().filter(|l| l.from_flashpoint()) {
+        navigator.set_fetch(crate::fpfetch::FpFetch::new(std::path::Path::new(&path), l.url.as_deref(), web_root.as_deref().map(std::path::Path::new)));
+        say("     files not here are asked of Flashpoint's server");
+    }
     if let Some(e) = base_err {
         say(&format!("warn navigator base path {}: {e} (relative loads off)", base.display()));
     }

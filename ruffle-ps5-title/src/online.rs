@@ -210,6 +210,28 @@ pub struct Launch {
     /// The folder the movie's web addresses are read from (`webroot`, inside the game's folder:
     /// a Flashpoint game data's `content`).
     pub web_root: Option<String>,
+    /// 1.000.034: the source's site (`site`), and the game's folder (where online.txt is).
+    pub site: Option<String>,
+    pub folder: String,
+}
+
+impl Launch {
+    /// A game fetched from Flashpoint: the files it asks for that are not on the console come
+    /// from Flashpoint's server (src/fpfetch.rs).
+    pub fn from_flashpoint(&self) -> bool {
+        self.site.as_deref() == Some(crate::fpfetch::SITE)
+    }
+
+    /// Where its web addresses are kept: its game data's `content`, or (1.000.034, an entry
+    /// without game data) a `content` folder made for what is fetched while it plays.
+    pub fn web_root_or_made(&self) -> Option<String> {
+        if self.web_root.is_some() || !self.from_flashpoint() {
+            return self.web_root.clone();
+        }
+        let made = std::path::Path::new(&self.folder).join("content");
+        std::fs::create_dir_all(&made).ok()?;
+        Some(made.to_string_lossy().into_owned())
+    }
 }
 
 pub fn launch_for(movie_path: &str) -> Option<Launch> {
@@ -217,7 +239,8 @@ pub fn launch_for(movie_path: &str) -> Option<Launch> {
     let url = o.get("url").filter(|u| u.starts_with("http://") || u.starts_with("https://")).cloned();
     let command = o.get("launch").filter(|c| !c.is_empty()).cloned();
     let web_root = o.get("webroot").and_then(|r| zip_rel(r)).map(|r| dir.join(r)).filter(|p| p.is_dir()).map(|p| p.to_string_lossy().into_owned());
-    Some(Launch { url, command, web_root })
+    let site = o.get("site").filter(|s| !s.is_empty()).cloned();
+    Some(Launch { url, command, web_root, site, folder: dir.to_string_lossy().into_owned() })
 }
 
 /// What online.txt says. `url`: the address the movie is played as if it came from (its source

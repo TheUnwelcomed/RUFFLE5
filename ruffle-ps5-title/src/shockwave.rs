@@ -372,9 +372,18 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
             say(&format!("     address {url} (online.txt)"));
             player.set_movie_address(url);
         }
-        if let Some(root) = &l.web_root {
+        // 1.000.034: a Flashpoint game's files not on the console come from Flashpoint's server
+        // as it asks for them (src/fpfetch.rs); an entry without game data gets a `content`
+        // folder for what comes from other sites
+        let root = l.web_root_or_made();
+        if let Some(root) = &root {
             say(&format!("     web addresses read from {root}"));
             player.set_web_root(root);
+        }
+        if l.from_flashpoint() {
+            let fp = crate::fpfetch::FpFetch::new(std::path::Path::new(&path), l.url.as_deref(), root.as_deref().map(std::path::Path::new));
+            player.set_fetcher(Some(Box::new(move |url, local| fp.fetch(url, local))));
+            say("     files not here are asked of Flashpoint's server");
         }
     }
     if let Err(e) = player.load(&path).await {

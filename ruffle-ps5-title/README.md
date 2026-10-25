@@ -88,8 +88,9 @@ two settings can be compared on the same game.
 | `net/` | `r5net`, its own crate: HTTPS on the console's sockets (rustls + RustCrypto, Mozilla's roots), the three sources' APIs and pages, a zip reader for Flashpoint's game data; `examples/online-check.rs`, `examples/fetch.rs` |
 | `src/game.rs` | one game: loading screen, the player and its options, quick menu, overlay, the frame-time log |
 | `src/dir3d.rs` | which Director games have Shockwave 3D (the menu's categories, 1.000.033) |
-| `src/navigator.rs` | where a Flash game's files come from: beside the movie, and (a Flashpoint game) by web address from its game data's `content/` (1.000.033) |
-| `src/fsutil.rs` | writing files safely; removing a game's folder, or moving it to `games/.ruffle5-trash` when the console refuses (1.000.032) |
+| `src/navigator.rs` | where a Flash game's files come from: beside the movie, and (a Flashpoint game) by web address from its game data's `content/` (1.000.033), or from Flashpoint's server (1.000.034) |
+| `src/fpfetch.rs` | a Flashpoint game's files that are not on the console: asked of Flashpoint's server when the game asks for them, and kept (1.000.034) |
+| `src/fsutil.rs` | writing files safely; removing a game's folder with the calls the console allows a title (no `lstat`, 1.000.034), or moving it to `games/.ruffle5-trash` when it refuses (1.000.032) |
 | `src/watchdog.rs` | names the step of a game's loop that takes 5 s or more, in ruffle.log (1.000.032) |
 | `src/background.rs` | the menu's moving background: ruffle.rs's logo animation, played by Ruffle at the display's size |
 | `src/widgets.rs` | the shared look: Ruffle's colours, buttons, hints, focus halo/ring, ribbons, sparks, easing |
@@ -194,6 +195,17 @@ narrowed. Checked with `DCR_PROBE_COMPARE=3` (each stage drawn both ways): only 
 differ. And a sprite whose foreColor/backColor are set but left at black and white takes the
 upright path with a 32-bit picture, as those colours tint nothing (Supersonic RC's whole stage: the
 blit went from 11–13 ms to 2 ms a frame on a PC, the same pixels in 630 race frames).
+1.000.034: `mouseEnter` / `mouseLeave` / `mouseWithin` go to the front-most sprite under the
+pointer that has a script (a behaviour, or its member's script: Director's "active sprite"), not
+to the front-most sprite of any kind. Teen Titans Battle Blitz's select screen shows a fighter's
+highlight (a sprite with no script) over the fighter's tile on mouseEnter and hides it on
+mouseLeave; with the highlight in front, the tile was left on the next frame, the highlight
+hidden, the tile entered again — the screen flickered every frame (1.000.032's video). ScummVM's
+Director engine also gives these events to one sprite, the front-most that responds to the mouse.
+And `the idleHandlerPeriod`, `idleLoadMode`, `idleLoadPeriod`, `idleLoadTag` and
+`idleReadChunkSize` (Director 5 movie properties) are kept as a movie sets them and read back
+(Virus Raider's startMovie stopped at "Symbol 'idleHandlerPeriod' is not a built-in symbol");
+nothing is paced by them.
 1.000.028, in the patch: text in a font the movie does not carry (Arial, Times New Roman, Verdana…)
 no longer stops the game — DirPlayer asked a browser's canvas for it; off the web `native_text.rs`
 lays it out and draws it with the Liberation fonts (`fonts/liberation/`, the advance widths of
@@ -206,7 +218,9 @@ Blitz's START button); what a
 movie asks of a browser — a message box, `gotoNetPage`, the Flash bridge —
 is answered as no browser here can (a notice shown in the game, a refusal the movie sees) instead of
 stopping the title; `setPref` / `getPref` keep their files in the game's
-saves folder; a file a movie asks for is found whatever the case of its name, as on Windows. A game
+saves folder; a file a movie asks for is found whatever the case of its name, as on Windows
+(1.000.034: one that is not there goes to the host's fetcher — Flashpoint's server for a
+Flashpoint game — and a request that fails is a `net: … not found` line in ruffle.log). A game
 from Flashpoint starts as Flashpoint starts it: its launch command is parsed as DirPlayer's web front
 end parses it (`parse_launch_command`, a port of its `launchCommand.js`) — the projector's
 LeechProtectionRemovalHelp flags and `--do` become Lingo run when the movie loads, `--doBefore`
@@ -304,7 +318,12 @@ A Flashpoint game comes as its game data (a zip, checked against its SHA-256) wh
 `content/<host>/<path>`, the files at the addresses it was published at — and plays as if from its
 address; the files it loads by web address are read from `content/` (`src/navigator.rs`), as
 Flashpoint's own proxy serves them. One without game data comes as its movie alone, from
-Flashpoint's legacy server (the files such a movie loads are not fetched). Flash Museum was a
+Flashpoint's legacy server; the files it loads that are not on the console are asked of that
+server when the game asks for them (1.000.034, `src/fpfetch.rs`; before, they were not fetched),
+as Flashpoint's own game server does (FlashpointGameServer: the game data, then its `htdocs`, then
+`infinity.flashpointarchive.org/Flashpoint/Legacy/htdocs/<host>/<path>`, never a server script),
+and kept where they were looked for, so the next time they are on the console. The game waits
+while a file comes; each one is a `net:` line in ruffle.log with its size and seconds. Flash Museum was a
 source until 1.000.032: its file server refused the movies on the console (403 Forbidden), so it
 was taken out; games fetched from it before still play. L2 searches the current list.
 Flashpoint's search (FPA-Rust, the archive's search library) looks for each word in the title, an
@@ -333,13 +352,21 @@ A game stays in the games folder after it is played; Settings › Library › *K
 deletes a fetched game when it is left (its saves stay), and OPTIONS on any game's tile deletes it
 there and then.
 
-The trash folder (1.000.032). On the console every removal of a game's folder was refused
-("Operation not permitted", 1.000.031's log), while renaming works. What Ruffle5 cannot remove it
-moves into `games/.ruffle5-trash/`: the game leaves the menu (a folder whose name starts with a dot
+Removing on the console (1.000.034). The console refuses `lstat` to Ruffle5 in the games folder
+and in `/data/ruffle5` ("Operation not permitted"), while `stat`, listing a folder, `unlink`,
+`rmdir` and `rename` work (1.000.032's `files: removing in …` lines). Rust's `remove_dir_all` asks
+`lstat` first, and 1.000.032 and 1.000.033 told a folder from a file, and whether a removal had
+worked, with `lstat` too, so a refused `lstat` read as "gone": Delete and Keep online games Off said
+`menu: deleted …` and left the game there, and nothing went to the trash. A game's folder is now
+removed by listing it — an entry is a folder when the listing says so, or when it can be listed —
+with `unlink` for each file and `rmdir` for each folder, deepest first, and it is gone only when
+`stat` no longer finds it (`src/fsutil.rs`). What the console still refuses moves into
+`games/.ruffle5-trash/` (1.000.032): the game leaves the menu (a folder whose name starts with a dot
 is never listed), the files stay on the disk until they can be removed. Each start tries to empty
 it and says in ruffle.log what is left and why; you can also delete the folder over FTP. The log's
 `files: removing in …` lines say what removing a file, an empty folder and a folder of files
-answers in the games folder and in `/data/ruffle5`, and whether renaming works.
+answers in the games folder and in `/data/ruffle5`, whether renaming works, and whether `lstat`
+is refused.
 
 HTTPS is `net/`'s: rustls 0.23 with RustCrypto's algorithms (no C, no assembly) and Mozilla's root
 certificates compiled in, on the console's own sockets and resolver; the title calls `sceNetInit`

@@ -14,6 +14,16 @@
 //! folder's `.ruffle5-trash` (the menu never looks in a folder whose name starts with a dot), and
 //! `empty_trash` tries again at each start. `check_removal` tries each call once at start (a
 //! file, an empty folder, renames, a tree) and gives one line for the log.
+//!
+//! 1.000.034: what that line said on the console (1.000.032 log, 2026-10-25, every start): `lstat`
+//! is refused ("Operation not permitted") for the games folder, a file and an empty folder made
+//! there, and inside a folder made there; `unlink`, `rmdir` and `rename` work. std's
+//! `remove_dir_all` starts with `lstat`, so it is refused too. And 1.000.032 asked `lstat` whether
+//! a game's folder was there before removing it: refused, it took the folder for gone, removed
+//! nothing and said "deleted" (the rescan after each one still counted 77 games). Nothing here asks
+//! `lstat` now: a folder's entries are told apart by the type `read_dir` gives (or by whether they
+//! can be listed), whether something is there by `stat` — and only "not found" means gone.
+//! Checked on a PC with `lstat` refused the same way (a preload library), as the console answers.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::fs::{self, File};
@@ -113,14 +123,45 @@ pub fn move_file(from: &str, to: &str) -> bool {
     }
 }
 
-/// Removes `dir` and everything in it, by paths: read_dir, remove_file, remove_dir. A link is
-/// removed, not followed.
+/// What is at a path, asked without `lstat` (refused on the console).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    Missing,
+    File,
+    Folder,
+}
+
+/// `stat`; when that cannot tell (anything but "not found"), what can be listed is a folder and
+/// anything else a file: it is there.
+fn kind_of(p: &Path) -> Kind {
+    match fs::metadata(p) {
+        Ok(m) if m.is_dir() => Kind::Folder,
+        Ok(_) => Kind::File,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Kind::Missing,
+        Err(_) if fs::read_dir(p).is_ok() => Kind::Folder,
+        Err(_) => Kind::File,
+    }
+}
+
+/// Still there: only "not found" says it went.
+fn is_there(p: &Path) -> bool {
+    kind_of(p) != Kind::Missing
+}
+
+/// Removes `dir` and everything in it, by paths: read_dir, remove_file, remove_dir. An entry is a
+/// folder when read_dir says so (or, saying nothing, when it can be listed); a link is removed,
+/// not followed.
 fn remove_by_paths(dir: &Path) -> std::io::Result<()> {
     // each error names the call and the path it was refused for
     let named = |call: &str, p: &Path, e: std::io::Error| std::io::Error::new(e.kind(), format!("{call} {}: {e}", p.display()));
     for entry in fs::read_dir(dir).map_err(|e| named("read_dir", dir, e))? {
-        let path = entry.map_err(|e| named("read_dir", dir, e))?.path();
-        if fs::symlink_metadata(&path).map_err(|e| named("lstat", &path, e))?.is_dir() {
+        let entry = entry.map_err(|e| named("read_dir", dir, e))?;
+        let path = entry.path();
+        let folder = match entry.file_type() {
+            Ok(t) => t.is_dir(),
+            Err(_) => fs::read_dir(&path).is_ok(),
+        };
+        if folder {
             remove_by_paths(&path)?;
         } else {
             fs::remove_file(&path).map_err(|e| named("unlink", &path, e))?;
@@ -136,20 +177,24 @@ fn outcome(r: &std::io::Result<()>) -> String {
     }
 }
 
-/// Removes the folder `dir` and everything in it: std's remove_dir_all, then by paths if the folder
-/// is still there. Err says what each way answered.
+/// Removes the folder `dir` and everything in it: by paths (1.000.034: first, as std's
+/// remove_dir_all asks `lstat`, refused on the console), then std's remove_dir_all if the folder is
+/// still there. Err says what each way answered.
 pub fn remove_tree(dir: &str) -> Result<(), String> {
     let path = Path::new(dir);
-    let first = fs::remove_dir_all(path);
-    if !path.exists() {
+    if !is_there(path) {
         return Ok(());
     }
-    let second = remove_by_paths(path);
-    if !path.exists() {
-        crate::say(&format!("files: {dir}: removed by paths (std::fs::remove_dir_all: {})", outcome(&first)));
+    let first = remove_by_paths(path);
+    if !is_there(path) {
         return Ok(());
     }
-    Err(format!("std::fs::remove_dir_all {}, by paths {}", outcome(&first), outcome(&second)))
+    let second = fs::remove_dir_all(path);
+    if !is_there(path) {
+        crate::say(&format!("files: {dir}: removed by std::fs::remove_dir_all (by paths: {})", outcome(&first)));
+        return Ok(());
+    }
+    Err(format!("by paths {}, std::fs::remove_dir_all {}", outcome(&first), outcome(&second)))
 }
 
 /// The folder in a games folder that deleted games wait in when the console refuses removing them.
@@ -182,14 +227,17 @@ fn remove_any(path: &str, is_dir: bool) -> Result<(), String> {
 
 fn trash_unless_removed(path: &str, root: &str, remove: &dyn Fn(&str, bool) -> Result<(), String>) -> Result<Removed, String> {
     let p = Path::new(path);
-    let Ok(meta) = fs::symlink_metadata(p) else {
-        return Ok(Removed::Gone);
+    let folder = match kind_of(p) {
+        Kind::Missing => return Ok(Removed::Gone),
+        k => k == Kind::Folder,
     };
-    let refused = match remove(path, meta.is_dir()) {
-        Ok(()) => return Ok(Removed::Gone),
+    // gone only when it is no longer found, whatever the removal answered
+    let refused = match remove(path, folder) {
+        Ok(()) if !is_there(p) => return Ok(Removed::Gone),
+        Ok(()) => "removed, yet still there".to_string(),
         Err(e) => e,
     };
-    if fs::symlink_metadata(p).is_err() {
+    if !is_there(p) {
         return Ok(Removed::Gone);
     }
     let trash = format!("{root}/{TRASH}");
@@ -199,19 +247,20 @@ fn trash_unless_removed(path: &str, root: &str, remove: &dyn Fn(&str, bool) -> R
     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "game".into());
     let mut target = format!("{trash}/{name}");
     let mut n = 2;
-    while fs::symlink_metadata(&target).is_ok() {
+    while is_there(Path::new(&target)) {
         target = format!("{trash}/{name} {n}");
         n += 1;
     }
     match fs::rename(p, &target) {
-        Ok(()) => Ok(Removed::Trashed(target, refused)),
+        Ok(()) if !is_there(p) => Ok(Removed::Trashed(target, refused)),
+        Ok(()) => Err(format!("{refused}; moved to {target}, yet still there")),
         Err(e) => Err(format!("{refused}; moving it to {trash}: {e}")),
     }
 }
 
 /// The bytes in `path` and below.
 fn size_of(path: &Path) -> u64 {
-    match fs::symlink_metadata(path) {
+    match fs::metadata(path) {
         Ok(m) if m.is_dir() => fs::read_dir(path)
             .map(|it| it.filter_map(|e| e.ok()).map(|e| size_of(&e.path())).sum())
             .unwrap_or(0),
@@ -236,8 +285,14 @@ fn empty_trash_with(root: &str, remove: &dyn Fn(&str, bool) -> Result<(), String
     let (mut gone, mut left, mut bytes, mut why) = (0, 0, 0u64, String::new());
     for n in &names {
         let path = format!("{trash}/{n}");
-        match remove(&path, Path::new(&path).is_dir()) {
-            Ok(()) => gone += 1,
+        match remove(&path, kind_of(Path::new(&path)) == Kind::Folder) {
+            Ok(()) if !is_there(Path::new(&path)) => gone += 1,
+            Ok(()) => {
+                left += 1;
+                if why.is_empty() {
+                    why = "removed, yet still there".into();
+                }
+            }
             Err(e) => {
                 left += 1;
                 bytes += size_of(Path::new(&path));
@@ -264,11 +319,15 @@ fn empty_trash_with(root: &str, remove: &dyn Fn(&str, bool) -> Result<(), String
 pub fn check_removal(parent: &str) -> String {
     use std::os::unix::fs::MetadataExt;
     let base = format!("{parent}/.ruffle5-removal-check");
-    let owner = |p: &str| match fs::symlink_metadata(p) {
+    let owner = |p: &str| match fs::metadata(p) {
         Ok(m) => format!("uid {} mode {:o}", m.uid(), m.mode() & 0o7777),
-        Err(e) => format!("({e})"),
+        Err(e) => format!("stat: {e}"),
     };
-    let mut out = vec![format!("files: removing in {parent} ({})", owner(parent))];
+    let lstat = match fs::symlink_metadata(parent) {
+        Ok(_) => "ok".to_string(),
+        Err(e) => format!("refused ({e})"),
+    };
+    let mut out = vec![format!("files: removing in {parent} ({}; lstat {lstat})", owner(parent))];
     // what an earlier start could not remove is used again
     if let Err(e) = fs::create_dir_all(&base) {
         return format!("{}: cannot make {base}: {e}", out[0]);
@@ -301,19 +360,12 @@ pub fn check_removal(parent: &str) -> String {
     match made {
         Err(e) => out.push(format!("a folder with files: cannot make it ({e})")),
         Ok(()) => {
-            let first = fs::remove_dir_all(&tree);
-            if !Path::new(&tree).exists() {
-                out.push(format!("a folder with files: remove_dir_all {}", outcome(&first)));
-            } else {
-                let second = remove_by_paths(Path::new(&tree));
-                let left = Path::new(&tree).exists();
-                out.push(format!(
-                    "a folder with files: remove_dir_all {}, by paths {}{}",
-                    outcome(&first),
-                    outcome(&second),
-                    if left { ", still there" } else { ", gone" }
-                ));
-            }
+            // as a game's folder is removed (remove_tree: by paths, then std's remove_dir_all)
+            let r = remove_tree(&tree);
+            out.push(match r {
+                Ok(()) => "a folder with files: removed".to_string(),
+                Err(e) => format!("a folder with files: {e}, still there"),
+            });
         }
     }
     let last = fs::remove_dir(&base);
@@ -345,7 +397,7 @@ mod tests {
         remove_by_paths(&game).unwrap();
         assert!(!game.exists());
         let line = check_removal(root.to_str().unwrap());
-        for part in ["a file (uid ", "): unlink ok", "rmdir ok", "rename a file ok", "rename a folder ok", "a folder with files: remove_dir_all ok"] {
+        for part in ["a file (uid ", "): unlink ok", "rmdir ok", "rename a file ok", "rename a folder ok", "a folder with files: removed"] {
             assert!(line.contains(part), "{part}: {line}");
         }
         assert!(!root.join(".ruffle5-removal-check").exists());

@@ -33,6 +33,8 @@ pub struct Ps5Navigator {
     base: PathBuf,
     /// The folder web addresses are read from (`<web root>/<host>/<path>`), when the game has one.
     web_root: Option<PathBuf>,
+    /// 1.000.034: a Flashpoint game's files not on the console, from Flashpoint's server.
+    fetch: Option<std::sync::Arc<crate::fpfetch::FpFetch>>,
 }
 
 impl Ps5Navigator {
@@ -44,7 +46,34 @@ impl Ps5Navigator {
             Ok(b) => (b, None),
             Err(e) => (PathBuf::new(), Some(e)),
         };
-        (Self { spawner: executor.spawner(), base, web_root: web_root.and_then(|w| w.canonicalize().ok()) }, err)
+        (Self { spawner: executor.spawner(), base, web_root: web_root.and_then(|w| w.canonicalize().ok()), fetch: None }, err)
+    }
+
+    /// Files the game asks for that are not on the console are asked of Flashpoint's server.
+    pub fn set_fetch(&mut self, f: crate::fpfetch::FpFetch) {
+        self.fetch = Some(std::sync::Arc::new(f));
+    }
+
+    /// The file a request is read from on the console, when it is a file (a web address under
+    /// the web root, or a file address).
+    fn local_file(&self, url: &Url) -> Option<PathBuf> {
+        match url.scheme() {
+            "http" | "https" => web_file(self.web_root.as_ref()?, url),
+            "file" => url.to_file_path().ok(),
+            _ => None,
+        }
+    }
+
+    /// 1.000.034: a file not on the console, from Flashpoint's server into its place (the game
+    /// waits for it). True when it is there now.
+    fn fetched(&self, url: &Url) -> bool {
+        let (Some(f), Some(local)) = (&self.fetch, self.local_file(url)) else {
+            return false;
+        };
+        if local.is_file() {
+            return true;
+        }
+        f.fetch(url, Some(&local)).is_some() && local.is_file()
     }
 
     pub fn web_root(&self) -> Option<&Path> {
@@ -59,8 +88,12 @@ impl NavigatorBackend for Ps5Navigator {
     }
 
     fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
-        if let (Some(root), Ok(url)) = (&self.web_root, Url::parse(request.url())) {
-            if matches!(url.scheme(), "http" | "https") {
+        if let Ok(url) = Url::parse(request.url()).or_else(|_| self.resolve_url(request.url())) {
+            // not on the console: from Flashpoint's server first, when the game came from there
+            if self.fetch.is_some() {
+                self.fetched(&url);
+            }
+            if let (Some(root), true) = (&self.web_root, matches!(url.scheme(), "http" | "https")) {
                 if let Some(file) = web_file(root, &url).and_then(|p| Url::from_file_path(p).ok()) {
                     return fetch_path(self, "Ruffle5", file.as_str(), None);
                 }
@@ -151,6 +184,47 @@ mod tests {
         // without a web root, a web address is not read
         let (plain, _) = Ps5Navigator::new(&game, None, &executor);
         assert!(now(plain.fetch(Request::get("http://www.example.com/games/x/level.swf".to_string()))).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 1.000.034: a Flashpoint game's files that are not on the console.
+    #[test]
+    fn a_flashpoint_games_files_not_here_come_from_its_server_and_stay() {
+        let root = std::env::temp_dir().join(format!("ruffle5-nav-fp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let game = root.join("Some Game");
+        let content = game.join("content");
+        std::fs::create_dir_all(&content).unwrap();
+        std::fs::write(game.join("game.swf"), b"FWS-main").unwrap();
+        let (port, server) = crate::fpfetch::serve(
+            &[("/htdocs/www.example.com/games/x/level2.swf", b"FWS-level2"), ("/htdocs/cdn.example.com/a/b.xml", b"<b/>")],
+            3,
+        );
+        let mut f = crate::fpfetch::FpFetch::new(&game.join("game.swf"), Some("http://www.example.com/games/x/game.swf"), Some(&content));
+        f.set_server(format!("http://127.0.0.1:{port}/htdocs/"));
+        let executor = NullExecutor::new();
+        let (mut nav, err) = Ps5Navigator::new(&game, Some(&content), &executor);
+        assert!(err.is_none());
+        nav.set_fetch(f);
+        let read = |url: &str| -> Result<Vec<u8>, String> {
+            let response = now(nav.fetch(Request::get(url.to_string()))).map_err(|e| e.error.to_string())?;
+            now(response.body()).map_err(|e| e.to_string())
+        };
+        // a name beside the movie: the same name beside its address, kept beside the movie
+        assert_eq!(read("level2.swf").unwrap(), b"FWS-level2");
+        assert_eq!(std::fs::read(game.join("level2.swf")).unwrap(), b"FWS-level2");
+        // another site's address: kept under the web root, the query left off
+        assert_eq!(read("http://cdn.example.com/a/b.xml?v=2").unwrap(), b"<b/>");
+        assert_eq!(std::fs::read(content.join("cdn.example.com/a/b.xml")).unwrap(), b"<b/>");
+        // what the server does not have: an error, asked for once
+        assert!(read("missing.swf").is_err());
+        assert!(read("missing.swf").is_err());
+        assert!(!game.join("missing.swf").exists());
+        // what is here is read from the console (the stand-in answers three requests only)
+        assert_eq!(read("level2.swf").unwrap(), b"FWS-level2");
+        assert_eq!(read("game.swf").unwrap(), b"FWS-main");
+        let asked = server.join().unwrap();
+        assert_eq!(asked, ["/htdocs/www.example.com/games/x/level2.swf", "/htdocs/cdn.example.com/a/b.xml", "/htdocs/www.example.com/games/x/missing.swf"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

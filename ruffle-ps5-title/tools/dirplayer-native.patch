@@ -857,10 +857,41 @@ index 9d1fa62f..596427ac 100644
          }
      }
 diff --git a/vm-rust/src/player/events.rs b/vm-rust/src/player/events.rs
-index 184a4962..f6b59620 100644
+index 184a4962..04080f5c 100644
 --- a/vm-rust/src/player/events.rs
 +++ b/vm-rust/src/player/events.rs
-@@ -243,7 +243,7 @@ pub async fn player_invoke_event_to_instances(
+@@ -115,13 +115,27 @@ pub fn player_dispatch_event_to_sprite(
+ /// sprite's and undo it (Matematik i Maaneby's map: a ground patch carrying
+ /// one house's behaviour sits under another house, and a pointer landing on
+ /// the house lit it and then unlit it in the same event).
++///
++/// PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.034): the front-most sprite with a script (a
++/// behaviour, or its member's script: `get_sprite_at(.., true)`, Director's "active
++/// sprite"). ScummVM's Director engine also gives these events to one sprite, the front-most
++/// that responds to the mouse (events.cpp `processSysEvent` -> score.cpp
++/// `getMouseSpriteIDFromPos`, sprite.cpp `respondsToMouse`: from D6 any behaviour, a
++/// script with mouse handlers; also a moveable sprite or a button, which this does not
++/// count). The front-most sprite of any kind made Teen Titans Battle Blitz's select
++/// screen flicker every frame: a fighter's tile (channel 25, its behaviour shows
++/// sprite(fighterID + 50) on mouseEnter and hides it on mouseLeave) is covered by that
++/// highlight (channel 52, no script) once shown, so the tile was left, the highlight
++/// hidden, the tile entered again on the next frame... A sprite without scripts in
++/// front also took the events from Merlin's Revenge's Start button (its label, sprite 66,
++/// over the button, sprite 65 — see `get_sprites_at`). Matematik i Maaneby's houses
++/// carry behaviours, so the front-most one is still the only one hovered.
+ pub fn dispatch_rollover_events() {
+     let (now_hovered, prev_hovered) = reserve_player_mut(|player| {
+         let (x, y) = player.mouse_loc;
+         let prev_hovered = std::mem::take(&mut player.hovered_sprites);
+-        let now_hovered: Vec<i16> = crate::player::score::get_sprites_at(player, x, y)
+-            .first()
+-            .map(|num| *num as i16)
++        let now_hovered: Vec<i16> = crate::player::score::get_sprite_at(player, x, y, true)
++            .map(|num| num as i16)
+             .into_iter()
+             .collect();
+         player.hovered_sprites = now_hovered.clone();
+@@ -243,7 +257,7 @@ pub async fn player_invoke_event_to_instances(
                      // Dump bytecode execution history before the error
                      crate::player::bytecode::handler_manager::dump_execution_history_on_error(&err.message);
                      // Log the error to console
@@ -869,7 +900,7 @@ index 184a4962..f6b59620 100644
                          &format!("⚠ Error in handler '{}': {}", handler_name, err.message).into()
                      );
                      // Report to player's error handler
-@@ -1807,7 +1807,7 @@ pub async fn player_dispatch_event_beginsprite(
+@@ -1807,7 +1821,7 @@ pub async fn player_dispatch_event_beginsprite(
                  });
                  return Ok(vec![]);
              }
@@ -878,7 +909,7 @@ index 184a4962..f6b59620 100644
                  &format!("Error in {} for sprite {}: {}", handler_name, sprite_number, err.message).into()
              );
              reserve_player_mut(|player| {
-@@ -1897,7 +1897,7 @@ pub async fn dispatch_event_endsprite_for_score(score_ref: ScoreRef, sprite_nums
+@@ -1897,7 +1911,7 @@ pub async fn dispatch_event_endsprite_for_score(score_ref: ScoreRef, sprite_nums
                  if err.code == ScriptErrorCode::Abort {
                      break;
                  }
@@ -887,7 +918,7 @@ index 184a4962..f6b59620 100644
                      &format!("Error in endSprite for sprite {}: {}", sprite_num, err.message).into()
                  );
                  reserve_player_mut(|player| {
-@@ -2154,7 +2154,7 @@ pub async fn dispatch_event_to_all_behaviors(
+@@ -2154,7 +2168,7 @@ pub async fn dispatch_event_to_all_behaviors(
                      });
                      return;
                  }
@@ -2932,12 +2963,69 @@ index 1c4a69a3..6a5ae2ae 100644
              let browser_fetch_pending = read_window_count("__dirplayerPendingNetCount") > 0.0;
              // Offscreen Ruffle instances self-tick via requestAnimationFrame; a
              // tight high-tempo Director loop (DGS puppetTempo(999) guest-gate
+diff --git a/vm-rust/src/player/movie.rs b/vm-rust/src/player/movie.rs
+index fd461636..ec219dd8 100644
+--- a/vm-rust/src/player/movie.rs
++++ b/vm-rust/src/player/movie.rs
+@@ -47,6 +47,10 @@ pub struct Movie {
+     /// Wall-clock ms of the last idle-counter reset (input activity or a fire).
+     /// `the timeoutLapsed` is derived from this.
+     pub timeout_last_reset_ms: f64,
++    /// PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.034): `the idleHandlerPeriod`, `idleLoadMode`,
++    /// `idleLoadPeriod`, `idleLoadTag`, `idleReadChunkSize` (Director 5 movie properties),
++    /// kept as the movie sets them and read back; nothing here is paced by them. 0 until set.
++    pub idle_props: [i32; 5],
+     pub allow_custom_caching: bool,
+     /// `_movie.scriptExecutionStyle` — 9 (Director 8/9 semantics) or 10 (D10+).
+     /// `None` = never written, so the getter reports the movie's own default.
+@@ -133,6 +137,7 @@ impl Movie {
+             timeout_mouse: true,
+             timeout_keydown: true,
+             timeout_last_reset_ms: 0.0,
++            idle_props: [0; 5],
+             allow_custom_caching: false,
+             script_execution_style: None,
+             trace_script: false,
+@@ -481,6 +486,11 @@ impl Movie {
+             // emulates Windows Shockwave playback, so report 256 — movies branch their
+             // path separators and platform paths on this.
+             BuiltInSymbol::MachineType => Ok(Datum::Int(256)),
++            BuiltInSymbol::IdleHandlerPeriod => Ok(Datum::Int(self.idle_props[0])),
++            BuiltInSymbol::IdleLoadMode => Ok(Datum::Int(self.idle_props[1])),
++            BuiltInSymbol::IdleLoadPeriod => Ok(Datum::Int(self.idle_props[2])),
++            BuiltInSymbol::IdleLoadTag => Ok(Datum::Int(self.idle_props[3])),
++            BuiltInSymbol::IdleReadChunkSize => Ok(Datum::Int(self.idle_props[4])),
+             _ => Err(ScriptError::new(format!("Cannot get movie prop {prop}")))
+         }
+     }
+@@ -666,6 +676,21 @@ impl Movie {
+                 // 3D renderer preference / sound settings — accept silently in WASM
+                 Ok(())
+             },
++            BuiltInSymbol::IdleHandlerPeriod
++            | BuiltInSymbol::IdleLoadMode
++            | BuiltInSymbol::IdleLoadPeriod
++            | BuiltInSymbol::IdleLoadTag
++            | BuiltInSymbol::IdleReadChunkSize => {
++                let i = match builtin_prop {
++                    BuiltInSymbol::IdleHandlerPeriod => 0,
++                    BuiltInSymbol::IdleLoadMode => 1,
++                    BuiltInSymbol::IdleLoadPeriod => 2,
++                    BuiltInSymbol::IdleLoadTag => 3,
++                    _ => 4,
++                };
++                self.idle_props[i] = value.int_value()?;
++                Ok(())
++            },
+             _ => Err(ScriptError::new(format!("Cannot set movie prop {prop}")))
+         }
+     }
 diff --git a/vm-rust/src/player/native.rs b/vm-rust/src/player/native.rs
 new file mode 100644
-index 00000000..33921eff
+index 00000000..cf7f19d3
 --- /dev/null
 +++ b/vm-rust/src/player/native.rs
-@@ -0,0 +1,595 @@
+@@ -0,0 +1,607 @@
 +//! PS5_RUFFLE_DIRPLAYER_NATIVE — DirPlayer inside another program, without a browser.
 +//!
 +//! The web front end drives the VM from JavaScript: it loads the movie, runs the frame loop on
@@ -3254,6 +3342,12 @@ index 00000000..33921eff
 +    });
 +}
 +
++/// 1.000.034: what the host fetches for a request not on disk (see
++/// [`crate::player::net_task::Fetcher`]); [`NativePlayer::new`] clears it.
++pub fn set_fetcher(f: Option<crate::player::net_task::Fetcher>) {
++    crate::player::net_task::set_fetcher(f);
++}
++
 +/// The folder web addresses are read from: `http://host/dir/file` is `<dir>/host/dir/file`, as
 +/// an archive's game data holds a game's captured files (Flashpoint: its `content/` folder).
 +/// Without one (and [`NativePlayer::new`] clears it) a web address the movie asks for is not read.
@@ -3357,6 +3451,7 @@ index 00000000..33921eff
 +            *p = (None, Vec::new());
 +        }
 +        crate::player::net_task::set_web_root(None);
++        crate::player::net_task::set_fetcher(None);
 +        // 1.000.030: a new player draws 3D from nothing (the software renderer keeps members'
 +        // geometry and textures by cast member number).
 +        crate::rendering_gpu::softgl::reset();
@@ -3433,6 +3528,11 @@ index 00000000..33921eff
 +    /// [`Self::load`].
 +    pub fn set_movie_address(&mut self, url: &str) {
 +        set_movie_address(url);
++    }
++
++    /// What the host fetches for a request not on disk: see [`set_fetcher`].
++    pub fn set_fetcher(&mut self, f: Option<crate::player::net_task::Fetcher>) {
++        set_fetcher(f);
 +    }
 +
 +    /// The folder the movie's web addresses are read from: see [`set_web_root`].
@@ -4780,7 +4880,7 @@ index 0a4cb097..2ce9606c 100644
                  let final_bytes = match &result {
                      Ok(bytes) => bytes.len() as u64,
 diff --git a/vm-rust/src/player/net_task.rs b/vm-rust/src/player/net_task.rs
-index e684a937..cb0442ea 100644
+index e684a937..efa2c22f 100644
 --- a/vm-rust/src/player/net_task.rs
 +++ b/vm-rust/src/player/net_task.rs
 @@ -85,6 +85,15 @@ pub async fn fetch_net_task(
@@ -4799,7 +4899,7 @@ index e684a937..cb0442ea 100644
      // Normal HTTP(S) fetch
      // Note: file:// URLs are handled in preload_net_thing and never reach this function
      let window = web_sys::window().unwrap();
-@@ -207,6 +216,97 @@ pub async fn fetch_net_task(
+@@ -207,6 +216,146 @@ pub async fn fetch_net_task(
      }
  }
  
@@ -4841,9 +4941,37 @@ index e684a937..cb0442ea 100644
 +    Some(path)
 +}
 +
++/// PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.034): what the host gives for a GET that is not on disk —
++/// Ruffle5 fetches a Flashpoint game's file from Flashpoint's server and keeps it, as Flashpoint's
++/// game server does for files a game's data does not hold. Called with the address asked for (a
++/// web address, or a file address in the movie's folder where the movie's own address stands for
++/// it) and the place it was looked for (None: a web address with no web root). The bytes, or None.
++#[cfg(not(target_arch = "wasm32"))]
++pub type Fetcher = Box<dyn Fn(&Url, Option<&std::path::Path>) -> Option<Vec<u8>> + Send>;
++
++#[cfg(not(target_arch = "wasm32"))]
++static FETCHER: std::sync::Mutex<Option<Fetcher>> = std::sync::Mutex::new(None);
++
++/// Sets (or, None, clears) the host's fetcher: see [`Fetcher`].
++#[cfg(not(target_arch = "wasm32"))]
++pub fn set_fetcher(f: Option<Fetcher>) {
++    if let Ok(mut g) = FETCHER.lock() {
++        *g = f;
++    }
++}
++
++#[cfg(not(target_arch = "wasm32"))]
++fn fetch_missing(url: &Url, path: Option<&std::path::Path>) -> Option<Vec<u8>> {
++    let g = FETCHER.lock().ok()?;
++    let f = g.as_ref()?;
++    f(url, path)
++}
++
 +/// A request read off disk: a file address as its file; a web address (GET only) as its file
 +/// under the web root. A name not there as written is looked for ignoring case, as the Windows
-+/// file systems and servers these movies were made on and served from found it.
++/// file systems and servers these movies were made on and served from found it. 1.000.034: what
++/// is not there either goes to the host's fetcher (GET only), and a request that fails is named
++/// in the log.
 +#[cfg(not(target_arch = "wasm32"))]
 +pub fn native_read(url: &Url, is_get: bool) -> NetResult {
 +    let path = match url.scheme() {
@@ -4852,6 +4980,19 @@ index e684a937..cb0442ea 100644
 +        _ => None,
 +    };
 +    let Some(path) = path else {
++        if is_get && matches!(url.scheme(), "http" | "https") {
++            if let Some(bytes) = fetch_missing(url, None) {
++                return Ok(bytes);
++            }
++        }
++        let why = if !is_get {
++            "a POST, not sent".to_string()
++        } else if matches!(url.scheme(), "http" | "https") {
++            "no folder is set for web addresses, or the address leaves it".to_string()
++        } else {
++            format!("a {}: address", url.scheme())
++        };
++        log::warn!("net: {url}: not read ({why})");
 +        return Err(-1);
 +    };
 +    match std::fs::read(&path) {
@@ -4861,7 +5002,15 @@ index e684a937..cb0442ea 100644
 +                log::info!("{} read as {}", path.display(), found.display());
 +                std::fs::read(found).map_err(|_| -1)
 +            }
-+            _ => Err(-1),
++            _ => {
++                if is_get {
++                    if let Some(bytes) = fetch_missing(url, Some(&path)) {
++                        return Ok(bytes);
++                    }
++                }
++                log::warn!("net: {url}: not found ({})", path.display());
++                Err(-1)
++            }
 +        },
 +    }
 +}
@@ -4897,7 +5046,7 @@ index e684a937..cb0442ea 100644
  /// Neopets DGS shows a Flash preloader whose guest-login prompt is only
  /// (re)painted while the nested game `.dcr` is still streaming — the Director
  /// loader sits at load-state 34 calling the SWF's `showLoadingProcess` each
-@@ -237,7 +337,7 @@ async fn maybe_hold_dcr_for_preloader(url: &str) {
+@@ -237,7 +386,7 @@ async fn maybe_hold_dcr_for_preloader(url: &str) {
      if !crate::player::is_flash_loading().unwrap_or(false) {
          return;
      }
@@ -5006,6 +5155,25 @@ index 2499fe7e..f1f2fcb8 100644
                  _ => None,
              };
              let is_film_loop = matches!(&m.member_type, CastMemberType::FilmLoop(_));
+diff --git a/vm-rust/src/player/symbols/builtin.rs b/vm-rust/src/player/symbols/builtin.rs
+index 731e9233..1823a0c5 100644
+--- a/vm-rust/src/player/symbols/builtin.rs
++++ b/vm-rust/src/player/symbols/builtin.rs
+@@ -83,6 +83,14 @@ define_builtin_symbols! {
+     "floatPrecision" => FloatPrecision,
+     "centerStage" => CenterStage,
+     "exitLock" => ExitLock,
++    // PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.034): Director 5 movie properties (ScummVM's
++    // lingo-the.cpp lists all five as "D5 p"); Virus Raider's startMovie sets the
++    // idleHandlerPeriod and stopped at "not a built-in symbol".
++    "idleHandlerPeriod" => IdleHandlerPeriod,
++    "idleLoadMode" => IdleLoadMode,
++    "idleLoadPeriod" => IdleLoadPeriod,
++    "idleLoadTag" => IdleLoadTag,
++    "idleReadChunkSize" => IdleReadChunkSize,
+     "itemDelimiter" => ItemDelimiter,
+     "debugPlaybackEnabled" => DebugPlaybackEnabled,
+     "alertHook" => AlertHook,
 diff --git a/vm-rust/src/player/testing.rs b/vm-rust/src/player/testing.rs
 index 7096c712..8e9ad80d 100644
 --- a/vm-rust/src/player/testing.rs

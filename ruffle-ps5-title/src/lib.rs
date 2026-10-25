@@ -112,6 +112,21 @@
 //! Shockwave 3D (src/dir3d.rs) and Animations (Flashpoint's, and an Animations folder). The search
 //! keyboard shows what is typed and has settings of its own (Settings > Search keyboard).
 //!
+//! 1.000.034 (2026-10-25): what the 1.000.032 console logs had shown. The console refuses `lstat`
+//! to Ruffle5 in the games folder and /data/ruffle5 (EPERM), while stat, readdir, unlink, rmdir and
+//! rename work. 1.000.032 told a folder from a file, and whether a removal had worked, by `lstat`,
+//! so a refused `lstat` read as "gone": Delete and Keep online games Off logged "menu: deleted ..."
+//! and left the game there (the menu's count stayed the same). Removing now lists the folder and
+//! unlinks and rmdirs what is in it, and a game is gone only when stat no longer finds it
+//! (src/fsutil.rs). A Flashpoint game's files that are not on the console are asked of Flashpoint's
+//! server when the game asks for them, and kept (src/fpfetch.rs), as Flashpoint's own game server
+//! does: Golfish and Golf Ace's wrapper loads gameloader.dcr from beside it ("[go] eager mount of
+//! gameloader.dcr FAILED"). DirPlayer: mouseEnter / mouseLeave go to the front-most sprite with a
+//! script (Teen Titans Battle Blitz's select screen flickered: a fighter's highlight, shown on
+//! mouseEnter, covered its tile); `the idleHandlerPeriod` and the other idle* movie properties are
+//! kept (Virus Raider's startMovie stopped at "Symbol 'idleHandlerPeriod' is not a built-in
+//! symbol"); a file a movie asks for that is not there is named in ruffle.log.
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -119,7 +134,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.033";
+pub const APP_VERSION: &str = "1.000.034";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 
@@ -141,6 +156,8 @@ mod cursor;
 mod dir3d;
 #[cfg(feature = "ruffle")]
 mod dirinfo;
+#[cfg(feature = "ruffle")]
+mod fpfetch;
 #[cfg(feature = "ruffle")]
 mod editor;
 #[cfg(feature = "ruffle")]
