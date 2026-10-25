@@ -315,13 +315,20 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
     // For a game Flash Browser fetched, the address its source plays it from (online.txt `url`:
     // Flashpoint's launch address); else the Pretend Site setting. 1.000.033: the game's own address
     // first — a Flashpoint game's files are read by their addresses (src/navigator.rs), and a movie
-    // that builds them from its own address would look under the pretend site's.
+    // that builds them from its own address would look under the pretend site's. 1.000.035: the
+    // setting's Automatic, the site the movie names (src/pretend.rs).
     let spoof = match crate::online::address_for(&path) {
         Some(a) => {
             say(&format!("     address {a} (online.txt)"));
             Some(a)
         }
-        None => s.spoofed_url(&path),
+        None => {
+            let (a, line) = crate::pretend::address(&s, &path, false);
+            if let Some(line) = line {
+                say(&line);
+            }
+            a
+        }
     };
     if spoof.is_some() {
         builder = builder.with_spoofed_url(spoof.clone());

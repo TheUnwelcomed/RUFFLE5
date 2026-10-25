@@ -767,6 +767,10 @@ pub struct Online {
     shelf_anim: f32,
     shown_now: bool,
     toasts: Vec<String>,
+    /// 1.000.035: the games fetched in this run (their folders in the games folder): the only
+    /// ones Keep online games Off deletes when they are left. A game already in the library
+    /// stays (1.000.034 deleted any game from Flash Browser, fetched in an earlier run too).
+    fetched_now: std::collections::HashSet<String>,
 }
 
 impl Online {
@@ -794,7 +798,28 @@ impl Online {
             shelf_anim: 0.0,
             shown_now: false,
             toasts: Vec::new(),
+            fetched_now: std::collections::HashSet::new(),
         }
+    }
+
+    /// The game's folder in the games folder (or the file itself, a loose movie).
+    fn game_folder(&self, movie_path: &str) -> Option<String> {
+        let rel = movie_path.strip_prefix(&self.games_dir)?.trim_start_matches('/');
+        let first = rel.split('/').next().filter(|f| !f.is_empty())?;
+        Some(format!("{}/{first}", self.games_dir.trim_end_matches('/')))
+    }
+
+    /// 1.000.035: the game at `movie_path` was fetched now.
+    fn note_fetched(&mut self, movie_path: &str) {
+        if let Some(f) = self.game_folder(movie_path) {
+            self.fetched_now.insert(f);
+        }
+    }
+
+    /// 1.000.035: was the game at `movie_path` fetched in this run? (Keep online games Off
+    /// deletes only those.)
+    pub fn fetched_in_this_run(&self, movie_path: &str) -> bool {
+        self.game_folder(movie_path).is_some_and(|f| self.fetched_now.contains(&f))
     }
 
     fn src(&self) -> Source {
@@ -1168,6 +1193,7 @@ impl Online {
                     match result {
                         Ok(path) => {
                             crate::say(&format!("online: {title} is in {path}"));
+                            self.note_fetched(&path);
                             self.installed = installed(&self.games_dir);
                             self.installed.insert(k, path.clone());
                             if play && shown {
@@ -1663,6 +1689,20 @@ mod tests {
         assert_eq!(cast_file_name("sounds").as_deref(), Some("sounds.cct"));
         assert_eq!(cast_file_name("a.b.cst").as_deref(), Some("a.b.cct"));
         assert_eq!(cast_file_name(""), None);
+    }
+
+    #[test]
+    fn keep_online_games_off_is_for_games_fetched_in_this_run() {
+        let mut o = Online::new("/data/homebrew/PPSA99620/games");
+        let racer = "/data/homebrew/PPSA99620/games/Pyongyang Racer/content/www.koryogroup.com/Pyongyang_racer/PY Racer_0509/PYracer.swf";
+        assert!(!o.fetched_in_this_run(racer));
+        o.note_fetched(racer);
+        assert!(o.fetched_in_this_run(racer));
+        // any movie of that game's folder; not another game, not one fetched in an earlier run
+        assert!(o.fetched_in_this_run("/data/homebrew/PPSA99620/games/Pyongyang Racer/other.swf"));
+        assert!(!o.fetched_in_this_run("/data/homebrew/PPSA99620/games/Pacman/pacman.swf"));
+        assert!(!o.fetched_in_this_run("/data/homebrew/PPSA99620/games/Pyongyang Racer 2/x.swf"));
+        assert!(!o.fetched_in_this_run("/mnt/usb0/ruffle5/Pyongyang Racer/PYracer.swf"));
     }
 
     #[test]

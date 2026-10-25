@@ -20,8 +20,9 @@ pub const LOAD_BEHAVIORS: [&str; 3] = ["Streaming", "Delayed", "Blocking"];
 pub const MAX_EXECUTION: [u32; 6] = [5, 10, 15, 20, 30, 60];
 pub const MOUSE_SPEEDS: [&str; 5] = ["Slowest", "Slow", "Normal", "Fast", "Fastest"];
 /// Sites a sitelocked game may insist on, and where its file seems to come from there (the game's
-/// own file name is appended).
-pub const SPOOF_SITES: [(&str, &str); 7] = [
+/// own file name is appended). 1.000.035: Shockwave.com, and Automatic (src/pretend.rs: the site
+/// the game's own file names) — added at the end, so a saved choice keeps its number.
+pub const SPOOF_SITES: [(&str, &str); 9] = [
     ("Off", ""),
     ("Newgrounds", "https://uploads.ungrounded.net/alternate/1/"),
     ("Kongregate", "https://chat.kongregate.com/gamez/0001/0001/live/"),
@@ -29,7 +30,27 @@ pub const SPOOF_SITES: [(&str, &str); 7] = [
     ("Miniclip", "https://www.miniclip.com/games/en/"),
     ("Addicting Games", "https://www.addictinggames.com/games/"),
     ("Y8", "https://www.y8.com/games/"),
+    ("Shockwave.com", "http://www.shockwave.com/content/"),
+    ("Automatic", ""),
 ];
+
+/// `spoof_site` for Automatic (src/pretend.rs).
+pub const SPOOF_AUTOMATIC: u8 = 8;
+
+/// 1.000.035: the address a game at `game_path` seems to come from on the site `site` (an index of
+/// SPOOF_SITES that has an address): the site's folder and the game's file name. A Director movie
+/// gets the http:// form: Shockwave movies were served over http, and their Lingo tests for it
+/// (Miniclip's game loader builds its addresses from the domain when `the moviePath contains
+/// "http:"`).
+pub fn site_address(site: usize, game_path: &str, director: bool) -> Option<String> {
+    let &(_, base) = SPOOF_SITES.get(site)?;
+    if base.is_empty() {
+        return None;
+    }
+    let file = game_path.rsplit('/').next().filter(|f| !f.is_empty()).unwrap_or(if director { "movie.dcr" } else { "game.swf" });
+    let base = if director { base.replacen("https://", "http://", 1) } else { base.to_string() };
+    Some(format!("{base}{file}"))
+}
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Settings {
@@ -245,7 +266,13 @@ impl Row {
             Row::LoadBehavior => "Streaming: the game starts while it loads. Delayed: once loaded. Blocking: loads everything before the first frame.",
             Row::MaxExecution => "How long a game's script may run before it is stopped as stuck.",
             Row::DummyExternalInterface => "Tells games the web page they expect is there, answering its calls with nothing. Some games wait for it and will not start without it.",
-            Row::SpoofSite => "Makes a game believe it runs on this site. Many games only start on the site they were made for.",
+            Row::SpoofSite => {
+                if s.spoof_site == SPOOF_AUTOMATIC {
+                    "Automatic: each game is told it runs on the site its own file names (Newgrounds, Kongregate, Armor Games, Miniclip, Addicting Games, Y8 or Shockwave.com), and on none when it names none. Flash and Shockwave games; a game from Flashpoint keeps its own address."
+                } else {
+                    "Makes a game believe it runs on this site. Many games only start on the site they were made for. Flash and Shockwave games; a game from Flashpoint keeps its own address. Automatic: the site each game names."
+                }
+            }
             Row::AllControls => "What each button does in every game. A game's own mapping (Triangle on it in Games) starts from these. Saved in Custom Mappings.",
             Row::KeyboardLayout => "Its size, where it opens, and whether the game moves out of its way, for every game; ready-made settings for kinds of game. A game's own (quick menu: Keyboard for this game) start from these. Saved in Custom Mappings.",
             Row::SearchKeyboard => "The keyboard L2 opens to search Games and Flash Browser: its size, where it opens and how solid it is. It starts as the on-screen keyboard for all games; what you change here is its own. Saved in Custom Mappings.",
@@ -264,7 +291,7 @@ impl Row {
                 if s.keep_online {
                     "On: a game you fetch from Flash Browser stays in your games folder after you play it. Delete one yourself with OPTIONS on its tile."
                 } else {
-                    "Off: a game fetched from Flash Browser is deleted when you leave it and come back to the menu. Its saves are kept."
+                    "Off: a game you fetch from Flash Browser is deleted when you leave it and come back to the menu, so it is played and gone. Its saves are kept. Games already in your library stay."
                 }
             }
             Row::Version | Row::CreatedBy => "",
@@ -439,14 +466,10 @@ impl Settings {
         *self != before
     }
 
-    /// The URL a game should believe it was loaded from, when pretending.
+    /// The URL a Flash game should believe it was loaded from, when pretending to be on a chosen
+    /// site (Automatic: src/pretend.rs reads the game first).
     pub fn spoofed_url(&self, game_path: &str) -> Option<String> {
-        let (_, base) = SPOOF_SITES[self.spoof_site as usize];
-        if base.is_empty() {
-            return None;
-        }
-        let file = game_path.rsplit('/').next().filter(|f| !f.is_empty()).unwrap_or("game.swf");
-        Some(format!("{base}{file}"))
+        site_address(self.spoof_site as usize, game_path, false)
     }
 
     /// Game pixels per USB mouse count.
@@ -475,7 +498,10 @@ mod tests {
         assert_eq!(Settings::load(path.to_str().unwrap()), s);
         std::fs::write(&path, "quality=99\nvolume=50\nspoof_site=200\nbogus\nuhd=1\n").unwrap();
         let t = Settings::load(path.to_str().unwrap());
-        assert_eq!((t.quality, t.volume, t.spoof_site, t.uhd), (7, 10, 6, true));
+        assert_eq!((t.quality, t.volume, t.spoof_site, t.uhd), (7, 10, SPOOF_AUTOMATIC, true));
+        // 1.000.035: the sites added at the end, so a choice saved before keeps its site
+        std::fs::write(&path, "spoof_site=6\n").unwrap();
+        assert_eq!(SPOOF_SITES[Settings::load(path.to_str().unwrap()).spoof_site as usize].0, "Y8");
         // a settings file from before 1.000.028 keeps online games
         assert!(t.keep_online);
         let _ = std::fs::remove_dir_all(&dir);
@@ -493,6 +519,13 @@ mod tests {
         assert_eq!(s.spoofed_url("/data/games/x.swf"), None);
         s.spoof_site = 1;
         assert_eq!(s.spoofed_url("/data/games/x.swf").unwrap(), "https://uploads.ungrounded.net/alternate/1/x.swf");
+        // a Director movie gets the http:// form; Automatic has no address of its own
+        assert_eq!(site_address(4, "/data/games/Golf/gameloader.dcr", true).unwrap(), "http://www.miniclip.com/games/en/gameloader.dcr");
+        assert_eq!(site_address(7, "/data/games/pb.dcr", false).unwrap(), "http://www.shockwave.com/content/pb.dcr");
+        s.spoof_site = SPOOF_AUTOMATIC;
+        assert_eq!(SPOOF_SITES[SPOOF_AUTOMATIC as usize].0, "Automatic");
+        assert_eq!(s.spoofed_url("/data/games/x.swf"), None);
+        assert!(!s.step(Row::SpoofSite, 1), "Automatic is the last");
     }
 
     #[test]

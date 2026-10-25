@@ -127,6 +127,14 @@
 //! kept (Virus Raider's startMovie stopped at "Symbol 'idleHandlerPeriod' is not a built-in
 //! symbol"); a file a movie asks for that is not there is named in ruffle.log.
 //!
+//! 1.000.035 (2026-10-25): Pretend to be on for Shockwave games too, Shockwave.com among the sites,
+//! and Automatic: each game is told it runs on the site its own file names, read from the movie
+//! (src/pretend.rs). DirPlayer: under a movie address, a movie the first one goes to keeps its own
+//! name (`the movieName` stayed the wrapper's: Battle Blitz given an address stopped at its title),
+//! and `getStreamStatus` / `netDone` by address find what `preloadNetThing` asked for. Keep online
+//! games Off deletes only a game fetched in this run (1.000.034 also deleted games fetched before:
+//! Pacman).
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -134,7 +142,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.034";
+pub const APP_VERSION: &str = "1.000.035";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 
@@ -158,6 +166,8 @@ mod dir3d;
 mod dirinfo;
 #[cfg(feature = "ruffle")]
 mod fpfetch;
+#[cfg(feature = "ruffle")]
+mod pretend;
 #[cfg(feature = "ruffle")]
 mod editor;
 #[cfg(feature = "ruffle")]
@@ -559,8 +569,13 @@ fn run_app(gpu: gpu::Gpu, paths: paths::Paths) -> Result<(), String> {
             say("game: restarting");
         }
         // 1.000.028: Settings › Library › Keep online games Off: a game the Online tab fetched goes
-        // when it is left
-        if !app.settings.keep_online && app.menu.games.get(gi).is_some_and(|g| g.online) {
+        // when it is left. 1.000.035: one fetched in this run only — a game already in the library
+        // stays (1.000.034 deleted Pacman, fetched in an earlier run, when it was left)
+        let fetched_now = app.menu.games.get(gi).is_some_and(|g| g.online && app.menu.online.fetched_in_this_run(&g.path));
+        if let Some(g) = app.menu.games.get(gi).filter(|g| !app.settings.keep_online && !fetched_now && g.online) {
+            say(&format!("menu: {} kept: Keep online games is Off, but it was in the library before this run", g.name));
+        }
+        if !app.settings.keep_online && fetched_now {
             delete_game(&mut app, gi, " (Keep online games is Off)");
         }
     }

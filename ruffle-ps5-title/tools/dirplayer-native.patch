@@ -2663,7 +2663,7 @@ index 00000000..87000619
 +    }
 +}
 diff --git a/vm-rust/src/player/mod.rs b/vm-rust/src/player/mod.rs
-index 1c4a69a3..6a5ae2ae 100644
+index 1c4a69a3..af943e66 100644
 --- a/vm-rust/src/player/mod.rs
 +++ b/vm-rust/src/player/mod.rs
 @@ -54,6 +54,33 @@ pub mod console;
@@ -2739,7 +2739,43 @@ index 1c4a69a3..6a5ae2ae 100644
          // When running a nested `#movie` sub-player, dispatch its Flash sprites
          // to Ruffle under a synthetic per-player key so they don't collide with
          // the host's channel keys and their captured frames route back into THIS
-@@ -3092,12 +3131,69 @@ impl DirPlayer {
+@@ -1694,18 +1733,32 @@ impl DirPlayer {
+                     .map(|s| (s.clone(), false))
+             });
+         if let Some((path, is_label)) = path_to_apply {
++            // PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.035): the address names the first movie. A movie
++            // that one goes to afterwards (a wrapper's game, a loader's) is in the address's folder
++            // under its own name: `the movieName` stayed the first movie's, so `the moviePath &
++            // the movieName` named the wrapper while the game played — Teen Titans Battle Blitz
++            // (gamewrapper.dir -> game.dcr) given an address stopped at its title, frame 105.
++            let own_name = self.movie.file_name.clone();
++            let later_movie = !is_label && self.net_manager.override_base_path.is_some();
++            let name_for = |name: &str| -> String {
++                if later_movie && !name.eq_ignore_ascii_case(&own_name) && !own_name.is_empty() {
++                    own_name.clone()
++                } else {
++                    name.to_string()
++                }
++            };
+             if let Ok(url) = Url::parse(&path) {
+                 self.movie.base_path = get_base_url(&url).to_string();
+                 if let Some(name) = url.path_segments().and_then(|s| s.last()) {
+-                    self.movie.file_name = name.to_string();
++                    self.movie.file_name = name_for(name);
+                 }
+             } else {
+                 // Treat as a plain path
+                 if let Some(pos) = path.rfind('/') {
+                     self.movie.base_path = path[..pos].to_string();
+-                    self.movie.file_name = path[pos + 1..].to_string();
++                    self.movie.file_name = name_for(&path[pos + 1..]);
+                 } else {
+-                    self.movie.file_name = path.clone();
++                    self.movie.file_name = name_for(&path);
+                 }
+             }
+             if !is_label {
+@@ -3092,12 +3145,69 @@ impl DirPlayer {
              .and_then(|t| t.film_loop.clone())
      }
  
@@ -2810,7 +2846,7 @@ index 1c4a69a3..6a5ae2ae 100644
                  Ok(self.alloc_datum(Datum::String(stats)))
              },
              BuiltInSymbol::DatumSnapshot => {
-@@ -3107,7 +3203,7 @@ impl DirPlayer {
+@@ -3107,7 +3217,7 @@ impl DirPlayer {
              },
              BuiltInSymbol::DatumLeakScan => {
                  let stats = self.datum_leak_scan();
@@ -2819,7 +2855,7 @@ index 1c4a69a3..6a5ae2ae 100644
                  Ok(self.alloc_datum(Datum::String(stats)))
              },
              BuiltInSymbol::SystemDate => {
-@@ -4095,7 +4191,7 @@ impl DirPlayer {
+@@ -4095,7 +4205,7 @@ impl DirPlayer {
              stack_trace.push_str(&self.format_scope_stack(5, 25));
              stack_trace.push_str("\nThis usually indicates a bug in the Director movie's scripts (e.g., a handler calling itself infinitely).\n");
              stack_trace.push_str("Note: If this is happening during frame events, it may be a re-entrant call issue.\n");
@@ -2828,7 +2864,7 @@ index 1c4a69a3..6a5ae2ae 100644
              panic!("Stack overflow - infinite recursion in Lingo scripts");
          }
          let scope_ref = self.scope_count;
-@@ -4246,7 +4342,9 @@ impl DirPlayer {
+@@ -4246,7 +4356,9 @@ impl DirPlayer {
                              } else {
                                  next
                              };
@@ -2839,7 +2875,7 @@ index 1c4a69a3..6a5ae2ae 100644
                              Some((member_ref, current, new_frame))
                          } else {
                              None
-@@ -4257,6 +4355,12 @@ impl DirPlayer {
+@@ -4257,6 +4369,12 @@ impl DirPlayer {
          
          // Process each filmloop
          for (member_ref, old_frame, new_frame) in active_filmloops {
@@ -2852,7 +2888,7 @@ index 1c4a69a3..6a5ae2ae 100644
              // Skip if frame didn't change
              if old_frame == new_frame {
                  continue;
-@@ -4793,7 +4897,7 @@ where
+@@ -4793,7 +4911,7 @@ where
  {
      // `use ... as raw` (no trailing `(`) so the bulk `crate::player::spawn_player_local(`
      // → `spawn_player_local(` rewrite doesn't turn this into infinite recursion.
@@ -2861,7 +2897,7 @@ index 1c4a69a3..6a5ae2ae 100644
      let id = unsafe { ACTIVE_PLAYER_ID };
      raw(WithActivePlayer { id, inner: fut });
  }
-@@ -5125,7 +5229,10 @@ pub async fn player_call_script_handler_raw_args(
+@@ -5125,7 +5243,10 @@ pub async fn player_call_script_handler_raw_args(
      // On each BACKWARD jump (a loop iteration) we check elapsed time and, past a
      // frame's worth, yield a real macrotask so queued input events fire, then
      // resume. Time-budgeted so ordinary fast compute loops are unaffected.
@@ -2873,7 +2909,7 @@ index 1c4a69a3..6a5ae2ae 100644
      // Count backward jumps to distinguish a TIGHT busy-wait (thousands of
      // iterations/ms — `repeat while keyPressed`) from a heavy COMPUTE loop (a
      // few iterations, each doing real work — the game's `drawmap`/water
-@@ -5194,7 +5301,9 @@ pub async fn player_call_script_handler_raw_args(
+@@ -5194,7 +5315,9 @@ pub async fn player_call_script_handler_raw_args(
                          if backjumps >= 4096 {
                              backjumps = 0;
                              let now = chrono::Utc::now().timestamp_millis();
@@ -2884,7 +2920,7 @@ index 1c4a69a3..6a5ae2ae 100644
                                  last_yield_ms = now;
                                  let _ = timeout(
                                      Duration::from_millis(1),
-@@ -5500,7 +5609,9 @@ pub async fn player_call_script_handler_raw_args(
+@@ -5500,7 +5623,9 @@ pub async fn player_call_script_handler_raw_args(
                      if backjumps >= 4096 {
                          backjumps = 0;
                          let now = chrono::Utc::now().timestamp_millis();
@@ -2895,7 +2931,7 @@ index 1c4a69a3..6a5ae2ae 100644
                              last_yield_ms = now;
                              let _ = timeout(
                                  Duration::from_millis(1),
-@@ -5757,7 +5868,7 @@ async fn run_movie_init_sequence() {
+@@ -5757,7 +5882,7 @@ async fn run_movie_init_sequence() {
      dispatch_system_event_to_timeouts(BuiltInSymbol::PrepareMovie, &vec![]).await;
  
      if let Err(err) = player_invoke_global_event(Symbol::builtin(BuiltInSymbol::PrepareMovie), &vec![]).await {
@@ -2904,7 +2940,7 @@ index 1c4a69a3..6a5ae2ae 100644
          if err.code != ScriptErrorCode::Abort {
              reserve_player_mut(|player| player.on_script_error(&err));
          }
-@@ -6260,6 +6371,7 @@ async fn restart_current_movie() {
+@@ -6260,6 +6385,7 @@ async fn restart_current_movie() {
  
  // JS bridge name uses the `dirplayer_` prefix so this fork's globals don't
  // collide with stock Ruffle / other libraries on the same page.
@@ -2912,7 +2948,7 @@ index 1c4a69a3..6a5ae2ae 100644
  #[wasm_bindgen]
  extern "C" {
      #[wasm_bindgen(js_name = "dirplayer_isFlashLoading", catch)]
-@@ -6288,6 +6400,31 @@ extern "C" {
+@@ -6288,6 +6414,31 @@ extern "C" {
      #[wasm_bindgen(js_name = "dirplayer_ruffleStop")]
      fn ruffle_stop(sprite_num: i32);
  }
@@ -2944,7 +2980,7 @@ index 1c4a69a3..6a5ae2ae 100644
  /// Execute one complete frame cycle: run frame scripts, then advance to the next frame.
  /// Returns (is_playing, is_script_paused) so callers can check if the movie is still running.
  ///
-@@ -7423,6 +7560,9 @@ pub async fn run_frame_loop() {
+@@ -7423,6 +7574,9 @@ pub async fn run_frame_loop() {
              // 1-3 s) to set `preloaderTranslationSuccess`; without this the tight
              // loop starves that fetch's completion callback and the login links
              // (asfunction hyperlinks in the translated IDS strings) never load.
@@ -2954,7 +2990,7 @@ index 1c4a69a3..6a5ae2ae 100644
              let read_window_count = |key: &str| -> f64 {
                  web_sys::window()
                      .and_then(|w| {
-@@ -7431,6 +7571,8 @@ pub async fn run_frame_loop() {
+@@ -7431,6 +7585,8 @@ pub async fn run_frame_loop() {
                      .and_then(|v| v.as_f64())
                      .unwrap_or(0.0)
              };
@@ -4857,10 +4893,46 @@ index 00000000..a159f906
 +    }
 +}
 diff --git a/vm-rust/src/player/net_manager.rs b/vm-rust/src/player/net_manager.rs
-index 0a4cb097..2ce9606c 100644
+index 0a4cb097..78cb61e6 100644
 --- a/vm-rust/src/player/net_manager.rs
 +++ b/vm-rust/src/player/net_manager.rs
-@@ -291,15 +291,9 @@ impl NetManager {
+@@ -91,9 +91,35 @@ impl NetManager {
+                 let resolved = normalize_task_url(&url.to_string(), self.base_path.as_ref());
+                 find_task_with_resolved_url(&self.tasks, &resolved)
+             })
++            .or_else(|| {
++                // PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.035): an address under the movie's own (the
++                // movie path override), as `preload_net_thing` asked for it — the part after the
++                // override's folder — so `getStreamStatus(the moviePath & "x.cct")` and
++                // `netDone` by address find the task the preload made.
++                let relative = self.strip_override_base(url)?;
++                find_task_with_url(&self.tasks, &relative).or_else(|| {
++                    let resolved = normalize_task_url(&relative, self.base_path.as_ref());
++                    find_task_with_resolved_url(&self.tasks, &resolved)
++                })
++            })
+             .map(|task| task.id)
+     }
+ 
++    /// PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.035): `url` without the movie path override's folder,
++    /// when it is under it (compared as `preload_net_thing` compares: `\` as `/`, any case).
++    fn strip_override_base(&self, url: &str) -> Option<String> {
++        let override_base = self.override_base_path.as_ref()?;
++        let norm_url = url.replace('\\', "/");
++        let norm_override = override_base.replace('\\', "/");
++        let prefix = if norm_override.ends_with('/') { norm_override } else { format!("{norm_override}/") };
++        let head = norm_url.get(..prefix.len())?;
++        if head.eq_ignore_ascii_case(&prefix) {
++            norm_url.get(prefix.len()..).filter(|rest| !rest.is_empty()).map(str::to_string)
++        } else {
++            None
++        }
++    }
++
+     pub fn get_task_state(&self, task_id: Option<u32>) -> Option<NetTaskState> {
+         let shared_state = self.shared_state.try_lock().unwrap();
+         let task_states = &shared_state.task_states;
+@@ -291,15 +317,9 @@ impl NetManager {
                  // slash before the drive letter makes `fs::read` fail on Windows
                  // while working by accident on macOS/Linux. `to_file_path` decodes
                  // percent-escapes and yields a real platform path on all three.

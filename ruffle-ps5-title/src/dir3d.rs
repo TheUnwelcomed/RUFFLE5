@@ -34,6 +34,18 @@ pub fn is_director_file(name: &str) -> bool {
 
 /// Has the Director file `bytes` a Shockwave 3D cast member?
 pub fn has_3d(bytes: &[u8]) -> Result<bool, String> {
+    let mut found = false;
+    resources(bytes, &|t| t == b"CASt", &mut |_, d| {
+        found = contains(d, MARK);
+        found
+    })?;
+    Ok(found)
+}
+
+/// 1.000.035: each resource of the Director file `bytes` whose tag `want` takes, as the file keeps
+/// it (a plain file) or decompressed (an afterburned one), in the order of its ids, until `visit`
+/// says to stop (true). Pretend to be on, Automatic (src/pretend.rs), reads a movie's text so.
+pub(crate) fn resources(bytes: &[u8], want: &dyn Fn(&[u8; 4]) -> bool, visit: &mut dyn FnMut(&[u8; 4], &[u8]) -> bool) -> Result<(), String> {
     if bytes.len() < 12 {
         return Err("too short for a Director file".into());
     }
@@ -44,8 +56,8 @@ pub fn has_3d(bytes: &[u8]) -> Result<bool, String> {
     };
     let r = Reader { b: bytes, p: 8, le };
     match &r.tag_at(8)? {
-        b"FGDM" | b"FGDC" => afterburned(bytes, le),
-        _ => plain(bytes, le),
+        b"FGDM" | b"FGDC" => afterburned(bytes, le, want, visit),
+        _ => plain(bytes, le, want, visit),
     }
 }
 
@@ -106,7 +118,7 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
-fn afterburned(b: &[u8], le: bool) -> Result<bool, String> {
+fn afterburned(b: &[u8], le: bool, want: &dyn Fn(&[u8; 4]) -> bool, visit: &mut dyn FnMut(&[u8; 4], &[u8]) -> bool) -> Result<(), String> {
     let mut r = Reader { b, p: 12, le };
     r.expect(b"Fver")?;
     let n = r.var()?;
@@ -152,31 +164,37 @@ fn afterburned(b: &[u8], le: bool) -> Result<bool, String> {
         loaded.insert(id, (s.p, stored));
         s.p += stored;
     }
-    for (id, &(tag, offset, stored, size)) in &res {
-        if &tag != b"CASt" {
+    let mut ids: Vec<usize> = res.keys().copied().filter(|&id| id != 2).collect();
+    ids.sort_unstable();
+    for id in ids {
+        let (tag, offset, stored, size) = res[&id];
+        if !want(&tag) {
             continue;
         }
-        let found = match loaded.get(id) {
-            Some(&(at, len)) => ils.get(at..(at + len).min(ils.len())).is_some_and(|d| contains(d, MARK)),
+        let stop = match loaded.get(&id) {
+            Some(&(at, len)) => match ils.get(at..(at + len).min(ils.len())) {
+                Some(d) => visit(&tag, d),
+                None => false,
+            },
             None => {
                 let Some(raw) = b.get(body + offset..(body + offset + stored).min(b.len())) else {
                     continue;
                 };
                 // zlib, or stored as it is (its size is no sign: a record can compress to its own size)
                 match inflate(raw, size.max(1) * 2) {
-                    Ok(d) => contains(&d, MARK),
-                    Err(_) => contains(raw, MARK),
+                    Ok(d) => visit(&tag, &d),
+                    Err(_) => visit(&tag, raw),
                 }
             }
         };
-        if found {
-            return Ok(true);
+        if stop {
+            return Ok(());
         }
     }
-    Ok(false)
+    Ok(())
 }
 
-fn plain(b: &[u8], le: bool) -> Result<bool, String> {
+fn plain(b: &[u8], le: bool, want: &dyn Fn(&[u8; 4]) -> bool, visit: &mut dyn FnMut(&[u8; 4], &[u8]) -> bool) -> Result<(), String> {
     let r = Reader { b, p: 12, le };
     if &r.tag_at(12)? != b"imap" {
         return Err("imap expected".into());
@@ -193,18 +211,19 @@ fn plain(b: &[u8], le: bool) -> Result<bool, String> {
     }
     for i in 0..used {
         let at = mmap + 8 + header + i * entry;
-        if &r.tag_at(at)? != b"CASt" {
+        let tag = r.tag_at(at)?;
+        if !want(&tag) {
             continue;
         }
         let len = r.u32_at(at + 4)? as usize;
         let off = r.u32_at(at + 8)? as usize;
         if let Some(d) = b.get(off + 8..(off + 8 + len).min(b.len())) {
-            if contains(d, MARK) {
-                return Ok(true);
+            if visit(&tag, d) {
+                return Ok(());
             }
         }
     }
-    Ok(false)
+    Ok(())
 }
 
 /// The answers so far, by file: (size, modified, 3D).
@@ -394,6 +413,44 @@ pub(crate) mod sample {
         c
     }
 
+    /// A plain big-endian file (RIFX, MV93): imap -> mmap, these records as `tag` resources.
+    pub(crate) fn plain_file(records: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(b"RIFX\0\0\0\0MV93");
+        f.extend_from_slice(b"imap");
+        f.extend_from_slice(&24u32.to_be_bytes());
+        f.extend_from_slice(&1u32.to_be_bytes());
+        let mmap_at = 12 + 8 + 24;
+        f.extend_from_slice(&(mmap_at as u32).to_be_bytes());
+        f.resize(mmap_at, 0);
+        let header = 24usize;
+        let entry = 20usize;
+        let n = records.len();
+        let data_at = mmap_at + 8 + header + n * entry;
+        f.extend_from_slice(b"mmap");
+        f.extend_from_slice(&((header + n * entry) as u32).to_be_bytes());
+        f.extend_from_slice(&(header as u16).to_be_bytes());
+        f.extend_from_slice(&(entry as u16).to_be_bytes());
+        f.extend_from_slice(&(n as u32).to_be_bytes());
+        f.extend_from_slice(&(n as u32).to_be_bytes());
+        f.extend_from_slice(&[0xff; 8]);
+        f.extend_from_slice(&0u32.to_be_bytes());
+        let mut at = data_at;
+        for (tag, r) in records {
+            f.extend_from_slice(*tag);
+            f.extend_from_slice(&(r.len() as u32).to_be_bytes());
+            f.extend_from_slice(&(at as u32).to_be_bytes());
+            f.extend_from_slice(&[0; 8]);
+            at += 8 + r.len();
+        }
+        for (tag, r) in records {
+            f.extend_from_slice(*tag);
+            f.extend_from_slice(&(r.len() as u32).to_be_bytes());
+            f.extend_from_slice(r);
+        }
+        f
+    }
+
     /// An afterburned movie with a bitmap's record, and a Shockwave 3D member when `three_d`.
     pub(crate) fn movie(three_d: bool) -> Vec<u8> {
         let d3 = cast_3d();
@@ -427,42 +484,7 @@ mod tests {
     #[test]
     fn a_plain_movie_is_read_through_its_memory_map() {
         // RIFX (big-endian): imap -> mmap with two entries (a bitmap's record, a 3D member's)
-        let build = |second: &[u8]| -> Vec<u8> {
-            let mut f = Vec::new();
-            f.extend_from_slice(b"RIFX\0\0\0\0MV93");
-            f.extend_from_slice(b"imap");
-            f.extend_from_slice(&24u32.to_be_bytes());
-            f.extend_from_slice(&1u32.to_be_bytes());
-            let mmap_at = 12 + 8 + 24;
-            f.extend_from_slice(&(mmap_at as u32).to_be_bytes());
-            f.resize(mmap_at, 0);
-            let header = 24usize;
-            let entry = 20usize;
-            let records: [&[u8]; 2] = [b"\x00\x00\x00\x01bitmap", second];
-            let data_at = mmap_at + 8 + header + 2 * entry;
-            f.extend_from_slice(b"mmap");
-            f.extend_from_slice(&((header + 2 * entry) as u32).to_be_bytes());
-            f.extend_from_slice(&(header as u16).to_be_bytes());
-            f.extend_from_slice(&(entry as u16).to_be_bytes());
-            f.extend_from_slice(&2u32.to_be_bytes());
-            f.extend_from_slice(&2u32.to_be_bytes());
-            f.extend_from_slice(&[0xff; 8]);
-            f.extend_from_slice(&0u32.to_be_bytes());
-            let mut at = data_at;
-            for r in records {
-                f.extend_from_slice(b"CASt");
-                f.extend_from_slice(&(r.len() as u32).to_be_bytes());
-                f.extend_from_slice(&(at as u32).to_be_bytes());
-                f.extend_from_slice(&[0; 8]);
-                at += 8 + r.len();
-            }
-            for r in records {
-                f.extend_from_slice(b"CASt");
-                f.extend_from_slice(&(r.len() as u32).to_be_bytes());
-                f.extend_from_slice(r);
-            }
-            f
-        };
+        let build = |second: &[u8]| -> Vec<u8> { super::sample::plain_file(&[(b"CASt", b"\x00\x00\x00\x01bitmap"), (b"CASt", second)]) };
         assert_eq!(has_3d(&build(&cast_3d())), Ok(true));
         assert_eq!(has_3d(&build(b"\x00\x00\x00\x03text")), Ok(false));
     }

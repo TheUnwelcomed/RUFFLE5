@@ -353,7 +353,8 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
     // source's Shockwave Projector command (Flashpoint's launchCommand: its flags, its --do Lingo),
     // the address it was published at (`the moviePath`; the files it asks for there are read from
     // its folder), and the folder its other web addresses are read from (its game data's content).
-    if let Some(l) = crate::online::launch_for(&path) {
+    let launch = crate::online::launch_for(&path);
+    if let Some(l) = &launch {
         if let Some(cmd) = &l.command {
             let lc = vm_rust::player::native::parse_launch_command(cmd);
             say(&format!("     launch command (online.txt): {cmd}"));
@@ -384,6 +385,18 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
             let fp = crate::fpfetch::FpFetch::new(std::path::Path::new(&path), l.url.as_deref(), root.as_deref().map(std::path::Path::new));
             player.set_fetcher(Some(Box::new(move |url, local| fp.fetch(url, local))));
             say("     files not here are asked of Flashpoint's server");
+        }
+    }
+    // 1.000.035: Pretend to be on, as for Flash games, when the game has no address of its own
+    // (`the moviePath` / `the movieName` say the site's; the files under it are read from the
+    // movie's folder): a chosen site, or Automatic — the site the movie names (src/pretend.rs)
+    if launch.as_ref().and_then(|l| l.url.as_ref()).is_none() {
+        let (a, line) = crate::pretend::address(&app.settings, &path, true);
+        if let Some(line) = line {
+            say(&line);
+        }
+        if let Some(a) = a {
+            player.set_movie_address(&a);
         }
     }
     if let Err(e) = player.load(&path).await {

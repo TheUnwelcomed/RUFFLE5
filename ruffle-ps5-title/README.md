@@ -90,6 +90,7 @@ two settings can be compared on the same game.
 | `src/dir3d.rs` | which Director games have Shockwave 3D (the menu's categories, 1.000.033) |
 | `src/navigator.rs` | where a Flash game's files come from: beside the movie, and (a Flashpoint game) by web address from its game data's `content/` (1.000.033), or from Flashpoint's server (1.000.034) |
 | `src/fpfetch.rs` | a Flashpoint game's files that are not on the console: asked of Flashpoint's server when the game asks for them, and kept (1.000.034) |
+| `src/pretend.rs` | Pretend to be on for Flash and Shockwave games, and its Automatic choice: the site the game's own file names (1.000.035) |
 | `src/fsutil.rs` | writing files safely; removing a game's folder with the calls the console allows a title (no `lstat`, 1.000.034), or moving it to `games/.ruffle5-trash` when it refuses (1.000.032) |
 | `src/watchdog.rs` | names the step of a game's loop that takes 5 s or more, in ruffle.log (1.000.032) |
 | `src/background.rs` | the menu's moving background: ruffle.rs's logo animation, played by Ruffle at the display's size |
@@ -349,8 +350,25 @@ folder that holds its files by address (`webroot = content`) — and Ruffle5 han
 three (see *Shockwave*).
 
 A game stays in the games folder after it is played; Settings › Library › *Keep online games* Off
-deletes a fetched game when it is left (its saves stay), and OPTIONS on any game's tile deletes it
-there and then.
+deletes a game fetched in this run of Ruffle5 when it is left (its saves stay; 1.000.035 — before,
+any game from Flash Browser, one fetched in an earlier run too), and OPTIONS on any game's tile
+deletes it there and then.
+
+**Pretend to be on** (Settings › Player; 1.000.035 for Shockwave games too): the address a game is
+told it was loaded from — a Flash game's `_url` / `loaderInfo.url`, a Director movie's `the
+moviePath` and `the movieName` (the files under that address are still read from the game's
+folder) — on a chosen site (Newgrounds, Kongregate, Armor Games, Miniclip, Addicting Games, Y8,
+Shockwave.com), or **Automatic** (`src/pretend.rs`): the movie is read — a Flash movie decompressed,
+a Director movie's resources — and the site whose domains it names most often (as whole names:
+"y8.com" in "www.y8.com", not in "heavy8.com") is the one the game is told it runs on; a movie that
+names none is told nothing. A game whose source gave it an address (a Flashpoint game's online.txt
+`url`) keeps that. Read on a PC: Paul Blart's gameloader.dcr names Miniclip 10 times, its
+paul_blart.dcr Shockwave.com 12 times; Trick or Treat Beat!, Battle Blitz and Supersonic RC name
+none of the sites. A Director movie is given the http:// form of the address (Miniclip's game
+loader tests `the moviePath contains "http:"`). With an address, a movie the first one goes to keeps
+its own name in that folder (DirPlayer had kept the first movie's name: Battle Blitz, whose
+wrapper goes to game.dcr, stopped at its title); `getStreamStatus` and `netDone` by address find
+what `preloadNetThing` asked for.
 
 Removing on the console (1.000.034). The console refuses `lstat` to Ruffle5 in the games folder
 and in `/data/ruffle5` ("Operation not permitted"), while `stat`, listing a folder, `unlink`,
