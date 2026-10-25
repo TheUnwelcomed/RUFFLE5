@@ -101,9 +101,18 @@ index 1fa65d0..9ea7b25 100644
                  }
              }
 diff --git a/vm-rust/src/lib.rs b/vm-rust/src/lib.rs
-index a5fd98f..3cdbdef 100644
+index a5fd98f..01dfb03 100644
 --- a/vm-rust/src/lib.rs
 +++ b/vm-rust/src/lib.rs
+@@ -7,7 +7,7 @@ pub mod rendering;
+ pub mod rendering_gpu;
+ pub mod utils;
+ 
+-use async_std::task::spawn_local;
++use crate::player::rt::spawn_local;
+ use log::{debug, warn};
+ use js_api::JsApi;
+ use num::ToPrimitive;
 @@ -493,13 +493,13 @@ pub fn player_print_member_sound_hex(cast_lib: i32, cast_member: i32) {
      reserve_player_ref(|player| {
          let member_ref = CastMemberRef { cast_lib, cast_member };
@@ -743,6 +752,19 @@ index 9ae62c7..d1e3add 100644
  
          if let Some(ref pan_node) = self.pan_node {
              let _ = pan_node.pan().set_value(clamped as f32);
+diff --git a/vm-rust/src/player/handlers/datum_handlers/sprite.rs b/vm-rust/src/player/handlers/datum_handlers/sprite.rs
+index e1caff1..6098c9c 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/sprite.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/sprite.rs
+@@ -135,7 +135,7 @@ async fn wait_for_flash_ready(sprite_num: i16) {
+         if ready {
+             return;
+         }
+-        let _ = async_std::future::timeout(
++        let _ = crate::player::rt::timeout(
+             std::time::Duration::from_millis(100),
+             std::future::pending::<()>(),
+         )
 diff --git a/vm-rust/src/player/handlers/datum_handlers/xml.rs b/vm-rust/src/player/handlers/datum_handlers/xml.rs
 index 7e0d99c..9c8b302 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/xml.rs
@@ -860,9 +882,18 @@ index 7e0d99c..9c8b302 100644
                                  "🔧 Document {}.childNodes returning root element {}",
                                  xml_id, root_id
 diff --git a/vm-rust/src/player/handlers/movie.rs b/vm-rust/src/player/handlers/movie.rs
-index f5f820c..c1ed281 100644
+index f5f820c..44c992b 100644
 --- a/vm-rust/src/player/handlers/movie.rs
 +++ b/vm-rust/src/player/handlers/movie.rs
+@@ -234,7 +234,7 @@ impl MovieHandlers {
+                         task_id, waited_ms, state
+                     );
+                 }
+-                let _ = async_std::future::timeout(
++                let _ = crate::player::rt::timeout(
+                     std::time::Duration::from_millis(POLL_MS),
+                     std::future::pending::<()>(),
+                 )
 @@ -468,7 +468,7 @@ impl MovieHandlers {
                  // Initialize behavior default properties
                  for (behavior_ref, sprite_num) in &behaviors_to_init {
@@ -890,6 +921,24 @@ index f5f820c..c1ed281 100644
                              &format!("⚠ sendAllSprites continuing after error in handler: {}", err.message).into()
                          );
                      }
+@@ -1400,7 +1400,7 @@ impl MovieHandlers {
+                 }
+             });
+         if yield_now {
+-            async_std::task::sleep(std::time::Duration::from_millis(2)).await;
++            crate::player::rt::sleep(std::time::Duration::from_millis(2)).await;
+         }
+ 
+         Ok(DatumRef::Void)
+@@ -1431,7 +1431,7 @@ impl MovieHandlers {
+ 
+             crate::rendering::draw_frame_immediate();
+ 
+-            async_std::task::sleep(std::time::Duration::from_millis(2)).await;
++            crate::player::rt::sleep(std::time::Duration::from_millis(2)).await;
+         }
+ 
+         Ok(DatumRef::Void)
 diff --git a/vm-rust/src/player/handlers/types.rs b/vm-rust/src/player/handlers/types.rs
 index ad5a8a0..98a5357 100644
 --- a/vm-rust/src/player/handlers/types.rs
@@ -904,10 +953,10 @@ index ad5a8a0..98a5357 100644
                          "  ❌ Cannot get sub-prop '{}' from type {}",
                          formatted_key,
 diff --git a/vm-rust/src/player/mod.rs b/vm-rust/src/player/mod.rs
-index 8fef74e..846ffb5 100644
+index 8fef74e..8a030e9 100644
 --- a/vm-rust/src/player/mod.rs
 +++ b/vm-rust/src/player/mod.rs
-@@ -54,6 +54,11 @@ pub mod console;
+@@ -54,6 +54,22 @@ pub mod console;
  pub mod testing_shared;
  #[cfg(not(target_arch = "wasm32"))]
  pub mod testing;
@@ -915,11 +964,35 @@ index 8fef74e..846ffb5 100644
 +#[cfg(not(target_arch = "wasm32"))]
 +pub mod native;
 +#[cfg(not(target_arch = "wasm32"))]
++pub mod native_rt;
++/// PS5_RUFFLE_DIRPLAYER_NATIVE: spawn_local / sleep / timeout — async-std's on the web, the
++/// native executor's elsewhere (async-std's runtime needs async-io, whose reactor does not start
++/// on the PS5).
++pub mod rt {
++    #[cfg(target_arch = "wasm32")]
++    pub use async_std::{future::timeout, task::{sleep, spawn_local}};
++    #[cfg(not(target_arch = "wasm32"))]
++    pub use super::native_rt::{sleep, spawn_local, timeout};
++}
++#[cfg(not(target_arch = "wasm32"))]
 +pub mod native_audio;
  #[cfg(target_arch = "wasm32")]
  pub mod testing_browser;
  pub mod symbols;
-@@ -2847,7 +2852,7 @@ impl DirPlayer {
+@@ -73,10 +89,10 @@ use allocator::{
+ use async_recursion::async_recursion;
+ use async_std::{
+     channel::{self, Sender},
+-    future::{self, timeout},
++    future,
+     sync::Mutex,
+-    task::spawn_local,
+ };
++use rt::timeout;
+ use cast_manager::CastPreloadReason;
+ use cast_member::CastMemberType;
+ use datum_ref::DatumRef;
+@@ -2847,7 +2863,7 @@ impl DirPlayer {
          match builtin_prop {
              BuiltInSymbol::DatumStats => {
                  let stats = self.allocator.datum_type_stats();
@@ -928,7 +1001,7 @@ index 8fef74e..846ffb5 100644
                  Ok(self.alloc_datum(Datum::String(stats)))
              },
              BuiltInSymbol::DatumSnapshot => {
-@@ -2857,7 +2862,7 @@ impl DirPlayer {
+@@ -2857,7 +2873,7 @@ impl DirPlayer {
              },
              BuiltInSymbol::DatumLeakScan => {
                  let stats = self.datum_leak_scan();
@@ -937,7 +1010,7 @@ index 8fef74e..846ffb5 100644
                  Ok(self.alloc_datum(Datum::String(stats)))
              },
              BuiltInSymbol::SystemDate => {
-@@ -3783,7 +3788,7 @@ impl DirPlayer {
+@@ -3783,7 +3799,7 @@ impl DirPlayer {
              stack_trace.push_str(&self.format_scope_stack(5, 25));
              stack_trace.push_str("\nThis usually indicates a bug in the Director movie's scripts (e.g., a handler calling itself infinitely).\n");
              stack_trace.push_str("Note: If this is happening during frame events, it may be a re-entrant call issue.\n");
@@ -946,7 +1019,16 @@ index 8fef74e..846ffb5 100644
              panic!("Stack overflow - infinite recursion in Lingo scripts");
          }
          let scope_ref = self.scope_count;
-@@ -5445,7 +5450,7 @@ async fn run_movie_init_sequence() {
+@@ -4481,7 +4497,7 @@ where
+ {
+     // `use ... as raw` (no trailing `(`) so the bulk `crate::player::spawn_player_local(`
+     // → `spawn_player_local(` rewrite doesn't turn this into infinite recursion.
+-    use async_std::task::spawn_local as raw;
++    use crate::player::rt::spawn_local as raw;
+     let id = unsafe { ACTIVE_PLAYER_ID };
+     raw(WithActivePlayer { id, inner: fut });
+ }
+@@ -5445,7 +5461,7 @@ async fn run_movie_init_sequence() {
      dispatch_system_event_to_timeouts(BuiltInSymbol::PrepareMovie, &vec![]).await;
  
      if let Err(err) = player_invoke_global_event(Symbol::builtin(BuiltInSymbol::PrepareMovie), &vec![]).await {
@@ -957,7 +1039,7 @@ index 8fef74e..846ffb5 100644
          }
 diff --git a/vm-rust/src/player/native.rs b/vm-rust/src/player/native.rs
 new file mode 100644
-index 0000000..3af20f3
+index 0000000..aa52b79
 --- /dev/null
 +++ b/vm-rust/src/player/native.rs
 @@ -0,0 +1,182 @@
@@ -996,7 +1078,7 @@ index 0000000..3af20f3
 +/// Runs `f` to completion on this thread, with DirPlayer's task executor (the VM spawns its
 +/// helper tasks onto the calling thread; they only make progress while something here awaits).
 +pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
-+    async_std::task::block_on(f)
++    crate::player::native_rt::block_on(f)
 +}
 +
 +pub struct NativePlayer {
@@ -1414,8 +1496,245 @@ index 0000000..fbf3183
 +        assert_eq!((out[0], out[1]), (0.0, 0.5));
 +    }
 +}
+diff --git a/vm-rust/src/player/native_rt.rs b/vm-rust/src/player/native_rt.rs
+new file mode 100644
+index 0000000..9e20f21
+--- /dev/null
++++ b/vm-rust/src/player/native_rt.rs
+@@ -0,0 +1,231 @@
++//! PS5_RUFFLE_DIRPLAYER_NATIVE — DirPlayer's task executor and timers off the web, without
++//! async-std's runtime.
++//!
++//! On the web DirPlayer spawns its helper tasks with `async_std::task::spawn_local` and waits with
++//! `async_std::task::sleep` / `async_std::future::timeout`. Natively those run on async-io: a
++//! reactor (a kqueue on FreeBSD, woken by an EVFILT_USER event) and an "async-io" thread. On the
++//! PS5 that reactor does not start — `Poller::new()` answers EINVAL and async-io panics ("cannot
++//! initialize I/O event notification", Ruffle5 1.000.021 on hardware, 2026-10-24). DirPlayer does
++//! no I/O through it; it only needs a local executor and a clock. This is both:
++//!
++//! * [`spawn_local`] puts a task on this thread's `futures` `LocalPool`;
++//! * [`block_on`] polls the given future, runs the pool's tasks until they stall, wakes the
++//!   timers that are due, and otherwise parks the thread until the next deadline (at most 5 ms);
++//! * [`sleep`] and [`timeout`] are deadline futures registered with that loop.
++//!
++//! [`crate::player::rt`] picks these or async-std's per target.
++// SPDX-License-Identifier: GPL-3.0-only
++
++use std::cell::RefCell;
++use std::future::Future;
++use std::pin::Pin;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::Arc;
++use std::task::{Context, Poll, Wake, Waker};
++use std::time::{Duration, Instant};
++
++use futures::executor::{LocalPool, LocalSpawner};
++use futures::task::LocalSpawnExt;
++
++thread_local! {
++    /// The pool, while no `block_on` runs it (it is taken out for that).
++    static POOL: RefCell<Option<LocalPool>> = const { RefCell::new(None) };
++    /// The running (or resting) pool's spawner.
++    static SPAWNER: RefCell<Option<LocalSpawner>> = const { RefCell::new(None) };
++    /// Deadlines and the wakers waiting for them.
++    static TIMERS: RefCell<Vec<(Instant, Waker)>> = const { RefCell::new(Vec::new()) };
++}
++
++/// The longest the loop parks when nothing is due (a wake from another thread ends it sooner).
++const MAX_PARK: Duration = Duration::from_millis(5);
++
++fn spawner() -> LocalSpawner {
++    SPAWNER.with(|s| {
++        let mut s = s.borrow_mut();
++        if s.is_none() {
++            POOL.with(|p| {
++                let mut p = p.borrow_mut();
++                *s = Some(p.get_or_insert_with(LocalPool::new).spawner());
++            });
++        }
++        s.as_ref().expect("spawner").clone()
++    })
++}
++
++/// Runs `fut` on this thread's executor (while a [`block_on`] runs it). Like async-std's, the task
++/// is detached: it keeps running when nobody waits for it.
++pub fn spawn_local<F>(fut: F)
++where
++    F: Future<Output = ()> + 'static,
++{
++    if spawner().spawn_local(fut).is_err() {
++        log::warn!("native_rt: the executor is gone; task dropped");
++    }
++}
++
++/// A future ready once `deadline` has passed.
++pub struct Sleep {
++    deadline: Instant,
++}
++
++impl Future for Sleep {
++    type Output = ();
++    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
++        if Instant::now() >= self.deadline {
++            return Poll::Ready(());
++        }
++        let deadline = self.deadline;
++        TIMERS.with(|t| t.borrow_mut().push((deadline, cx.waker().clone())));
++        Poll::Pending
++    }
++}
++
++/// Ready after `dur`.
++pub fn sleep(dur: Duration) -> Sleep {
++    Sleep { deadline: Instant::now() + dur }
++}
++
++/// [`timeout`]'s error: the time ran out first.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct TimeoutError {
++    _private: (),
++}
++
++impl std::fmt::Display for TimeoutError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        "future has timed out".fmt(f)
++    }
++}
++
++impl std::error::Error for TimeoutError {}
++
++/// `f`'s output, or [`TimeoutError`] if `dur` passes first (async-std's `future::timeout`).
++pub async fn timeout<F, T>(dur: Duration, f: F) -> Result<T, TimeoutError>
++where
++    F: Future<Output = T>,
++{
++    let mut f = std::pin::pin!(f);
++    let mut deadline = sleep(dur);
++    std::future::poll_fn(|cx| {
++        if let Poll::Ready(v) = f.as_mut().poll(cx) {
++            return Poll::Ready(Ok(v));
++        }
++        match Pin::new(&mut deadline).poll(cx) {
++            Poll::Ready(()) => Poll::Ready(Err(TimeoutError { _private: () })),
++            Poll::Pending => Poll::Pending,
++        }
++    })
++    .await
++}
++
++/// Wakes the timers that are due. (true if any were, the next deadline if any is left)
++fn fire_timers() -> (bool, Option<Instant>) {
++    let now = Instant::now();
++    let due: Vec<Waker> = TIMERS.with(|t| {
++        let mut t = t.borrow_mut();
++        let mut due = Vec::new();
++        t.retain(|(at, w)| {
++            if *at <= now {
++                due.push(w.clone());
++                false
++            } else {
++                true
++            }
++        });
++        due
++    });
++    let fired = !due.is_empty();
++    for w in due {
++        w.wake();
++    }
++    let next = TIMERS.with(|t| t.borrow().iter().map(|(at, _)| *at).min());
++    (fired, next)
++}
++
++/// The main future's waker: a flag, and the thread to unpark.
++struct MainWake {
++    woken: AtomicBool,
++    thread: std::thread::Thread,
++}
++
++impl Wake for MainWake {
++    fn wake(self: Arc<Self>) {
++        self.wake_by_ref();
++    }
++    fn wake_by_ref(self: &Arc<Self>) {
++        self.woken.store(true, Ordering::Release);
++        self.thread.unpark();
++    }
++}
++
++/// Runs `f` to completion on this thread, running the spawned tasks and the timers meanwhile.
++pub fn block_on<F: Future>(f: F) -> F::Output {
++    let mut pool = POOL.with(|p| p.borrow_mut().take()).unwrap_or_else(LocalPool::new);
++    SPAWNER.with(|s| *s.borrow_mut() = Some(pool.spawner()));
++    let main = Arc::new(MainWake { woken: AtomicBool::new(true), thread: std::thread::current() });
++    let waker = Waker::from(main.clone());
++    let mut cx = Context::from_waker(&waker);
++    let mut f = std::pin::pin!(f);
++    let out = loop {
++        if main.woken.swap(false, Ordering::AcqRel) {
++            if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
++                break v;
++            }
++        }
++        pool.run_until_stalled();
++        let (fired, next) = fire_timers();
++        if fired || main.woken.load(Ordering::Acquire) {
++            continue;
++        }
++        let wait = next.map_or(MAX_PARK, |at| at.saturating_duration_since(Instant::now()).min(MAX_PARK));
++        if !wait.is_zero() {
++            std::thread::park_timeout(wait);
++        }
++    };
++    POOL.with(|p| *p.borrow_mut() = Some(pool));
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::cell::Cell;
++    use std::rc::Rc;
++
++    #[test]
++    fn tasks_timers_and_timeouts_run() {
++        let hits = Rc::new(Cell::new(0));
++        let h = hits.clone();
++        let started = Instant::now();
++        let out = block_on(async move {
++            let h2 = h.clone();
++            spawn_local(async move {
++                sleep(Duration::from_millis(20)).await;
++                h2.set(h2.get() + 1);
++            });
++            // a timeout used as a sleep, as DirPlayer does
++            let r = timeout(Duration::from_millis(40), std::future::pending::<()>()).await;
++            assert!(r.is_err());
++            // a timeout that does not run out
++            let ok = timeout(Duration::from_secs(5), async { 7 }).await;
++            assert_eq!(ok, Ok(7));
++            h.get()
++        });
++        assert_eq!(out, 1);
++        assert!(started.elapsed() >= Duration::from_millis(40));
++        assert!(started.elapsed() < Duration::from_secs(2));
++    }
++
++    #[test]
++    fn a_channel_wakes_the_main_future() {
++        let (tx, rx) = async_std::channel::unbounded::<u32>();
++        let got = block_on(async move {
++            spawn_local(async move {
++                sleep(Duration::from_millis(5)).await;
++                let _ = tx.send(42).await;
++            });
++            rx.recv().await.unwrap()
++        });
++        assert_eq!(got, 42);
++    }
++}
 diff --git a/vm-rust/src/player/net_task.rs b/vm-rust/src/player/net_task.rs
-index e684a93..203ce57 100644
+index e684a93..4c2cbc9 100644
 --- a/vm-rust/src/player/net_task.rs
 +++ b/vm-rust/src/player/net_task.rs
 @@ -85,6 +85,17 @@ pub async fn fetch_net_task(
@@ -1436,6 +1755,15 @@ index e684a93..203ce57 100644
      // Normal HTTP(S) fetch
      // Note: file:// URLs are handled in preload_net_thing and never reach this function
      let window = web_sys::window().unwrap();
+@@ -237,7 +248,7 @@ async fn maybe_hold_dcr_for_preloader(url: &str) {
+     if !crate::player::is_flash_loading().unwrap_or(false) {
+         return;
+     }
+-    let _ = async_std::future::timeout(
++    let _ = crate::player::rt::timeout(
+         std::time::Duration::from_millis(3000),
+         std::future::pending::<()>(),
+     )
 diff --git a/vm-rust/src/player/score.rs b/vm-rust/src/player/score.rs
 index 25330f7..7b5ebec 100644
 --- a/vm-rust/src/player/score.rs
@@ -1476,6 +1804,19 @@ index 25330f7..7b5ebec 100644
                          "Unexpected color flag: {}",
                          data.color_flag
                      )));
+diff --git a/vm-rust/src/player/testing.rs b/vm-rust/src/player/testing.rs
+index 7096c71..8e9ad80 100644
+--- a/vm-rust/src/player/testing.rs
++++ b/vm-rust/src/player/testing.rs
+@@ -196,7 +196,7 @@ pub fn run_test<F: std::future::Future<Output = ()>>(f: F) {
+     // process); that is fine, ignore it.
+     let _ = log::set_logger(&NATIVE_TEST_LOGGER)
+         .map(|()| log::set_max_level(log::LevelFilter::Warn));
+-    async_std::task::block_on(f);
++    crate::player::native_rt::block_on(f);
+ }
+ 
+ // --- Snapshot comparison utilities ---
 diff --git a/vm-rust/src/player/xtra/external.rs b/vm-rust/src/player/xtra/external.rs
 index 0011447..03ae620 100644
 --- a/vm-rust/src/player/xtra/external.rs
@@ -1490,10 +1831,20 @@ index 0011447..03ae620 100644
                  log::info!("[xtra] {}", msg);
              }
 diff --git a/vm-rust/src/player/xtra/multiuser/mod.rs b/vm-rust/src/player/xtra/multiuser/mod.rs
-index 9bc0ebe..6280faa 100644
+index 9bc0ebe..2bb05ba 100644
 --- a/vm-rust/src/player/xtra/multiuser/mod.rs
 +++ b/vm-rust/src/player/xtra/multiuser/mod.rs
-@@ -16,7 +16,7 @@ use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
+@@ -4,7 +4,8 @@ pub mod reader;
+ pub mod types;
+ 
+ use std::collections::VecDeque;
+-use async_std::{channel::Sender, task::spawn_local};
++use async_std::channel::Sender;
++use crate::player::rt::spawn_local;
+ use binary_reader::BinaryReader;
+ use fxhash::FxHashMap;
+ use itertools::Itertools;
+@@ -16,7 +17,7 @@ use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
  // Use console::warn_1 directly for debugging since log level is set to Error
  macro_rules! multiuser_log {
      ($($arg:tt)*) => {
@@ -1515,6 +1866,19 @@ index cfef474..2435607 100644
      ok_int(1)
  }
  
+diff --git a/vm-rust/src/rendering.rs b/vm-rust/src/rendering.rs
+index 0a7e9d6..099d59d 100644
+--- a/vm-rust/src/rendering.rs
++++ b/vm-rust/src/rendering.rs
+@@ -5,7 +5,7 @@ use std::{
+     rc::Rc,
+ };
+ 
+-use async_std::task::spawn_local;
++use crate::player::rt::spawn_local;
+ use chrono::Local;
+ use itertools::Itertools;
+ use log::{debug, warn};
 diff --git a/vm-rust/src/rendering_gpu/webgl2/mod.rs b/vm-rust/src/rendering_gpu/webgl2/mod.rs
 index dffbb65..15d5fd1 100644
 --- a/vm-rust/src/rendering_gpu/webgl2/mod.rs

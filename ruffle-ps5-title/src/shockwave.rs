@@ -21,7 +21,11 @@
 //!     same `[Game]` format ("game" is the frame's Lingo, "draw" rendering the stage).
 //!
 //! Everything DirPlayer does runs on this thread, inside its executor (`block_on`): its helper tasks
-//! (loading casts, timeouts) only move while this loop awaits it.
+//! (loading casts, timeouts) only move while this loop awaits it. 1.000.022: that executor is
+//! DirPlayer's native one (vendor/dirplayer vm-rust/src/player/native_rt.rs, from
+//! tools/dirplayer-native.patch), not async-std's, whose async-io reactor panicked on the console
+//! ("cannot initialize I/O event notification", EINVAL) right after 1.000.021's kqueue check passed;
+//! the check is gone with it.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::controls::Controls;
@@ -195,11 +199,6 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
         return GameEnd::Menu;
     };
     let (name, thumb, accent) = (g.name.clone(), g.thumb, g.accent);
-    if let Err(e) = event_queue_ok() {
-        say(&format!("FAIL {name}: {e}"));
-        app.menu.toast(&format!("{name}: Shockwave cannot run here ({e})"));
-        return GameEnd::Menu;
-    }
     // DirPlayer reads the movie on this thread: show the loading screen for a moment first.
     let shown = Instant::now();
     let mut events = Vec::new();
@@ -210,96 +209,6 @@ pub fn play(app: &mut App, gi: usize) -> GameEnd {
         let _ = app.display.present_scene(&scene, crate::widgets::BLUE_9);
     }
     block_on(run(app, gi, shown))
-}
-
-/// DirPlayer's timers (`async_std::task::sleep`, `future::timeout`) run on async-io, whose reactor
-/// is a kqueue woken by an `EVFILT_USER` event (the `polling` crate's kqueue backend on FreeBSD).
-/// If the console refused that, async-io would panic on its own thread, and a panic aborts the
-/// title. So the same calls are made here once, the way `polling` makes them (EV_ADD|EV_RECEIPT|
-/// EV_CLEAR, then a NOTE_TRIGGER, then a zero-timeout wait that must return the event), through
-/// the same `kevent@FBSD_1.0` symbol the `libc` crate binds: a game that cannot run goes back to
-/// the menu with the reason, written to ruffle.log.
-pub fn event_queue_ok() -> Result<(), String> {
-    static CHECKED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-    CHECKED
-        .get_or_init(|| {
-            let r = kqueue_user_event();
-            say(&format!("shockwave: kqueue EVFILT_USER check: {}", match &r { Ok(()) => "ok".to_string(), Err(e) => e.clone() }));
-            r
-        })
-        .clone()
-}
-
-#[cfg(target_os = "freebsd")]
-fn kqueue_user_event() -> Result<(), String> {
-    use std::ffi::c_void;
-    use std::ptr::{null, null_mut};
-    /// FreeBSD 11's `struct kevent` (the libc crate's, with `libc_unstable_freebsd_version="11"`).
-    #[repr(C)]
-    struct KEvent {
-        ident: usize,
-        filter: i16,
-        flags: u16,
-        fflags: u32,
-        data: isize,
-        udata: *mut c_void,
-    }
-    #[repr(C)]
-    struct Timespec {
-        tv_sec: i64,
-        tv_nsec: i64,
-    }
-    extern "C" {
-        fn kqueue() -> i32;
-        #[link_name = "kevent@FBSD_1.0"]
-        fn kevent(kq: i32, changes: *const KEvent, nchanges: i32, events: *mut KEvent, nevents: i32, timeout: *const Timespec) -> i32;
-        fn close(fd: i32) -> i32;
-    }
-    const EVFILT_USER: i16 = -11;
-    const EV_ADD: u16 = 0x0001;
-    const EV_CLEAR: u16 = 0x0020;
-    const EV_RECEIPT: u16 = 0x0040;
-    const EV_ERROR: u16 = 0x4000;
-    const NOTE_TRIGGER: u32 = 0x0100_0000;
-    let ev = |flags: u16, fflags: u32| KEvent { ident: 0, filter: EVFILT_USER, flags, fflags, data: 0, udata: null_mut() };
-    let zero = Timespec { tv_sec: 0, tv_nsec: 0 };
-    let os = || std::io::Error::last_os_error().to_string();
-    // SAFETY: plain syscalls on a kqueue this function owns and closes; every pointer is a live local.
-    unsafe {
-        let kq = kqueue();
-        if kq < 0 {
-            return Err(format!("kqueue: {}", os()));
-        }
-        let change = |what: &str, e: KEvent| -> Result<(), String> {
-            let mut got = ev(0, 0);
-            let n = kevent(kq, &e, 1, &mut got, 1, &zero);
-            if n < 0 {
-                return Err(format!("{what}: {}", os()));
-            }
-            if n == 1 && got.flags & EV_ERROR != 0 && got.data != 0 {
-                return Err(format!("{what}: {}", std::io::Error::from_raw_os_error(got.data as i32)));
-            }
-            Ok(())
-        };
-        let mut r = change("EVFILT_USER add", ev(EV_ADD | EV_RECEIPT | EV_CLEAR, 0));
-        if r.is_ok() {
-            r = change("EVFILT_USER trigger", ev(EV_ADD | EV_RECEIPT, NOTE_TRIGGER));
-        }
-        if r.is_ok() {
-            let mut got = ev(0, 0);
-            let n = kevent(kq, null(), 0, &mut got, 1, &zero);
-            if n != 1 || got.filter != EVFILT_USER {
-                r = Err(format!("EVFILT_USER wait: {n} events (filter {}){}", got.filter, if n < 0 { format!(": {}", os()) } else { String::new() }));
-            }
-        }
-        close(kq);
-        r
-    }
-}
-
-#[cfg(not(target_os = "freebsd"))]
-fn kqueue_user_event() -> Result<(), String> {
-    Ok(())
 }
 
 async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {

@@ -148,18 +148,19 @@ player in Rust, built into the title (`src/shockwave.rs`):
   for a `games/ttbattleblitz/` folder): Square punch (Z), Cross/Circle kick (X), Triangle jump,
   d-pad run/duck, OPTIONS pause (P; hold it for the quick menu).
 
-DirPlayer's timers run on `async-io`, whose reactor on FreeBSD is a kqueue woken by an
-`EVFILT_USER` event. Before the first Shockwave game the title makes those same kqueue calls once
-(`event_queue_ok`, logged as `shockwave: kqueue EVFILT_USER check: ok`); if the console refuses
-them the game returns to the menu with the reason rather than aborting the title.
+DirPlayer's tasks and timers run on its own small executor off the web (`native_rt.rs` in the
+patch): async-std's runtime needs async-io, whose kqueue reactor does not start on the console
+(1.000.021 aborted with "cannot initialize I/O event notification", EINVAL). Nothing in Ruffle5
+opens a kqueue now.
 
 `tools/fetch-dirplayer.sh` (run by `build-title.sh`) fetches DirPlayer at a pinned commit into
 `vendor/dirplayer` and applies `tools/dirplayer-native.patch`: an embedding API for a native
 program (`player/native.rs`), a sound mixer without Web Audio (`player/native_audio.rs`), local
 files instead of `fetch()`, browser-console calls compiled out off the web, `rect.intersect()`
 returning the overlap (DirPlayer returned the union, so every collision test in a fighting game
-hit), its `image` dependency cut to the formats movies use (no AV1 encoder in the build), and its
-wasm-bindgen pins relaxed to share Ruffle's versions.
+hit), its `image` dependency cut to the formats movies use (no AV1 encoder in the build), its
+wasm-bindgen pins relaxed to share Ruffle's versions, an rlib-only crate type, and a native task
+executor and timers (`player/native_rt.rs`) in place of async-std's runtime.
 `dcr-probe/` (at the repository root) runs a movie in DirPlayer on a PC or server and saves the
 stage as PNGs — for checking a game before it goes on the console.
 
