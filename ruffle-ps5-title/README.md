@@ -83,8 +83,8 @@ two settings can be compared on the same game.
 | `src/gpu.rs` | the static-RADV → wgpu bring-up (the novel piece); picks 3840x2160, else 1920x1080 |
 | `src/lib.rs` | `ruffle_ps5_main`: 3a clear-screen; 3b the app — the menu loop, a player per game, back |
 | `src/shell.rs` | the display: the swapchain, a game's `RenderTarget` (direct at 4K, or 1080p + GPU scale), cover capture, frame timings |
-| `src/menu.rs` | the menu: Games / Favorites / Recent / Online / Badges / Settings; stage, shelf, search, screensaver |
-| `src/online.rs` | the Online tab: lists, pictures and fetching games from the Internet Archive, Flash Museum and Flashpoint, on threads of its own |
+| `src/menu.rs` | the menu: Games / Favorites / Recent / Badges / Flash Browser / Settings; stage, shelf, search, screensaver |
+| `src/online.rs` | the Flash Browser tab (*Online* before 1.000.029): lists, pictures and fetching games from the Internet Archive, Flash Museum and Flashpoint, on threads of its own |
 | `net/` | `r5net`, its own crate: HTTPS on the console's sockets (rustls + RustCrypto, Mozilla's roots), the three sources' APIs and pages, a zip reader for Flashpoint's game data; `examples/online-check.rs`, `examples/fetch.rs` |
 | `src/game.rs` | one game: loading screen, the player and its options, quick menu, overlay, the frame-time log |
 | `src/background.rs` | the menu's moving background: ruffle.rs's logo animation, played by Ruffle at the display's size |
@@ -108,7 +108,7 @@ two settings can be compared on the same game.
 | `src/audio.rs` | Ruffle's mixer → AudioOut: mixed in f32, clamped to s16 |
 | `src/swfinfo.rs` | a SWF's header (version, size, fps, frames) without inflating the movie |
 | `src/paths.rs`, `src/fsutil.rs` | where things live; durable and background writes |
-| `shell/main.c` | the C title shell: `sceAgcInit`, the ICD entry, toasts, the folders, `sceNetInit` for the Online tab |
+| `shell/main.c` | the C title shell: `sceAgcInit`, the ICD entry, toasts, the folders, `sceNetInit` for Flash Browser, the resolver's log lines |
 | `shell/pad.c` | scePad / AudioOut |
 | `Custom Mappings/` | presets shipped in the title's Custom Mappings folder (`dadnme` so far) |
 | `controls.txt` | the mapping file's format and the defaults, shipped as a commented example |
@@ -122,7 +122,7 @@ two settings can be compared on the same game.
 
 | where | what |
 |---|---|
-| `/data/homebrew/PPSA99620/games/` | your games (`*.swf`, or one game per sub-folder); also `ruffle5/` on a USB drive; games from the Online tab, each in its folder with `cover.png` and `online.txt` (a Flashpoint game: its game data's `content/` too) |
+| `/data/homebrew/PPSA99620/games/` | your games (`*.swf`, or one game per sub-folder); also `ruffle5/` on a USB drive; games from Flash Browser, each in its folder with `cover.png` and `online.txt` (a Flashpoint game: its game data's `content/` too) |
 | `/data/homebrew/PPSA99620/Custom Mappings/` | every controls file: the shipped presets, the ones the editor writes, `_All Games.controls.txt` |
 | `/data/ruffle5/` | `ruffle.log`, `settings.txt`, the library and badges, `saves/`, `covers/` |
 
@@ -221,11 +221,12 @@ between games, and a ribbon wipe carries you into a game and back out.
 | Triangle | this game's controls editor |
 | Square | favourite / unfavourite |
 | L2 | search (on-screen keyboard, or type on a USB keyboard) |
-| L1 / R1 | Games · Favorites · Recent · Online · Badges · Settings |
+| L1 / R1 | Games · Favorites · Recent · Badges · Flash Browser · Settings |
 | OPTIONS | delete the focused game (1.000.028): Cross deletes, Circle keeps; its saves, cover and play time stay |
 | Circle, held | close Ruffle5 |
 
-**Online** (1.000.027, Flashpoint 1.000.028): games and movies from three sources, R2 switching
+**Flash Browser** (1.000.027 as *Online*, Flashpoint 1.000.028, renamed and moved last before
+Settings 1.000.029): games and movies from three sources, R2 switching
 between them — the Internet Archive's Flash collection (`softwarelibrary_flash`, the movies
 archive.org itself plays with Ruffle: found through its search API, most downloaded first, its
 sub-collections left out), Flash Museum (flashmuseum.net: read from its own list and search pages
@@ -253,7 +254,12 @@ there and then.
 
 HTTPS is `net/`'s: rustls 0.23 with RustCrypto's algorithms (no C, no assembly) and Mozilla's root
 certificates compiled in, on the console's own sockets and resolver; the title calls `sceNetInit`
-first (a title's sockets answer EACCES before it). Requests say `User-Agent: Ruffle5/<version>
+first (a title's sockets answer EACCES before it). Names are looked up by the kit's `evo_dns.c`
+(`getaddrinfo` over `sceNetResolver*`, the DNS the console's network settings name), compiled into
+the eboot; its `dns:` lines go to ruffle.log. 1.000.027 and 1.000.028 linked the platform layer's
+`ps5_getaddrinfo` in its place (PS5_Vulkan's link recipe binds it with `--defsym`), which answers
+every lookup "Non-recoverable failure in name resolution"; `build-title.sh` V10 takes that binding
+out and checks the image for the resolver. Requests say `User-Agent: Ruffle5/<version>
 (PlayStation 5 Flash player; +https://github.com/TheUnwelcomed/RUFFLE5)`. `tools/online-check.sh`
 runs the same code on the build server against the three sites and packs what they answered.
 

@@ -1,4 +1,4 @@
-/* PS5_RUFFLE_SHELL_V6 — the C shell of the Ruffle PS5 title.
+/* PS5_RUFFLE_SHELL_V7 — the C shell of the Ruffle PS5 title.
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Small on purpose: it does the few things that must happen from the title executable itself,
@@ -19,6 +19,9 @@
  * V5 (1.000.022): the USB keyboard and mouse system modules load first thing in main(), before the
  * title opens /data or touches the GPU (shell/hid.c V2), and their answers are logged.
  * V6 (1.000.027): ps5_net_init(), sceNetInit once, for the Online tab's first socket.
+ * V7 (1.000.029): evo_boot_log() — the console resolver's own log (the kit's evo_dns.c, which
+ * answers the title's name lookups) goes into ruffle.log as "dns: ..." lines, in place of the kit's
+ * shell/boot_log.c (a folder of the kit's hello app, which this title does not have).
  */
 #include <stdarg.h>
 #include <stdint.h>
@@ -65,6 +68,18 @@ void ps5_log(const char *msg)
     fprintf(stderr, "%s\n", msg);
 }
 
+/* The console resolver (evo_dns.c: getaddrinfo over sceNetResolver*) logs every lookup it makes,
+ * what it answered and how long it took, through this (a weak reference there). */
+void evo_boot_log(const char *fmt, ...)
+{
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    ps5_log(line);
+}
+
 /* The console's local hour, 0-23 (-1 if the clock cannot be read). */
 int ps5_local_hour(void)
 {
@@ -106,7 +121,7 @@ int main(int argc, char **argv)
     ps5_hid_preload();
     mkdir(DATA_DIR, 0777);
     g_log = fopen(DATA_DIR "/ruffle.log", "w");
-    ps5_log("ruffle-ps5 shell (PS5_RUFFLE_SHELL_V6) up");
+    ps5_log("ruffle-ps5 shell (PS5_RUFFLE_SHELL_V7) up");
 
     char line[160];
     snprintf(line, sizeof line, "usb: sysmodule keyboard 0x0106 = 0x%08x, mouse 0x00a9 = 0x%08x (loaded first)",

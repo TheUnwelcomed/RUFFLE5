@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PS5_RUFFLE_TITLE_BUILD_V9 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
+# PS5_RUFFLE_TITLE_BUILD_V10 — build the Ruffle PS5 title: a PPSA folder for /data/homebrew, a tile
 # under Games. Phase 3a by default (wgpu on the static RADV clears the display); 3b with --ruffle.
 # V8 (1.000.025): the first line of the log names the version and when the build started, so
 # tools/ruffle5-status.sh can tell a log of this build from the last one's.
@@ -7,6 +7,11 @@
 # one build per folder at a time (a second one is refused before it touches anything — two at once
 # overwrote each other's objects and log, 2026-10-24); ~/.ruffle-radv-env is read when it was not
 # sourced.
+# V10 (1.000.029): name lookups are the console's own resolver. PS5_Vulkan's link recipe binds
+# getaddrinfo / freeaddrinfo to the platform layer's ps5_getaddrinfo, which answers every lookup
+# EAI_FAIL ("Non-recoverable failure in name resolution": every Online source on the console,
+# 2026-10-25); those two bindings are taken out, so the kit's evo_dns.c (sceNetResolver*) answers,
+# and the link is checked for it. Its log lines go to ruffle.log (shell/main.c V7).
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Three proven pieces, joined:
@@ -191,7 +196,6 @@ log "compiling the shell and the native-app runtime"
 "$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$HERE/shell/libc_fixes.c" -o "$BUILD/obj/libc_fixes.o"
 # USB keyboard + mouse (src/hid.rs) and the import lookup src/cpu.rs uses; imports libSceSysmodule only
 "$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$HERE/shell/hid.c" -o "$BUILD/obj/hid.o"
-"$TCC" -std=gnu11 -O2 -Wall "${TFLAGS[@]}" -c "$KIT/shell/boot_log.c" -o "$BUILD/obj/boot_log.o"
 VKNATIVE="$VK/tooling/native"; [[ -f "$VKNATIVE/app_crt.cpp" ]] || VKNATIVE="$NATIVE"
 "$TCXX" -std=c++20 -O2 -fno-exceptions -fno-rtti "${TFLAGS[@]}" -c "$VKNATIVE/app_crt.cpp" -o "$BUILD/obj/app_crt.o"
 "$TCXX" -std=c++20 -O2 -fno-exceptions -fno-rtti "${TFLAGS[@]}" -c "$VKNATIVE/app_cpp_runtime.cpp" -o "$BUILD/obj/app_cpp_runtime.o"
@@ -203,7 +207,8 @@ VKNATIVE="$VK/tooling/native"; [[ -f "$VKNATIVE/app_crt.cpp" ]] || VKNATIVE="$NA
 # malloc_shim first as in the kit; with the platform's --wrap=malloc it is only the __real_ fallback
 RUNTIME_OBJS=("$BUILD/obj/malloc_shim.o" "$BUILD/obj/app_crt.o" "$BUILD/obj/app_cpp_runtime.o"
               "$BUILD/obj/libc_ext.o" "$BUILD/obj/evo_dns.o")
-OBJS=("$BUILD/obj/main.o" "$BUILD/obj/pad.o" "$BUILD/obj/hid.o" "$BUILD/obj/libc_fixes.o" "$BUILD/obj/boot_log.o")
+# (evo_dns.c's log, evo_boot_log, is shell/main.c's since V10: into ruffle.log, not the kit's boot.log)
+OBJS=("$BUILD/obj/main.o" "$BUILD/obj/pad.o" "$BUILD/obj/hid.o" "$BUILD/obj/libc_fixes.o")
 
 # --- 4. the RADV link recipe (PS5_Vulkan tools/radv-link.sh) ----------------------------------------
 export PS5_CLANG="$LLVM_BIN/clang"        # for Clang's builtins archive (__emutls_get_address)
@@ -218,6 +223,19 @@ fi
 # shellcheck source=/dev/null
 source "$VK/tools/radv-link.sh"
 radv_link_recipe "$VK" "$SDK" "$RADV_ARCHIVE" || die "radv_link_recipe failed (missing input above)"
+# V10: not the platform layer's name lookups. Its ps5_getaddrinfo answers EAI_FAIL whatever it is
+# asked (SDK fork platform/src/libc.c), and the recipe's --defsym bound getaddrinfo to it over the
+# console-resolver one evo_dns.o defines: every lookup the title made failed. The recipe's local map
+# keeps naming these two, so evo_dns.o's definitions stay local (never exported) as before.
+dns_bound=(); kept_flags=()
+for f in "${radv_link_flags[@]}"; do
+    case "$f" in
+        --defsym=getaddrinfo=*|--defsym=freeaddrinfo=*|--defsym=getnameinfo=*|--defsym=gai_strerror=*) dns_bound+=("$f") ;;
+        *) kept_flags+=("$f") ;;
+    esac
+done
+radv_link_flags=("${kept_flags[@]}")
+if [[ ${#dns_bound[@]} -gt 0 ]]; then ok "name lookups: the console's resolver (evo_dns.c), not the recipe's ${dns_bound[*]}"; fi
 PLATFORM="$SDK/target/lib/libps5platform.a"
 ok "RADV link: ${#radv_link_inputs[@]} inputs, ${#radv_link_flags[@]} flags (wraps + ps5_* bindings)"
 
@@ -322,6 +340,14 @@ PY
 "$TCC" -std=gnu11 -O1 -fPIC -w "${TFLAGS[@]}" -c "$BUILD/obj/import_check.c" -o "$BUILD/obj/import_check.o"
 link_app "$BUILD/obj/import_check.o" || { tail -30 "$LINK_LOG"; die "relink with the import check failed"; }
 ok "linked $(stat -c %s "$BUILD/llvm-pie.elf") bytes, $(wc -l < "$IMPORTS") imports"
+# V10: getaddrinfo is evo_dns.c's (it imports the console's resolver), not the platform's stand-in.
+SYMS="$("$NM" "$BUILD/llvm-pie.elf" 2>/dev/null || true)"
+gai_at="$(awk '$3=="getaddrinfo"{print $1; exit}' <<<"$SYMS")"
+p5_gai_at="$(awk '$3=="ps5_getaddrinfo"{print $1; exit}' <<<"$SYMS")"
+[[ -n "$gai_at" ]] || die "the image has no getaddrinfo"
+[[ "$gai_at" != "$p5_gai_at" ]] || die "getaddrinfo is the platform layer's ps5_getaddrinfo: every name lookup would fail"
+grep -qx sceNetResolverStartNtoa "$IMPORTS" || die "the image does not import sceNetResolverStartNtoa: the console resolver (evo_dns.c) is not linked"
+ok "getaddrinfo at 0x$gai_at is the console resolver's (imports sceNetResolverStartNtoa)"
 if "$READELF" -d "$BUILD/llvm-pie.elf" | grep NEEDED | grep -E 'libkernel_|PosixForWebKit'; then
     die "the app imports a kernel variant (above): it would die before main"
 fi

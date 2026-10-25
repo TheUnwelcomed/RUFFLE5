@@ -223,7 +223,7 @@ pub fn launch_for(movie_path: &str) -> Option<Launch> {
 /// game data).
 fn online_txt(source: Source, item: &Item, movie: &str, address: Option<&str>, launch: Option<&str>, web_root: Option<&str>) -> String {
     let one_line = |s: &str| s.replace(['\r', '\n'], " ");
-    let mut s = String::from("# Ruffle5: where this game came from (the Online tab). Delete the folder to remove the game.\n");
+    let mut s = String::from("# Ruffle5: where this game came from (the Flash Browser tab). Delete the folder to remove the game.\n");
     s.push_str(&format!("site = {}\n", source.site()));
     s.push_str(&format!("id = {}\n", one_line(&item.id)));
     s.push_str(&format!("title = {}\n", one_line(&item.title)));
@@ -770,7 +770,7 @@ impl Online {
                 crate::say(&format!("online: started ({})", user_agent()));
                 self.workers = Some(w);
                 self.installed = installed(&self.games_dir);
-                crate::say(&format!("online: {} game(s) in {} came from the Online tab", self.installed.len(), self.games_dir));
+                crate::say(&format!("online: {} game(s) in {} came from Flash Browser", self.installed.len(), self.games_dir));
             }
             Err(e) => {
                 crate::say(&format!("online: could not start: {e}"));

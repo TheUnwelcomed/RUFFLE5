@@ -75,7 +75,8 @@ pub enum Tab {
     Games,
     Favorites,
     Recent,
-    /// V5: games and movies from the Internet Archive and Flash Museum (src/online.rs).
+    /// V5: games and movies from the Internet Archive and Flash Museum (src/online.rs); 1.000.028
+    /// Flashpoint too. Shown as "Flash Browser" since 1.000.029 (it was "Online").
     Online,
     Badges,
     Settings,
@@ -87,7 +88,7 @@ impl Tab {
             Tab::Games => "Games",
             Tab::Favorites => "Favorites",
             Tab::Recent => "Recent",
-            Tab::Online => "Online",
+            Tab::Online => "Flash Browser",
             Tab::Badges => "Badges",
             Tab::Settings => "Settings",
         }
@@ -660,10 +661,12 @@ impl Menu {
     }
 
     fn tabs(&self, settings: &Settings) -> Vec<Tab> {
-        let mut t = vec![Tab::Games, Tab::Favorites, Tab::Recent, Tab::Online];
+        // 1.000.029: Flash Browser last before Settings (it came after Recent).
+        let mut t = vec![Tab::Games, Tab::Favorites, Tab::Recent];
         if settings.badges {
             t.push(Tab::Badges);
         }
+        t.push(Tab::Online);
         t.push(Tab::Settings);
         t
     }
@@ -1159,7 +1162,7 @@ impl Menu {
         };
         let what = ui.fit(Face::SemiBold, 24.0, &what, inner);
         scene.text(ui, Face::SemiBold, 24.0, &what, r.x + 56.0, centred(r.y + 150.0, 24.0), INK.with_alpha(0.9), Align::Left, 0.0);
-        let kept = if g.online { "Its saves, cover and play time stay: fetch it again from Online and they are back." } else { "Its saves, cover and play time stay." };
+        let kept = if g.online { "Its saves, cover and play time stay: fetch it again from Flash Browser and they are back." } else { "Its saves, cover and play time stay." };
         let kept = ui.fit(Face::Regular, 22.0, kept, inner);
         scene.text(ui, Face::Regular, 22.0, &kept, r.x + 56.0, centred(r.y + 196.0, 22.0), INK.with_alpha(0.7), Align::Left, 0.0);
         let mut x = r.x + 56.0;

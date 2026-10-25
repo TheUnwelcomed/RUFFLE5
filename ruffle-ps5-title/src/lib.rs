@@ -60,6 +60,11 @@
 //! `webroot`: src/shockwave.rs); archive.org without its sub-collections; Flash Museum through its
 //! player's settings. The menu: OPTIONS deletes a game; Settings › Library › Keep online games.
 //!
+//! 1.000.029 (2026-10-25): the Online tab is Flash Browser, last before Settings. Its names resolve:
+//! the title's getaddrinfo is the console's resolver (the kit's evo_dns.c, sceNetResolver*) — the
+//! RADV link recipe had bound it to the platform layer's stand-in, which answers every lookup
+//! EAI_FAIL (build-title.sh V10) — and the resolver's lines are in ruffle.log (shell V7).
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -67,7 +72,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.028";
+pub const APP_VERSION: &str = "1.000.029";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 

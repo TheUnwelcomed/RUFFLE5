@@ -145,7 +145,7 @@ pub fn category_help(name: &str) -> &'static str {
         "Player" => "How Ruffle runs games: speed, Flash version, and helpers for games that will not start.",
         "Controls & Sound" => "The controller, a USB mouse and keyboard, the on-screen keyboard, and the volume.",
         "App" => "Ruffle5 itself: the animated background, the screensaver, covers, badges and the FPS counter.",
-        "Library" => "Your games list: look again for new games, forget what you played recently, and keep or drop games from Online.",
+        "Library" => "Your games list: look again for new games, forget what you played recently, and keep or drop games from Flash Browser.",
         _ => "Ruffle5 plays Flash games on the PS5 with Ruffle, the open-source Flash Player emulator.",
     }
 }
@@ -249,9 +249,9 @@ impl Row {
             Row::ClearRecent => "Empties Recent. Saves, play times and favorites are kept.",
             Row::KeepOnline => {
                 if s.keep_online {
-                    "On: a game you fetch from Online stays in your games folder after you play it. Delete one yourself with OPTIONS on its tile."
+                    "On: a game you fetch from Flash Browser stays in your games folder after you play it. Delete one yourself with OPTIONS on its tile."
                 } else {
-                    "Off: a game fetched from Online is deleted when you leave it and come back to the menu. Its saves are kept."
+                    "Off: a game fetched from Flash Browser is deleted when you leave it and come back to the menu. Its saves are kept."
                 }
             }
             Row::Version | Row::CreatedBy => "",
