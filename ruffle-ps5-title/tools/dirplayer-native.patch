@@ -152,8 +152,36 @@ index 1fa65d0a..9ea7b25f 100644
                      DatumRef::Void
                  }
              }
+diff --git a/vm-rust/src/js_api.rs b/vm-rust/src/js_api.rs
+index 3c6f4a99..3524dfd6 100644
+--- a/vm-rust/src/js_api.rs
++++ b/vm-rust/src/js_api.rs
+@@ -2106,10 +2106,20 @@ impl JsApi {
+     pub fn dispatch_clear_timeouts() {}
+     pub fn dispatch_movie_loaded(_: &DirectorFile) {}
+     pub fn dispatch_movie_load_failed(_: &str, _: &str) {}
+-    pub fn dispatch_flash_member_loaded(_: i32, _: i32, _: i32, _: &[u8], _: u32, _: u32, _: bool, _: i32) {}
++    // 1.000.036: Flash members go to the program's Flash host (player/flash_host.rs). It makes a
++    // sprite's player when the sprite is shown, so a movie's warm-up (players made ahead for the
++    // members the score will show) asks it for nothing.
++    #[allow(clippy::too_many_arguments)]
++    pub fn dispatch_flash_member_loaded(sprite_num: i32, cast_lib: i32, cast_member: i32, swf_data: &[u8], width: u32, height: u32, paused_at_start: bool, asserted_frame: i32) {
++        crate::player::flash_host::with_host(|h| h.load(sprite_num, cast_lib, cast_member, swf_data, width, height, paused_at_start, asserted_frame));
++    }
+     pub fn dispatch_flash_member_warm(_: i32, _: i32, _: i32, _: &[u8], _: u32, _: u32, _: bool) {}
+-    pub fn dispatch_flash_member_unloaded(_: i32) {}
+-    pub fn dispatch_flash_reset_all() {}
++    pub fn dispatch_flash_member_unloaded(sprite_num: i32) {
++        crate::player::flash_host::with_host(|h| h.unload(sprite_num));
++    }
++    pub fn dispatch_flash_reset_all() {
++        crate::player::flash_host::with_host(|h| h.reset());
++    }
+     pub fn dispatch_stage_size_changed(_: u32, _: u32, _: bool) {}
+     pub fn dispatch_cast_name_changed(_: u32) {}
+     pub fn dispatch_cast_list_changed() {}
 diff --git a/vm-rust/src/lib.rs b/vm-rust/src/lib.rs
-index d447a516..404039d7 100644
+index d447a516..0ce294ae 100644
 --- a/vm-rust/src/lib.rs
 +++ b/vm-rust/src/lib.rs
 @@ -7,7 +7,7 @@ pub mod rendering;
@@ -253,7 +281,50 @@ index d447a516..404039d7 100644
                              "[filmloop-dump]     >> nested ch={} ink={} member=({},{}) '{}' [{}] size={}x{} fore/back=({}/{}) color_flag={} kf_frame={}",
                              icn, id.ink, ilib, id.cast_member, inn_name, inn_type,
                              id.width, id.height, id.fore_color, id.back_color, id.color_flag, ifr
-@@ -2123,21 +2123,21 @@ pub fn export_w3d_obj(cast_lib: i32, cast_member: i32) {
+@@ -1865,13 +1865,25 @@ pub fn local_connection_send(
+ /// is unrecognised (caller may then fall through to a real navigation).
+ #[wasm_bindgen]
+ pub fn dispatch_flash_event(cast_lib: i32, cast_member: i32, body: String) -> bool {
++    match flash_event_command(cast_lib, cast_member, &body) {
++        Some(command) => {
++            player_dispatch(command);
++            true
++        }
++        None => false,
++    }
++}
++
++/// PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.036): [`dispatch_flash_event`]'s command, which a native
++/// program's Flash calls run themselves (player/native.rs `run_flash_calls`).
++pub(crate) fn flash_event_command(cast_lib: i32, cast_member: i32, body: &str) -> Option<PlayerVMCommand> {
+     use director::lingo::datum::Datum;
+ 
+     let trimmed = body.trim();
+     let mut tokens = trimmed.split_whitespace();
+     let Some(handler_token) = tokens.next() else {
+         warn!("[dispatch_flash_event] empty event body: {:?}", body);
+-        return false;
++        return None;
+     };
+     // The handler token MAY have a leading `#` in Director's UI conventions
+     // (e.g. `event: #done`), but the canonical `event: send …` form uses a
+@@ -1933,13 +1945,12 @@ pub fn dispatch_flash_event(cast_lib: i32, cast_member: i32, body: String) -> bo
+         arg_refs.push(player::player_alloc_datum(datum));
+     }
+ 
+-    player_dispatch(PlayerVMCommand::DispatchFlashEvent {
++    Some(PlayerVMCommand::DispatchFlashEvent {
+         cast_lib,
+         cast_member,
+         handler_name: Symbol::from_str(&handler_name),
+         args: arg_refs,
+-    });
+-    true
++    })
+ }
+ 
+ /// Execute a `getURL("lingo: …")` navigation body from a Flash SWF as a
+@@ -2123,21 +2134,21 @@ pub fn export_w3d_obj(cast_lib: i32, cast_member: i32) {
          let member = match player.movie.cast_manager.find_member_by_ref(&member_ref) {
              Some(m) => m,
              None => {
@@ -927,6 +998,537 @@ index 184a4962..d35d06e5 100644
                      &format!(
                          "Error in {} for sprite {} member script: {}",
                          handler_name, sprite_number, err.message
+diff --git a/vm-rust/src/player/flash_host.rs b/vm-rust/src/player/flash_host.rs
+new file mode 100644
+index 00000000..28589f1f
+--- /dev/null
++++ b/vm-rust/src/player/flash_host.rs
+@@ -0,0 +1,525 @@
++//! PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.036): Flash cast members off the web.
++//!
++//! On the web, DirPlayer's front end gives each Flash sprite a Ruffle player in the page
++//! (src/services/flashPlayerManager.ts) and the VM reaches it through the `dirplayer_*`
++//! JavaScript functions: the externs in datum_handlers/sprite.rs, datum_handlers/flash_object.rs,
++//! handlers/manager.rs, score.rs and player/mod.rs, and `JsApi::dispatch_flash_member_*`. Off the
++//! web the program DirPlayer is embedded in plays them. It installs a [`FlashHost`] with
++//! [`set_host`], and those calls come to it through [`bridge`], each meaning what
++//! flashPlayerManager.ts makes it mean (see the trait's methods).
++//!
++//! The other way: what a Flash movie says to Lingo — `getURL("event:…")`, `getURL("lingo:…")`,
++//! `fscommand(command, args)` — the host hands to [`post`], and `native::run_flash_calls` runs it
++//! (at the start of each native frame, and after each input event), as flashPlayerManager.ts
++//! hands it to `dispatch_flash_event` / `dispatch_flash_lingo`. The host draws each Flash sprite
++//! and gives its picture to `crate::update_flash_frame`, as flashPlayerManager.ts does each
++//! animation frame.
++//!
++//! Without a host the calls answer as the stubs before 1.000.036 did: nothing is there.
++// SPDX-License-Identifier: GPL-3.0-only
++
++use std::cell::RefCell;
++use std::collections::VecDeque;
++
++use crate::director::lingo::datum::Datum;
++use crate::player::{DatumRef, DirPlayer};
++
++/// A value crossing between Lingo and a Flash movie: what the JavaScript values the web bridge
++/// passes stand for.
++#[derive(Debug, Clone, PartialEq)]
++pub enum FlashValue {
++    Undefined,
++    Null,
++    Bool(bool),
++    Number(f64),
++    String(String),
++    /// An ActionScript object: the path it is reached by in its movie. As an answer, what the web
++    /// bridge marks `__dirplayer_stored_path`; as an argument, a Lingo Flash object handle
++    /// (`"__ruffle_path:…"`).
++    Object(String),
++    /// An ActionScript array.
++    List(Vec<FlashValue>),
++}
++
++/// The JavaScript value tests the bridge's callers make (`is_null`, `as_string`, …): a value answers
++/// only as what it is (a number is no string).
++impl FlashValue {
++    pub fn is_null(&self) -> bool {
++        matches!(self, FlashValue::Null)
++    }
++    pub fn is_undefined(&self) -> bool {
++        matches!(self, FlashValue::Undefined)
++    }
++    pub fn is_string(&self) -> bool {
++        matches!(self, FlashValue::String(_))
++    }
++    pub fn is_object(&self) -> bool {
++        matches!(self, FlashValue::Object(_) | FlashValue::List(_))
++    }
++    pub fn as_string(&self) -> Option<String> {
++        match self {
++            FlashValue::String(s) => Some(s.clone()),
++            _ => None,
++        }
++    }
++    pub fn as_f64(&self) -> Option<f64> {
++        match self {
++            FlashValue::Number(n) => Some(*n),
++            _ => None,
++        }
++    }
++    pub fn as_bool(&self) -> Option<bool> {
++        match self {
++            FlashValue::Bool(b) => Some(*b),
++            _ => None,
++        }
++    }
++}
++
++/// A mouse event for a Flash sprite (`dirplayer_ruffleDispatchMouse`'s "move", "down", "up"), and
++/// `Leave` when the mouse leaves the sprite (natively: `native::flash_mouse_move`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum MouseKind {
++    Move,
++    Down,
++    Up,
++    Leave,
++}
++
++/// What the program DirPlayer is embedded in does with Flash sprites. `sprite` is the key the web
++/// bridge uses: the channel number, a synthetic negative one for a Flash member drawn as a
++/// Shockwave 3D texture, or `nested_flash_key` for a sprite of a nested `#movie`; a picture is given
++/// back under the same key (`crate::update_flash_frame`). The methods name the web functions they
++/// stand for (flashPlayerManager.ts).
++pub trait FlashHost {
++    /// `createFlashInstance` (JsApi `onFlashMemberLoaded`): the sprite shows this Flash member
++    /// now: a player of its own for it, replacing the sprite's last one. `width` x `height` is the
++    /// sprite's size; `asserted_frame` (or -1) the frame a script set for the sprite.
++    /// Lingo calls for the sprite that came before (queued) are made once it plays.
++    #[allow(clippy::too_many_arguments)]
++    fn load(&mut self, sprite: i32, cast_lib: i32, cast_member: i32, swf: &[u8], width: u32, height: u32, paused_at_start: bool, asserted_frame: i32);
++    /// `destroyFlashInstance` (`onFlashMemberUnloaded`): the sprite shows no Flash member now.
++    fn unload(&mut self, sprite: i32);
++    /// `destroyAllFlashInstances` (`onFlashResetAll`): a movie went, with all its Flash sprites.
++    fn reset(&mut self);
++    /// `setFlashSize`: the sprite's size on the stage changed.
++    fn set_size(&mut self, sprite: i32, width: i32, height: i32);
++    /// `dirplayer_isFlashInstanceReady`: the sprite has a player that runs its movie.
++    fn is_ready(&mut self, sprite: i32) -> bool;
++    /// `goToFrame` (`sprite.gotoFrame(x)`): to a frame number or label, playing on.
++    fn goto_frame(&mut self, sprite: i32, frame_or_label: &str);
++    /// `goToFrameAndStop` (`sprite.frame = x`): to a frame number or label — stopped there for a
++    /// member that is `pausedAtStart`, playing on otherwise.
++    fn goto_frame_and_stop(&mut self, sprite: i32, frame_or_label: &str);
++    /// `stopFlash`: the root timeline stops (the player goes on).
++    fn stop(&mut self, sprite: i32);
++    /// `playFlash`: the root timeline plays on.
++    fn play(&mut self, sprite: i32);
++    /// `rewindFlash`: to frame 1, stopped.
++    fn rewind(&mut self, sprite: i32);
++    /// `callFrame`: a frame's actions run.
++    fn call_frame(&mut self, sprite: i32, frame: i32);
++    /// `isPlaying` (`sprite.playing`).
++    fn is_playing(&mut self, sprite: i32) -> bool;
++    /// `getFrameCount`.
++    fn frame_count(&mut self, sprite: i32) -> i32;
++    /// `getCurrentFrame`.
++    fn current_frame(&mut self, sprite: i32) -> i32;
++    /// `getVariable`: Null when the sprite has no player yet; else a primitive as a String (as
++    /// the classic GetVariable gives it), an object as `Object(path)`, Undefined when there is
++    /// nothing at the path.
++    fn get_variable(&mut self, sprite: i32, path: &str) -> FlashValue;
++    /// `setVariable`: the variable becomes the string (queued until the sprite plays).
++    fn set_variable(&mut self, sprite: i32, path: &str, value: &str) -> bool;
++    /// `callFunction` and a Flash object handle's methods: the function at `path` (the object's
++    /// path, a dot, its name), with the object as `this` (queued until the sprite plays, answering
++    /// Null).
++    fn call_function(&mut self, sprite: i32, path: &str, args: &[FlashValue]) -> FlashValue;
++    /// `newObject(sprite, class, args)`: `new class(args)` in the sprite's movie, kept at `store_at`.
++    /// (Natively only: the web build hands out a handle to a path nothing is at.)
++    fn new_object(&mut self, sprite: i32, class: &str, args: &[FlashValue], store_at: &str) -> bool;
++    /// `hitTest`: what is under a sprite-local point: 0 `#background`, 1 `#normal`, 2 `#button`,
++    /// 3 `#editText`.
++    fn hit_test(&mut self, sprite: i32, x: f64, y: f64) -> i32;
++    /// `dispatchMouseEvent`: a mouse event at a sprite-local point, `sprite_w` x `sprite_h` the
++    /// sprite's size. True when the sprite has a player.
++    fn mouse(&mut self, sprite: i32, kind: MouseKind, x: i32, y: i32, sprite_w: i32, sprite_h: i32) -> bool;
++}
++
++/// What a Flash movie said to Lingo, for [`post`].
++#[derive(Debug, Clone, PartialEq)]
++pub enum FlashCall {
++    /// `getURL("event:…")` (the text after `event:`), or `fscommand(command, args)` as "command
++    /// args": `dispatch_flash_event` — the handler named first, for the sprites showing the member.
++    Event { cast_lib: i32, cast_member: i32, body: String },
++    /// `getURL("lingo:…")` (the text after `lingo:`): `dispatch_flash_lingo` — run as Lingo.
++    Lingo(String),
++}
++
++thread_local! {
++    static HOST: RefCell<Option<Box<dyn FlashHost>>> = const { RefCell::new(None) };
++    static CALLS: RefCell<VecDeque<FlashCall>> = const { RefCell::new(VecDeque::new()) };
++}
++
++/// Installs the host (None: Flash sprites play nothing); answers the one it replaces. Everything
++/// DirPlayer does runs on one thread, and so does this.
++pub fn set_host(host: Option<Box<dyn FlashHost>>) -> Option<Box<dyn FlashHost>> {
++    HOST.with(|h| std::mem::replace(&mut *h.borrow_mut(), host))
++}
++
++pub fn has_host() -> bool {
++    HOST.with(|h| h.try_borrow().map(|h| h.is_some()).unwrap_or(true))
++}
++
++/// `f` on the host; None when there is none (or it is the one calling).
++pub fn with_host<R>(f: impl FnOnce(&mut dyn FlashHost) -> R) -> Option<R> {
++    HOST.with(|h| match h.try_borrow_mut() {
++        Ok(mut h) => h.as_mut().map(|h| f(h.as_mut())),
++        Err(_) => {
++            log::warn!("Flash: the host called back into the Flash bridge; that call does nothing");
++            None
++        }
++    })
++}
++
++/// What a Flash movie said to Lingo: run by `native::run_flash_calls`, in the order posted.
++pub fn post(call: FlashCall) {
++    CALLS.with(|c| c.borrow_mut().push_back(call));
++}
++
++/// The calls posted and not run yet, taken (`native::run_flash_calls` runs them; a host's tests
++/// can look at them).
++pub fn take_calls() -> Vec<FlashCall> {
++    CALLS.with(|c| c.borrow_mut().drain(..).collect())
++}
++
++pub(crate) fn clear_calls() {
++    CALLS.with(|c| c.borrow_mut().clear());
++}
++
++/// A Lingo value as an argument for a Flash function: what `convert_lingo_datum_to_json_inner`
++/// (datum_handlers/flash_object.rs) makes of it for the web bridge (VOID is 0, as Adobe's Flash
++/// Asset Xtra passes it; a symbol is "#name"; a Flash object handle is the object at its path).
++pub fn flash_arg(player: &DirPlayer, datum: &Datum) -> FlashValue {
++    match datum {
++        Datum::Int(i) => FlashValue::Number(*i as f64),
++        Datum::Float(f) => FlashValue::Number(*f),
++        Datum::String(s) => FlashValue::String(s.clone()),
++        Datum::Symbol(s) => FlashValue::String(format!("#{s}")),
++        Datum::Void => FlashValue::Number(0.0),
++        Datum::FlashObjectRef(r) => FlashValue::Object(r.path.clone()),
++        Datum::List(_, items, _) => FlashValue::List(items.iter().map(|i| flash_arg(player, player.get_datum(i))).collect()),
++        _ => FlashValue::Null,
++    }
++}
++
++pub fn flash_args(player: &DirPlayer, args: &[DatumRef]) -> Vec<FlashValue> {
++    args.iter().map(|a| flash_arg(player, player.get_datum(a))).collect()
++}
++
++/// The web bridge's argument list (a JSON array, flashPlayerManager.ts `callFunction`): a null
++/// argument is undefined, `"__ruffle_path:p"` (or `{"__ruffle_path": p}`) the object at `p`.
++pub fn parse_args(json: &str) -> Result<Vec<FlashValue>, String> {
++    if json.trim().is_empty() {
++        return Ok(Vec::new());
++    }
++    let value: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("arguments {json:?}: {e}"))?;
++    let serde_json::Value::Array(items) = value else {
++        return Err(format!("arguments {json:?}: not a list"));
++    };
++    Ok(items
++        .iter()
++        .map(|v| match v {
++            serde_json::Value::Null => FlashValue::Undefined,
++            v => from_json(v),
++        })
++        .collect())
++}
++
++fn from_json(v: &serde_json::Value) -> FlashValue {
++    match v {
++        serde_json::Value::Null => FlashValue::Null,
++        serde_json::Value::Bool(b) => FlashValue::Bool(*b),
++        serde_json::Value::Number(n) => FlashValue::Number(n.as_f64().unwrap_or(0.0)),
++        serde_json::Value::String(s) => match s.strip_prefix("__ruffle_path:") {
++            Some(path) => FlashValue::Object(path.to_string()),
++            None => FlashValue::String(s.clone()),
++        },
++        serde_json::Value::Array(items) => FlashValue::List(items.iter().map(from_json).collect()),
++        serde_json::Value::Object(map) => match (map.len(), map.get("__ruffle_path")) {
++            (1, Some(serde_json::Value::String(path))) => FlashValue::Object(path.clone()),
++            _ => FlashValue::Null,
++        },
++    }
++}
++
++/// The calls the bridge's callers make, with the signatures of the web externs (a `Result` where
++/// the extern has `catch`: Err only when there is no host, as before 1.000.036).
++pub mod bridge {
++    use super::*;
++
++    const NO_HOST: FlashValue = FlashValue::Undefined;
++
++    pub fn get_variable(sprite: i32, path: &str) -> Result<FlashValue, FlashValue> {
++        with_host(|h| h.get_variable(sprite, path)).ok_or(NO_HOST)
++    }
++
++    pub fn set_variable(sprite: i32, path: &str, value: &str) -> Result<FlashValue, FlashValue> {
++        with_host(|h| FlashValue::Bool(h.set_variable(sprite, path, value))).ok_or(NO_HOST)
++    }
++
++    /// As `callFunction`: arguments that are not a JSON list make the call answer null.
++    pub fn call_function(sprite: i32, path: &str, args_json: &str) -> Result<FlashValue, FlashValue> {
++        if !has_host() {
++            return Err(NO_HOST);
++        }
++        match parse_args(args_json) {
++            Ok(args) => with_host(|h| h.call_function(sprite, path, &args)).ok_or(NO_HOST),
++            Err(e) => {
++                log::warn!("Flash callFunction {path}: {e}");
++                Ok(FlashValue::Null)
++            }
++        }
++    }
++
++    pub fn goto_frame(sprite: i32, frame_or_label: &str) {
++        with_host(|h| h.goto_frame(sprite, frame_or_label));
++    }
++
++    pub fn goto_frame_and_stop(sprite: i32, frame_or_label: &str) {
++        with_host(|h| h.goto_frame_and_stop(sprite, frame_or_label));
++    }
++
++    pub fn stop(sprite: i32) {
++        with_host(|h| h.stop(sprite));
++    }
++
++    pub fn play(sprite: i32) {
++        with_host(|h| h.play(sprite));
++    }
++
++    pub fn rewind(sprite: i32) {
++        with_host(|h| h.rewind(sprite));
++    }
++
++    pub fn call_frame(sprite: i32, frame: i32) {
++        with_host(|h| h.call_frame(sprite, frame));
++    }
++
++    pub fn is_playing(sprite: i32) -> bool {
++        with_host(|h| h.is_playing(sprite)).unwrap_or(false)
++    }
++
++    pub fn frame_count(sprite: i32) -> i32 {
++        with_host(|h| h.frame_count(sprite)).unwrap_or(0)
++    }
++
++    pub fn current_frame(sprite: i32) -> i32 {
++        with_host(|h| h.current_frame(sprite)).unwrap_or(0)
++    }
++
++    pub fn hit_test(sprite: i32, x: f64, y: f64) -> i32 {
++        with_host(|h| h.hit_test(sprite, x, y)).unwrap_or(0)
++    }
++
++    pub fn is_ready(sprite: i32) -> Result<FlashValue, FlashValue> {
++        with_host(|h| FlashValue::Bool(h.is_ready(sprite))).ok_or(NO_HOST)
++    }
++
++    pub fn set_size(sprite: i32, width: i32, height: i32) {
++        with_host(|h| h.set_size(sprite, width, height));
++    }
++
++    pub fn dispatch_mouse(sprite: i32, kind: &str, x: i32, y: i32, sprite_w: i32, sprite_h: i32) -> Result<FlashValue, FlashValue> {
++        let kind = match kind {
++            "down" => MouseKind::Down,
++            "up" => MouseKind::Up,
++            "move" => MouseKind::Move,
++            _ => return Ok(FlashValue::Bool(false)),
++        };
++        with_host(|h| FlashValue::Bool(h.mouse(sprite, kind, x, y, sprite_w, sprite_h))).ok_or(NO_HOST)
++    }
++
++    /// The property numbers `getFlashProperty` knows (flashPlayerManager.ts `getFlashProperty`).
++    fn property_to_get(n: i32) -> Option<&'static str> {
++        const NAMES: [&str; 22] = [
++            "_x", "_y", "_xscale", "_yscale", "_currentframe", "_totalframes", "_alpha", "_visible", "_width", "_height", "_rotation", "_target",
++            "_framesloaded", "_name", "_droptarget", "_url", "_highquality", "_focusrect", "_soundbuftime", "_quality", "_xmouse", "_ymouse",
++        ];
++        usize::try_from(n).ok().and_then(|n| NAMES.get(n).copied())
++    }
++
++    /// The ones `setFlashProperty` sets.
++    fn property_to_set(n: i32) -> Option<&'static str> {
++        match n {
++            0 => Some("_x"),
++            1 => Some("_y"),
++            2 => Some("_xscale"),
++            3 => Some("_yscale"),
++            6 => Some("_alpha"),
++            7 => Some("_visible"),
++            10 => Some("_rotation"),
++            13 => Some("_name"),
++            16 => Some("_highquality"),
++            18 => Some("_soundbuftime"),
++            _ => None,
++        }
++    }
++
++    fn property_path(target: &str, name: &str) -> String {
++        if target.is_empty() {
++            format!("/:{name}")
++        } else {
++            format!("{target}:{name}")
++        }
++    }
++
++    /// `getFlashProperty`: the property's value as a string, null when there is none.
++    pub fn get_flash_property(sprite: i32, target: &str, prop: i32) -> Result<FlashValue, FlashValue> {
++        let Some(name) = property_to_get(prop) else {
++            return Ok(FlashValue::Null);
++        };
++        let value = with_host(|h| h.get_variable(sprite, &property_path(target, name))).ok_or(NO_HOST)?;
++        Ok(match value {
++            FlashValue::Undefined | FlashValue::Null => FlashValue::Null,
++            FlashValue::Object(_) | FlashValue::List(_) => FlashValue::String("[object Object]".into()),
++            v => v,
++        })
++    }
++
++    pub fn set_flash_property(sprite: i32, target: &str, prop: i32, value: &str) {
++        if let Some(name) = property_to_set(prop) {
++            with_host(|h| h.set_variable(sprite, &property_path(target, name), value));
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn arguments_come_as_the_web_bridge_decodes_them() {
++        let args = parse_args(r#"[1, 2.5, "a", null, "__ruffle_path:_level0.mc", [null, "__ruffle_path:_root.x"], true, {"__ruffle_path": "p"}]"#).unwrap();
++        assert_eq!(
++            args,
++            vec![
++                FlashValue::Number(1.0),
++                FlashValue::Number(2.5),
++                FlashValue::String("a".into()),
++                FlashValue::Undefined,
++                FlashValue::Object("_level0.mc".into()),
++                FlashValue::List(vec![FlashValue::Null, FlashValue::Object("_root.x".into())]),
++                FlashValue::Bool(true),
++                FlashValue::Object("p".into()),
++            ]
++        );
++        assert_eq!(parse_args("").unwrap(), vec![]);
++        assert!(parse_args("<invoke/>").is_err());
++        assert!(parse_args("{}").is_err());
++    }
++
++    #[test]
++    fn a_value_answers_only_as_what_it_is() {
++        assert_eq!(FlashValue::String("3".into()).as_f64(), None);
++        assert_eq!(FlashValue::Number(3.0).as_string(), None);
++        assert_eq!(FlashValue::Bool(true).as_bool(), Some(true));
++        assert!(FlashValue::Null.is_null() && !FlashValue::Undefined.is_null());
++        assert!(FlashValue::Object("p".into()).is_object());
++    }
++
++    struct Recorder(std::rc::Rc<RefCell<Vec<String>>>);
++    impl FlashHost for Recorder {
++        fn load(&mut self, sprite: i32, cl: i32, cm: i32, swf: &[u8], w: u32, h: u32, p: bool, a: i32) {
++            self.0.borrow_mut().push(format!("load {sprite} {cl}:{cm} {} {w}x{h} {p} {a}", swf.len()));
++        }
++        fn unload(&mut self, sprite: i32) {
++            self.0.borrow_mut().push(format!("unload {sprite}"));
++        }
++        fn reset(&mut self) {}
++        fn set_size(&mut self, _: i32, _: i32, _: i32) {}
++        fn is_ready(&mut self, _: i32) -> bool {
++            true
++        }
++        fn goto_frame(&mut self, _: i32, _: &str) {}
++        fn goto_frame_and_stop(&mut self, _: i32, _: &str) {}
++        fn stop(&mut self, _: i32) {}
++        fn play(&mut self, _: i32) {}
++        fn rewind(&mut self, _: i32) {}
++        fn call_frame(&mut self, _: i32, _: i32) {}
++        fn is_playing(&mut self, _: i32) -> bool {
++            true
++        }
++        fn frame_count(&mut self, _: i32) -> i32 {
++            7
++        }
++        fn current_frame(&mut self, _: i32) -> i32 {
++            2
++        }
++        fn get_variable(&mut self, sprite: i32, path: &str) -> FlashValue {
++            self.0.borrow_mut().push(format!("get {sprite} {path}"));
++            FlashValue::String("12".into())
++        }
++        fn set_variable(&mut self, sprite: i32, path: &str, value: &str) -> bool {
++            self.0.borrow_mut().push(format!("set {sprite} {path} {value}"));
++            true
++        }
++        fn call_function(&mut self, sprite: i32, path: &str, args: &[FlashValue]) -> FlashValue {
++            self.0.borrow_mut().push(format!("call {sprite} {path} {args:?}"));
++            FlashValue::Null
++        }
++        fn new_object(&mut self, _: i32, _: &str, _: &[FlashValue], _: &str) -> bool {
++            true
++        }
++        fn hit_test(&mut self, _: i32, _: f64, _: f64) -> i32 {
++            2
++        }
++        fn mouse(&mut self, _: i32, _: MouseKind, _: i32, _: i32, _: i32, _: i32) -> bool {
++            true
++        }
++    }
++
++    #[test]
++    fn the_bridge_reaches_the_host_and_answers_nothing_without_one() {
++        let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
++        set_host(None);
++        assert_eq!(bridge::get_variable(1, "x"), Err(FlashValue::Undefined));
++        assert!(!bridge::is_playing(1));
++        assert_eq!(bridge::call_function(1, "_root.f", "[]"), Err(FlashValue::Undefined));
++        set_host(Some(Box::new(Recorder(seen.clone()))));
++        assert_eq!(bridge::get_variable(3, "_root.isReady"), Ok(FlashValue::String("12".into())));
++        assert_eq!(bridge::set_variable(3, "_root.progress", "50"), Ok(FlashValue::Bool(true)));
++        assert_eq!(bridge::call_function(3, "_root.mc.gotoAndStop", "[101]"), Ok(FlashValue::Null));
++        assert_eq!(bridge::call_function(3, "_root.f", "not json"), Ok(FlashValue::Null), "as flashPlayerManager.ts: a bad list answers null");
++        assert_eq!(bridge::get_flash_property(3, "", 4), Ok(FlashValue::String("12".into())));
++        assert_eq!(bridge::get_flash_property(3, "/mc", 0), Ok(FlashValue::String("12".into())));
++        assert_eq!(bridge::get_flash_property(3, "", 99), Ok(FlashValue::Null));
++        bridge::set_flash_property(3, "", 7, "0");
++        bridge::set_flash_property(3, "", 4, "9"); // _currentframe cannot be set
++        assert_eq!(bridge::dispatch_mouse(3, "down", 1, 2, 10, 10), Ok(FlashValue::Bool(true)));
++        assert_eq!(bridge::is_ready(3), Ok(FlashValue::Bool(true)));
++        assert_eq!(bridge::frame_count(3), 7);
++        assert_eq!(bridge::hit_test(3, 0.0, 0.0), 2);
++        set_host(None);
++        assert_eq!(
++            *seen.borrow(),
++            vec![
++                "get 3 _root.isReady",
++                "set 3 _root.progress 50",
++                "call 3 _root.mc.gotoAndStop [Number(101.0)]",
++                "get 3 /:_currentframe",
++                "get 3 /mc:_x",
++                "set 3 /:_visible 0",
++            ]
++        );
++    }
++
++    #[test]
++    fn calls_come_back_in_the_order_posted() {
++        clear_calls();
++        post(FlashCall::Event { cast_lib: 1, cast_member: 4, body: "flash_start_game".into() });
++        post(FlashCall::Lingo("startGame".into()));
++        assert_eq!(take_calls().len(), 2);
++        assert!(take_calls().is_empty());
++    }
++}
 diff --git a/vm-rust/src/player/font/mod.rs b/vm-rust/src/player/font/mod.rs
 index a6ac50b8..d916a8ec 100644
 --- a/vm-rust/src/player/font/mod.rs
@@ -1170,6 +1772,32 @@ index 8b702c18..79103875 100644
      // Create offscreen canvas
      let document = match web_sys::window().and_then(|w| w.document()) {
          Some(d) => d,
+diff --git a/vm-rust/src/player/handlers/datum_handlers/cast_member_ref.rs b/vm-rust/src/player/handlers/datum_handlers/cast_member_ref.rs
+index 296f6258..c592ed1b 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/cast_member_ref.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/cast_member_ref.rs
+@@ -1454,6 +1454,21 @@ impl CastMemberRefHandlers {
+                 if prop.eq_ignore_ascii_case("filename") || prop.eq_ignore_ascii_case("pathname") {
+                     let url = value.string_value()?;
+                     return reserve_player_mut(|player| {
++                        // PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.036): natively a URL nothing has
++                        // fetched yet is fetched, and the member gets the movie when it is in
++                        // (`DirPlayer::link_flash_members`): Miniclip's game loader sets its intro
++                        // member's fileName to an address and then waits, frame after frame, for
++                        // the intro's `isReady` — Director loads a linked Flash member's file.
++                        #[cfg(not(target_arch = "wasm32"))]
++                        {
++                            let task = player.net_manager.find_task_by_url(&url);
++                            if task.is_none_or(|id| !player.net_manager.is_task_done(Some(id))) {
++                                let id = task.unwrap_or_else(|| player.net_manager.preload_net_thing(url.clone()));
++                                player.flash_member_links.retain(|(m, _, _)| m != member_ref);
++                                player.flash_member_links.push((member_ref.clone(), id, url.clone()));
++                                return Ok(());
++                            }
++                        }
+                         let bytes = player
+                             .net_manager
+                             .find_task_by_url(&url)
 diff --git a/vm-rust/src/player/handlers/datum_handlers/date.rs b/vm-rust/src/player/handlers/datum_handlers/date.rs
 index bc7374c0..46d511dd 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/date.rs
@@ -1295,7 +1923,7 @@ index bc7374c0..46d511dd 100644
  
          match prop.into_builtin() {
 diff --git a/vm-rust/src/player/handlers/datum_handlers/flash_object.rs b/vm-rust/src/player/handlers/datum_handlers/flash_object.rs
-index ce5283ba..19cff5f8 100644
+index ce5283ba..21ef7ad0 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/flash_object.rs
 +++ b/vm-rust/src/player/handlers/datum_handlers/flash_object.rs
 @@ -13,6 +13,7 @@ use log::warn;
@@ -1306,47 +1934,62 @@ index ce5283ba..19cff5f8 100644
  #[wasm_bindgen]
  extern "C" {
      // Per-sprite Flash bridge — see datum_handlers/sprite.rs for the full
-@@ -47,6 +48,27 @@ extern "C" {
+@@ -47,6 +48,18 @@ extern "C" {
      ) -> Result<JsValue, JsValue>;
  }
  
-+// PS5_RUFFLE_DIRPLAYER_NATIVE: off the web no Ruffle instance stands behind a Flash member, so no
-+// FlashObjectRef is ever made there (getVariable answers VOID) and `resolve_flash_sprite` finds no
-+// sprite: of these only the mouse forwarding (commands.rs) runs, and its answer is dropped.
-+// JsValue::UNDEFINED is a constant; making and dropping it never calls into the browser.
++// PS5_RUFFLE_DIRPLAYER_NATIVE: off the web the program DirPlayer is embedded in plays Flash
++// members (1.000.036: player/flash_host.rs); without one there is no sprite behind a handle.
 +#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_get_variable_global(_sprite_num: i32, _path: &str) -> Result<JsValue, JsValue> {
-+    Err(JsValue::UNDEFINED)
-+}
++use crate::player::flash_host::{bridge::{
++    call_function as ruffle_call_function_global, get_variable as ruffle_get_variable_global,
++    set_variable as ruffle_set_variable_global,
++}, FlashValue};
 +#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_set_variable_global(_sprite_num: i32, _path: &str, _value: &str) -> Result<JsValue, JsValue> {
-+    Err(JsValue::UNDEFINED)
-+}
-+#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_call_function_global(_sprite_num: i32, _path: &str, _args_xml: &str) -> Result<JsValue, JsValue> {
-+    Err(JsValue::UNDEFINED)
-+}
-+#[cfg(not(target_arch = "wasm32"))]
-+pub fn ruffle_dispatch_mouse_event_global(_sprite_num: i32, _event_type: &str, _local_x: i32, _local_y: i32, _sprite_w: i32, _sprite_h: i32) -> Result<JsValue, JsValue> {
-+    Err(JsValue::UNDEFINED)
++pub fn ruffle_dispatch_mouse_event_global(sprite_num: i32, event_type: &str, local_x: i32, local_y: i32, sprite_w: i32, sprite_h: i32) -> Result<FlashValue, FlashValue> {
++    crate::player::flash_host::bridge::dispatch_mouse(sprite_num, event_type, local_x, local_y, sprite_w, sprite_h)
 +}
 +
  /// Find the sprite number that currently displays the given Flash cast
  /// member. With per-sprite Ruffle instances we need a sprite-num key for
  /// the JS bridge; FlashObjectRef only carries cast_lib/cast_member, so we
-@@ -61,6 +83,12 @@ extern "C" {
- /// the bound sprite keeps `gDemoFlash.play()` working even when the member
- /// wasn't resolvable at the time the handle was captured.
- pub fn resolve_flash_sprite(flash_ref: &FlashObjectRef) -> Option<i32> {
-+    // PS5_RUFFLE_DIRPLAYER_NATIVE: no Ruffle instances off the web.
-+    #[cfg(not(target_arch = "wasm32"))]
-+    if true {
-+        let _ = flash_ref;
-+        return None;
-+    }
-     if let Some(sn) = flash_ref.bound_sprite() {
-         return Some(sn);
+@@ -295,6 +308,36 @@ fn convert_lingo_datum_to_json_inner(player: &crate::player::DirPlayer, datum: &
      }
+ }
+ 
++/// PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.036): the answer of a Flash function, from the program's
++/// Flash host (player/flash_host.rs), as the web version below makes it of the JavaScript one:
++/// undefined and null are VOID, a whole number an integer, a boolean 1 or 0, an array a 0-based
++/// list, an object a handle to where its movie keeps it.
++#[cfg(not(target_arch = "wasm32"))]
++fn convert_js_result_to_lingo_datum(
++    player: &mut crate::player::DirPlayer,
++    result: FlashValue,
++    context_path: &str,
++    cast_lib: i32,
++    cast_member: i32,
++) -> Result<DatumRef, ScriptError> {
++    Ok(match result {
++        FlashValue::Undefined | FlashValue::Null => player.alloc_datum(Datum::Void),
++        FlashValue::String(s) => player.alloc_datum(Datum::String(s)),
++        FlashValue::Number(n) if n.fract() == 0.0 && n >= i32::MIN as f64 && n <= i32::MAX as f64 => player.alloc_datum(Datum::Int(n as i32)),
++        FlashValue::Number(n) => player.alloc_datum(Datum::Float(n)),
++        FlashValue::Bool(b) => player.alloc_datum(Datum::Int(b as i32)),
++        FlashValue::List(values) => {
++            let mut items = VecDeque::new();
++            for v in values {
++                items.push_back(convert_js_result_to_lingo_datum(player, v, context_path, cast_lib, cast_member)?);
++            }
++            player.alloc_datum(Datum::List(crate::director::lingo::datum::DatumType::XmlChildNodes, items, false))
++        }
++        FlashValue::Object(path) => player.alloc_datum(Datum::FlashObjectRef(FlashObjectRef::from_path_with_member(&path, cast_lib, cast_member))),
++    })
++}
++
++#[cfg(target_arch = "wasm32")]
+ fn convert_js_result_to_lingo_datum(
+     player: &mut crate::player::DirPlayer,
+     result: JsValue,
 diff --git a/vm-rust/src/player/handlers/datum_handlers/mod.rs b/vm-rust/src/player/handlers/datum_handlers/mod.rs
 index 83967a2f..c0777b5f 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/mod.rs
@@ -1693,7 +2336,7 @@ index f4a22740..3e648b95 100644
          if let Some(ref pan_node) = self.pan_node {
              let _ = pan_node.pan().set_value(clamped as f32);
 diff --git a/vm-rust/src/player/handlers/datum_handlers/sprite.rs b/vm-rust/src/player/handlers/datum_handlers/sprite.rs
-index 2fe89176..455dcc2e 100644
+index 2fe89176..efc1ba29 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/sprite.rs
 +++ b/vm-rust/src/player/handlers/datum_handlers/sprite.rs
 @@ -80,6 +80,10 @@ fn set_sprite_camera_list(
@@ -1707,45 +2350,45 @@ index 2fe89176..455dcc2e 100644
  #[wasm_bindgen]
  extern "C" {
      // All Lingo Flash bridge calls now take `sprite_num` because each Flash
-@@ -121,6 +125,37 @@ extern "C" {
+@@ -121,6 +125,20 @@ extern "C" {
      #[wasm_bindgen(js_name = "dirplayer_isFlashInstanceReady", catch)]
      fn is_flash_instance_ready(sprite_num: i32) -> Result<JsValue, JsValue>;
  }
++// PS5_RUFFLE_DIRPLAYER_NATIVE: off the web the program DirPlayer is embedded in plays Flash
++// members (1.000.036: player/flash_host.rs); without one these answer as for a sprite without one.
 +#[cfg(not(target_arch = "wasm32"))]
-+mod no_flash_bridge {
-+    use wasm_bindgen::JsValue;
-+    pub fn ruffle_goto_frame(_sprite_num: i32, _frame_or_label: &str) {}
-+    pub fn ruffle_stop(_sprite_num: i32) {}
-+    pub fn ruffle_play(_sprite_num: i32) {}
-+    pub fn ruffle_rewind(_sprite_num: i32) {}
-+    pub fn ruffle_call_frame(_sprite_num: i32, _frame: i32) {}
-+    pub fn ruffle_get_variable(_sprite_num: i32, _path: &str) -> Result<JsValue, JsValue> {
-+        Err(JsValue::UNDEFINED)
-+    }
-+    pub fn ruffle_set_variable(_sprite_num: i32, _path: &str, _value: &str) -> Result<JsValue, JsValue> {
-+        Err(JsValue::UNDEFINED)
-+    }
-+    pub fn ruffle_call_function(_sprite_num: i32, _path: &str, _args_xml: &str) -> Result<JsValue, JsValue> {
-+        Err(JsValue::UNDEFINED)
-+    }
-+    pub fn ruffle_hit_test(_sprite_num: i32, _x: f64, _y: f64) -> i32 {
-+        0
-+    }
-+    pub fn ruffle_get_flash_property(_sprite_num: i32, _target: &str, _prop_num: i32) -> Result<JsValue, JsValue> {
-+        Err(JsValue::UNDEFINED)
-+    }
-+    pub fn ruffle_set_flash_property(_sprite_num: i32, _target: &str, _prop_num: i32, _value: &str) {}
-+    pub fn is_flash_instance_ready(_sprite_num: i32) -> Result<JsValue, JsValue> {
-+        Err(JsValue::UNDEFINED)
-+    }
++mod native_flash_bridge {
++    pub use crate::player::flash_host::bridge::{
++        call_frame as ruffle_call_frame, call_function as ruffle_call_function, get_flash_property as ruffle_get_flash_property,
++        get_variable as ruffle_get_variable, goto_frame as ruffle_goto_frame, hit_test as ruffle_hit_test,
++        is_ready as is_flash_instance_ready, play as ruffle_play, rewind as ruffle_rewind,
++        set_flash_property as ruffle_set_flash_property, set_variable as ruffle_set_variable, stop as ruffle_stop,
++    };
 +}
 +#[cfg(not(target_arch = "wasm32"))]
 +#[allow(unused_imports)]
-+use no_flash_bridge::*;
++use native_flash_bridge::*;
  
  /// Yield the frame loop until the sprite's Ruffle instance is ready (loaded +
  /// AS-initialized), so a Flash interop call reads/writes a live instance rather
-@@ -144,7 +179,7 @@ async fn wait_for_flash_ready(sprite_num: i16) {
+@@ -136,6 +154,16 @@ pub(crate) fn is_flash_sprite_ready(sprite_num: i16) -> bool {
+ }
+ 
+ async fn wait_for_flash_ready(sprite_num: i16) {
++    // PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.036): off the web a sprite's player is made when it is
++    // asked for (`pre_dispatch_flash_members`, which the callers run just before), so there is
++    // nothing to wait for: a sprite without one now (its member has no movie yet) has none in
++    // 100 ms either, and waiting held the movie 10 s (Miniclip's loader, whose intro member
++    // is still being fetched when its beginSprite sets the intro's variables).
++    #[cfg(not(target_arch = "wasm32"))]
++    if true {
++        let _ = sprite_num;
++        return;
++    }
+     for _ in 0..100u32 {
+         let ready = is_flash_instance_ready(sprite_num as i32)
+             .ok()
+@@ -144,7 +172,7 @@ async fn wait_for_flash_ready(sprite_num: i16) {
          if ready {
              return;
          }
@@ -1754,22 +2397,7 @@ index 2fe89176..455dcc2e 100644
              std::time::Duration::from_millis(100),
              std::future::pending::<()>(),
          )
-@@ -255,6 +290,14 @@ impl SpriteDatumHandlers {
-     /// cast_lib/cast_member are still needed by callers that build
-     /// `FlashObjectRef`s. Returns None when the sprite has no member.
-     fn resolve_sprite_flash_member(datum: &DatumRef) -> Result<Option<(i32, i32, i32)>, ScriptError> {
-+        // PS5_RUFFLE_DIRPLAYER_NATIVE: off the web no Ruffle instance stands behind a sprite (the
-+        // web front end runs one per Flash sprite), so the Flash methods — gotoFrame, getVariable,
-+        // callFunction, ... — do nothing there instead of calling into the browser (a panic).
-+        #[cfg(not(target_arch = "wasm32"))]
-+        if true {
-+            let _ = datum;
-+            return Ok(None);
-+        }
-         reserve_player_ref(|player| {
-             let sprite_num = player.get_datum(datum).to_sprite_ref()?;
-             let sprite = match player.movie.score.get_sprite(sprite_num) {
-@@ -1032,7 +1075,12 @@ impl SpriteDatumHandlers {
+@@ -1032,7 +1060,12 @@ impl SpriteDatumHandlers {
                          };
                          return reserve_player_mut(|player| Ok(player.alloc_datum(datum)));
                      }
@@ -1782,7 +2410,7 @@ index 2fe89176..455dcc2e 100644
                  }
                  Ok(DatumRef::Void)
              }
-@@ -1241,6 +1289,8 @@ impl SpriteDatumHandlers {
+@@ -1241,6 +1274,8 @@ impl SpriteDatumHandlers {
                          // The export is exposed under the dirplayer_ prefix
                          // (see ruffle/web/src/lib.rs and the matching JS in
                          // src/services/flashPlayerManager.ts).
@@ -1791,16 +2419,21 @@ index 2fe89176..455dcc2e 100644
                          if let Some(window) = web_sys::window() {
                              if let Ok(func) = js_sys::Reflect::get(&window, &"dirplayer_ruffleRegisterLingoCallback".into()) {
                                  if func.is_function() {
-@@ -1539,6 +1589,9 @@ impl SpriteDatumHandlers {
-             // runs before sprite#1's SWF is dispatched), and without triggering
-             // the dispatch here the wait would block the frame before render ever
-             // dispatches it (deadlock). Whitelist so all later calls are sync.
-+            // PS5_RUFFLE_DIRPLAYER_NATIVE: no Ruffle instance to wait for off the web (the
-+            // Flash bridge; `call` finds no Flash member there).
-+            #[cfg(target_arch = "wasm32")]
-             if let Ok(sn) =
-                 reserve_player_ref(|player| player.get_datum(&datum).to_sprite_ref())
-             {
+@@ -1402,6 +1437,14 @@ impl SpriteDatumHandlers {
+                         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+                         .collect();
+                     let path = format!("_root.__dpObj_{}_{}", safe, id);
++                    // PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.036): natively the object is made — `new
++                    // objectType(args)` in the sprite's movie, kept at that path — by the program's
++                    // Flash host (player/flash_host.rs); the web build makes none.
++                    #[cfg(not(target_arch = "wasm32"))]
++                    {
++                        let constructor_args = crate::player::flash_host::flash_args(player, &args[1..]);
++                        crate::player::flash_host::with_host(|h| h.new_object(sprite_num as i32, &object_type, &constructor_args, &path));
++                    }
+                     Ok(player.alloc_datum(Datum::FlashObjectRef(
+                         FlashObjectRef::from_path_with_sprite(&path, cl, cm, sprite_num as i32),
+                     )))
 diff --git a/vm-rust/src/player/handlers/datum_handlers/xml.rs b/vm-rust/src/player/handlers/datum_handlers/xml.rs
 index 7e0d99cd..9c8b3023 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/xml.rs
@@ -1918,7 +2551,7 @@ index 7e0d99cd..9c8b3023 100644
                                  "🔧 Document {}.childNodes returning root element {}",
                                  xml_id, root_id
 diff --git a/vm-rust/src/player/handlers/manager.rs b/vm-rust/src/player/handlers/manager.rs
-index a4d15155..8af6bf37 100644
+index a4d15155..80c38aac 100644
 --- a/vm-rust/src/player/handlers/manager.rs
 +++ b/vm-rust/src/player/handlers/manager.rs
 @@ -34,6 +34,10 @@ use crate::{
@@ -1932,51 +2565,29 @@ index a4d15155..8af6bf37 100644
  #[wasm_bindgen]
  extern "C" {
      #[wasm_bindgen(js_name = "dirplayer_ruffleGetVariable", catch)]
-@@ -86,6 +90,43 @@ extern "C" {
+@@ -86,6 +90,21 @@ extern "C" {
      #[wasm_bindgen(js_name = "dirplayer_ruffleSetFlashProperty")]
      fn ruffle_set_flash_property(sprite_num: i32, target: &str, prop_num: i32, value: &str);
  }
++// PS5_RUFFLE_DIRPLAYER_NATIVE: off the web the program DirPlayer is embedded in plays Flash
++// members (1.000.036: player/flash_host.rs); without one these answer as for a sprite without one.
 +#[cfg(not(target_arch = "wasm32"))]
-+mod no_flash_bridge {
-+    use wasm_bindgen::JsValue;
-+    pub fn ruffle_get_variable(_sprite_num: i32, _path: &str) -> Result<JsValue, JsValue> {
-+        Err(JsValue::UNDEFINED)
-+    }
-+    pub fn ruffle_set_variable(_sprite_num: i32, _path: &str, _value: &str) -> Result<JsValue, JsValue> {
-+        Err(JsValue::UNDEFINED)
-+    }
-+    pub fn ruffle_call_function(_sprite_num: i32, _path: &str, _args_xml: &str) -> Result<JsValue, JsValue> {
-+        Err(JsValue::UNDEFINED)
-+    }
-+    pub fn ruffle_goto_frame(_sprite_num: i32, _frame_or_label: &str) {}
-+    pub fn ruffle_stop(_sprite_num: i32) {}
-+    pub fn ruffle_play(_sprite_num: i32) {}
-+    pub fn ruffle_rewind(_sprite_num: i32) {}
-+    pub fn ruffle_is_playing(_sprite_num: i32) -> bool {
-+        false
-+    }
-+    pub fn ruffle_get_frame_count(_sprite_num: i32) -> i32 {
-+        0
-+    }
-+    pub fn ruffle_get_current_frame(_sprite_num: i32) -> i32 {
-+        0
-+    }
-+    pub fn ruffle_call_frame(_sprite_num: i32, _frame: i32) {}
-+    pub fn ruffle_hit_test(_sprite_num: i32, _x: f64, _y: f64) -> i32 {
-+        0
-+    }
-+    pub fn ruffle_get_flash_property(_sprite_num: i32, _target: &str, _prop_num: i32) -> Result<JsValue, JsValue> {
-+        Err(JsValue::UNDEFINED)
-+    }
-+    pub fn ruffle_set_flash_property(_sprite_num: i32, _target: &str, _prop_num: i32, _value: &str) {}
++mod native_flash_bridge {
++    pub use crate::player::flash_host::bridge::{
++        call_frame as ruffle_call_frame, call_function as ruffle_call_function, current_frame as ruffle_get_current_frame,
++        frame_count as ruffle_get_frame_count, get_flash_property as ruffle_get_flash_property, get_variable as ruffle_get_variable,
++        goto_frame as ruffle_goto_frame, hit_test as ruffle_hit_test, is_playing as ruffle_is_playing, play as ruffle_play,
++        rewind as ruffle_rewind, set_flash_property as ruffle_set_flash_property, set_variable as ruffle_set_variable,
++        stop as ruffle_stop,
++    };
 +}
 +#[cfg(not(target_arch = "wasm32"))]
 +#[allow(unused_imports)]
-+use no_flash_bridge::*;
++use native_flash_bridge::*;
  
  pub struct BuiltInHandlerManager {}
  
-@@ -95,6 +136,13 @@ impl BuiltInHandlerManager {
+@@ -95,6 +114,13 @@ impl BuiltInHandlerManager {
      /// key; cast_lib/cast_member are returned alongside for callers that
      /// still need them (e.g. building FlashObjectRefs).
      fn resolve_flash_member(datum_ref: &DatumRef) -> Result<Option<(i32, i32, i32)>, ScriptError> {
@@ -1990,7 +2601,7 @@ index a4d15155..8af6bf37 100644
          reserve_player_ref(|player| {
              let datum = player.get_datum(datum_ref);
              let sprite_num = match datum {
-@@ -125,6 +173,12 @@ impl BuiltInHandlerManager {
+@@ -125,6 +151,12 @@ impl BuiltInHandlerManager {
      /// SWA no-op (which is correct for those operands in the web port).
      fn resolve_flash_sprite_strict(datum_ref: &DatumRef) -> Result<Option<i32>, ScriptError> {
          use crate::player::cast_member::CastMemberType;
@@ -2003,7 +2614,7 @@ index a4d15155..8af6bf37 100644
          reserve_player_ref(|player| {
              let datum = player.get_datum(datum_ref);
              let sprite_num = match datum {
-@@ -1679,7 +1733,12 @@ impl BuiltInHandlerManager {
+@@ -1679,7 +1711,12 @@ impl BuiltInHandlerManager {
                                      }
                                  }
                              }
@@ -2016,7 +2627,7 @@ index a4d15155..8af6bf37 100644
                          }
                          if return_as_object {
                              return reserve_player_mut(|player| {
-@@ -2289,6 +2348,9 @@ impl BuiltInHandlerManager {
+@@ -2289,6 +2326,9 @@ impl BuiltInHandlerManager {
  
                          // Build the measurement context once and reuse it for all
                          // word-wrap probes below.
@@ -2026,7 +2637,7 @@ index a4d15155..8af6bf37 100644
                          let measure_ctx = {
                              use wasm_bindgen::JsCast;
                              let font_str = format!("{}px {}", display_font_size, display_font_name);
-@@ -2300,6 +2362,12 @@ impl BuiltInHandlerManager {
+@@ -2300,6 +2340,12 @@ impl BuiltInHandlerManager {
                                  .and_then(|c| c.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
                                  .map(|ctx| { ctx.set_font(&font_str); ctx })
                          };
@@ -2039,7 +2650,7 @@ index a4d15155..8af6bf37 100644
                          let measure = |s: &str| -> f64 {
                              measure_ctx.as_ref()
                                  .and_then(|ctx| ctx.measure_text(s).ok())
-@@ -3347,13 +3415,19 @@ fn count_wraps_before_index(
+@@ -3347,13 +3393,19 @@ fn count_wraps_before_index(
      wrap_w: i16,
      target_char_idx: usize,
  ) -> usize {
@@ -2061,7 +2672,7 @@ index a4d15155..8af6bf37 100644
      let Some(ctx) = ctx_opt else { return 0; };
      ctx.set_font(&format!("{}px {}", font_size, font_name));
      // Walk source lines; for each line, simulate word-wrap and count
-@@ -3382,7 +3456,7 @@ fn count_wraps_before_index(
+@@ -3382,7 +3434,7 @@ fn count_wraps_before_index(
  /// Total visual-line breaks (excluding the implicit final line) when
  /// `line` is word-wrapped at `wrap_w` pixels. Uses Canvas2D for width.
  fn wraps_in_line(
@@ -2070,7 +2681,7 @@ index a4d15155..8af6bf37 100644
      line: &str,
      wrap_w: i16,
  ) -> usize {
-@@ -3397,7 +3471,7 @@ fn wraps_in_line(
+@@ -3397,7 +3449,7 @@ fn wraps_in_line(
  /// preserved). Per-char measurement, by contrast, over-estimates
  /// because kerning isn't applied between independent calls.
  fn wraps_in_line_up_to(
@@ -2663,10 +3274,10 @@ index 00000000..87000619
 +    }
 +}
 diff --git a/vm-rust/src/player/mod.rs b/vm-rust/src/player/mod.rs
-index 1c4a69a3..af943e66 100644
+index 1c4a69a3..752bf15d 100644
 --- a/vm-rust/src/player/mod.rs
 +++ b/vm-rust/src/player/mod.rs
-@@ -54,6 +54,33 @@ pub mod console;
+@@ -54,6 +54,37 @@ pub mod console;
  pub mod testing_shared;
  #[cfg(not(target_arch = "wasm32"))]
  pub mod testing;
@@ -2675,6 +3286,10 @@ index 1c4a69a3..af943e66 100644
 +pub mod native;
 +#[cfg(not(target_arch = "wasm32"))]
 +pub mod native_rt;
++/// PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.036): Flash cast members, played by the program DirPlayer is
++/// embedded in.
++#[cfg(not(target_arch = "wasm32"))]
++pub mod flash_host;
 +/// PS5_RUFFLE_DIRPLAYER_NATIVE: spawn_local / sleep / timeout — async-std's on the web, the
 +/// native executor's elsewhere (async-std's runtime needs async-io, whose reactor does not start
 +/// on the PS5).
@@ -2700,7 +3315,7 @@ index 1c4a69a3..af943e66 100644
  #[cfg(target_arch = "wasm32")]
  pub mod testing_browser;
  pub mod symbols;
-@@ -73,10 +100,10 @@ use allocator::{
+@@ -73,10 +104,10 @@ use allocator::{
  use async_recursion::async_recursion;
  use async_std::{
      channel::{self, Sender},
@@ -2713,7 +3328,7 @@ index 1c4a69a3..af943e66 100644
  use cast_manager::CastPreloadReason;
  use cast_member::CastMemberType;
  use datum_ref::DatumRef;
-@@ -168,6 +195,13 @@ fn trace_output(player: &DirPlayer, message: &str) {
+@@ -168,6 +199,13 @@ fn trace_output(player: &DirPlayer, message: &str) {
  }
  
  pub fn dispatch_file_write_event(file_path: &str, content: &str) {
@@ -2727,19 +3342,70 @@ index 1c4a69a3..af943e66 100644
      let window = web_sys::window();
      if let Some(window) = window {
          let event_init = web_sys::CustomEventInit::new();
-@@ -1029,6 +1063,11 @@ impl DirPlayer {
+@@ -530,6 +568,10 @@ pub struct DirPlayer {
+     /// routes captured frames for these synthetic numbers into the named texture
+     /// instead of `flash_frame_buffers`. See `flash_texture_synthetic_id`.
+     pub flash_texture_targets: HashMap<i16, (cast_lib::CastMemberRef, String)>,
++    /// PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.036): Flash members whose `fileName` was set to an
++    /// address still being fetched (the member, the task, the address): see
++    /// `link_flash_members`.
++    pub flash_member_links: Vec<(cast_lib::CastMemberRef, u32, String)>,
+     /// Cached rendered 3D scene bitmaps (populated during sprite rendering, read by world.image)
+     pub w3d_frame_buffers: HashMap<(i32, i32), bitmap::manager::BitmapRef>,
+     /// Members whose `.image` a script has actually asked for. The per-frame FBO
+@@ -953,6 +995,7 @@ impl DirPlayer {
+             flash_lc_callbacks: std::collections::HashMap::new(),
+             input_polled: false,
+             flash_texture_targets: HashMap::new(),
++            flash_member_links: Vec::new(),
+             w3d_frame_buffers: HashMap::new(),
+             w3d_image_requested: std::collections::HashSet::new(),
+             w3d_any_rendered: false,
+@@ -1028,7 +1071,43 @@ impl DirPlayer {
+     /// Pre-dispatch Flash members for all active sprites so they start loading
      /// before Lingo scripts try to access them. Per-sprite: each sprite that
      /// references a Flash member gets its own dedicated Ruffle instance.
++    /// PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.036): a Flash member whose `fileName` was set to an
++    /// address gets the movie once the fetch is in (its sprite then starts it, as any Flash member);
++    /// a fetch that failed leaves it as it was, and says so.
++    #[cfg(not(target_arch = "wasm32"))]
++    fn link_flash_members(&mut self) {
++        let links = std::mem::take(&mut self.flash_member_links);
++        for (member_ref, task, url) in links {
++            if !self.net_manager.is_task_done(Some(task)) {
++                self.flash_member_links.push((member_ref, task, url));
++                continue;
++            }
++            match self.net_manager.get_task_result(Some(task)) {
++                Some(Ok(bytes)) if crate::rendering::has_swf_signature(&bytes) => {
++                    log::info!("Flash member {}:{}: {url} ({} bytes)", member_ref.cast_lib, member_ref.cast_member, bytes.len());
++                    if let Some(member) = self.movie.cast_manager.find_member_by_ref_mut(&member_ref) {
++                        if let CastMemberType::Flash(flash) = &mut member.member_type {
++                            flash.data = bytes;
++                            flash.flash_info = None;
++                        }
++                    }
++                }
++                Some(Ok(bytes)) => log::warn!("Flash member {}:{}: {url} is not a Flash movie ({} bytes)", member_ref.cast_lib, member_ref.cast_member, bytes.len()),
++                _ => log::warn!("Flash member {}:{}: {url} could not be fetched", member_ref.cast_lib, member_ref.cast_member),
++            }
++        }
++    }
++
      pub fn pre_dispatch_flash_members(&mut self) {
-+        // PS5_RUFFLE_DIRPLAYER_NATIVE: no Ruffle instances off the web (see the Flash bridge).
++        // PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.036): a linked member's movie, once fetched, whether
++        // or not a program plays it (its size and state are read either way); the players only
++        // for a program that plays Flash members (player/flash_host.rs).
 +        #[cfg(not(target_arch = "wasm32"))]
-+        if true {
++        self.link_flash_members();
++        #[cfg(not(target_arch = "wasm32"))]
++        if !crate::player::flash_host::has_host() {
 +            return;
 +        }
          // When running a nested `#movie` sub-player, dispatch its Flash sprites
          // to Ruffle under a synthetic per-player key so they don't collide with
          // the host's channel keys and their captured frames route back into THIS
-@@ -1694,18 +1733,32 @@ impl DirPlayer {
+@@ -1694,18 +1773,32 @@ impl DirPlayer {
                      .map(|s| (s.clone(), false))
              });
          if let Some((path, is_label)) = path_to_apply {
@@ -2775,7 +3441,7 @@ index 1c4a69a3..af943e66 100644
                  }
              }
              if !is_label {
-@@ -3092,12 +3145,69 @@ impl DirPlayer {
+@@ -3092,12 +3185,69 @@ impl DirPlayer {
              .and_then(|t| t.film_loop.clone())
      }
  
@@ -2846,7 +3512,7 @@ index 1c4a69a3..af943e66 100644
                  Ok(self.alloc_datum(Datum::String(stats)))
              },
              BuiltInSymbol::DatumSnapshot => {
-@@ -3107,7 +3217,7 @@ impl DirPlayer {
+@@ -3107,7 +3257,7 @@ impl DirPlayer {
              },
              BuiltInSymbol::DatumLeakScan => {
                  let stats = self.datum_leak_scan();
@@ -2855,7 +3521,7 @@ index 1c4a69a3..af943e66 100644
                  Ok(self.alloc_datum(Datum::String(stats)))
              },
              BuiltInSymbol::SystemDate => {
-@@ -4095,7 +4205,7 @@ impl DirPlayer {
+@@ -4095,7 +4245,7 @@ impl DirPlayer {
              stack_trace.push_str(&self.format_scope_stack(5, 25));
              stack_trace.push_str("\nThis usually indicates a bug in the Director movie's scripts (e.g., a handler calling itself infinitely).\n");
              stack_trace.push_str("Note: If this is happening during frame events, it may be a re-entrant call issue.\n");
@@ -2864,7 +3530,7 @@ index 1c4a69a3..af943e66 100644
              panic!("Stack overflow - infinite recursion in Lingo scripts");
          }
          let scope_ref = self.scope_count;
-@@ -4246,7 +4356,9 @@ impl DirPlayer {
+@@ -4246,7 +4396,9 @@ impl DirPlayer {
                              } else {
                                  next
                              };
@@ -2875,7 +3541,7 @@ index 1c4a69a3..af943e66 100644
                              Some((member_ref, current, new_frame))
                          } else {
                              None
-@@ -4257,6 +4369,12 @@ impl DirPlayer {
+@@ -4257,6 +4409,12 @@ impl DirPlayer {
          
          // Process each filmloop
          for (member_ref, old_frame, new_frame) in active_filmloops {
@@ -2888,7 +3554,7 @@ index 1c4a69a3..af943e66 100644
              // Skip if frame didn't change
              if old_frame == new_frame {
                  continue;
-@@ -4793,7 +4911,7 @@ where
+@@ -4793,7 +4951,7 @@ where
  {
      // `use ... as raw` (no trailing `(`) so the bulk `crate::player::spawn_player_local(`
      // → `spawn_player_local(` rewrite doesn't turn this into infinite recursion.
@@ -2897,7 +3563,7 @@ index 1c4a69a3..af943e66 100644
      let id = unsafe { ACTIVE_PLAYER_ID };
      raw(WithActivePlayer { id, inner: fut });
  }
-@@ -5125,7 +5243,10 @@ pub async fn player_call_script_handler_raw_args(
+@@ -5125,7 +5283,10 @@ pub async fn player_call_script_handler_raw_args(
      // On each BACKWARD jump (a loop iteration) we check elapsed time and, past a
      // frame's worth, yield a real macrotask so queued input events fire, then
      // resume. Time-budgeted so ordinary fast compute loops are unaffected.
@@ -2909,7 +3575,7 @@ index 1c4a69a3..af943e66 100644
      // Count backward jumps to distinguish a TIGHT busy-wait (thousands of
      // iterations/ms — `repeat while keyPressed`) from a heavy COMPUTE loop (a
      // few iterations, each doing real work — the game's `drawmap`/water
-@@ -5194,7 +5315,9 @@ pub async fn player_call_script_handler_raw_args(
+@@ -5194,7 +5355,9 @@ pub async fn player_call_script_handler_raw_args(
                          if backjumps >= 4096 {
                              backjumps = 0;
                              let now = chrono::Utc::now().timestamp_millis();
@@ -2920,7 +3586,7 @@ index 1c4a69a3..af943e66 100644
                                  last_yield_ms = now;
                                  let _ = timeout(
                                      Duration::from_millis(1),
-@@ -5500,7 +5623,9 @@ pub async fn player_call_script_handler_raw_args(
+@@ -5500,7 +5663,9 @@ pub async fn player_call_script_handler_raw_args(
                      if backjumps >= 4096 {
                          backjumps = 0;
                          let now = chrono::Utc::now().timestamp_millis();
@@ -2931,7 +3597,7 @@ index 1c4a69a3..af943e66 100644
                              last_yield_ms = now;
                              let _ = timeout(
                                  Duration::from_millis(1),
-@@ -5757,7 +5882,7 @@ async fn run_movie_init_sequence() {
+@@ -5757,7 +5922,7 @@ async fn run_movie_init_sequence() {
      dispatch_system_event_to_timeouts(BuiltInSymbol::PrepareMovie, &vec![]).await;
  
      if let Err(err) = player_invoke_global_event(Symbol::builtin(BuiltInSymbol::PrepareMovie), &vec![]).await {
@@ -2940,7 +3606,7 @@ index 1c4a69a3..af943e66 100644
          if err.code != ScriptErrorCode::Abort {
              reserve_player_mut(|player| player.on_script_error(&err));
          }
-@@ -6260,6 +6385,7 @@ async fn restart_current_movie() {
+@@ -6260,6 +6425,7 @@ async fn restart_current_movie() {
  
  // JS bridge name uses the `dirplayer_` prefix so this fork's globals don't
  // collide with stock Ruffle / other libraries on the same page.
@@ -2948,39 +3614,43 @@ index 1c4a69a3..af943e66 100644
  #[wasm_bindgen]
  extern "C" {
      #[wasm_bindgen(js_name = "dirplayer_isFlashLoading", catch)]
-@@ -6288,6 +6414,31 @@ extern "C" {
+@@ -6288,6 +6454,35 @@ extern "C" {
      #[wasm_bindgen(js_name = "dirplayer_ruffleStop")]
      fn ruffle_stop(sprite_num: i32);
  }
 +// PS5_RUFFLE_DIRPLAYER_NATIVE: off the web there is no Ruffle instance behind a Flash cast member
 +// (the web front end runs one per Flash sprite): the bridge answers "not loading, not playing,
 +// nothing there", and calling into the browser — which panics natively — never happens.
++// 1.000.036: the program's Flash host (player/flash_host.rs) plays them; it makes a sprite's player
++// when asked (the call returns with it made), so nothing is ever "loading".
 +#[cfg(not(target_arch = "wasm32"))]
-+pub(crate) fn is_flash_loading() -> Result<bool, wasm_bindgen::JsValue> {
++pub(crate) fn is_flash_loading() -> Result<bool, crate::player::flash_host::FlashValue> {
 +    Ok(false)
 +}
 +#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_set_size(_sprite_num: i32, _w: i32, _h: i32) -> Result<(), wasm_bindgen::JsValue> {
++fn ruffle_set_size(sprite_num: i32, w: i32, h: i32) -> Result<(), crate::player::flash_host::FlashValue> {
++    crate::player::flash_host::bridge::set_size(sprite_num, w, h);
 +    Ok(())
 +}
 +#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_is_playing(_sprite_num: i32) -> Result<bool, wasm_bindgen::JsValue> {
-+    Ok(false)
++fn ruffle_is_playing(sprite_num: i32) -> Result<bool, crate::player::flash_host::FlashValue> {
++    Ok(crate::player::flash_host::bridge::is_playing(sprite_num))
 +}
 +#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_get_current_frame(_sprite_num: i32) -> Result<i32, wasm_bindgen::JsValue> {
-+    Ok(0)
++fn ruffle_get_current_frame(sprite_num: i32) -> Result<i32, crate::player::flash_host::FlashValue> {
++    Ok(crate::player::flash_host::bridge::current_frame(sprite_num))
 +}
 +#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_goto_frame_and_stop(_sprite_num: i32, _frame_or_label: &str) -> Result<(), wasm_bindgen::JsValue> {
++fn ruffle_goto_frame_and_stop(sprite_num: i32, frame_or_label: &str) -> Result<(), crate::player::flash_host::FlashValue> {
++    crate::player::flash_host::bridge::goto_frame_and_stop(sprite_num, frame_or_label);
 +    Ok(())
 +}
 +#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_stop(_sprite_num: i32) {}
++use crate::player::flash_host::bridge::stop as ruffle_stop;
  /// Execute one complete frame cycle: run frame scripts, then advance to the next frame.
  /// Returns (is_playing, is_script_paused) so callers can check if the movie is still running.
  ///
-@@ -7423,6 +7574,9 @@ pub async fn run_frame_loop() {
+@@ -7423,6 +7618,9 @@ pub async fn run_frame_loop() {
              // 1-3 s) to set `preloaderTranslationSuccess`; without this the tight
              // loop starves that fetch's completion callback and the login links
              // (asfunction hyperlinks in the translated IDS strings) never load.
@@ -2990,7 +3660,7 @@ index 1c4a69a3..af943e66 100644
              let read_window_count = |key: &str| -> f64 {
                  web_sys::window()
                      .and_then(|w| {
-@@ -7431,6 +7585,8 @@ pub async fn run_frame_loop() {
+@@ -7431,6 +7629,8 @@ pub async fn run_frame_loop() {
                      .and_then(|v| v.as_f64())
                      .unwrap_or(0.0)
              };
@@ -3058,10 +3728,10 @@ index fd461636..ec219dd8 100644
      }
 diff --git a/vm-rust/src/player/native.rs b/vm-rust/src/player/native.rs
 new file mode 100644
-index 00000000..cf7f19d3
+index 00000000..b9c1b7bc
 --- /dev/null
 +++ b/vm-rust/src/player/native.rs
-@@ -0,0 +1,607 @@
+@@ -0,0 +1,706 @@
 +//! PS5_RUFFLE_DIRPLAYER_NATIVE — DirPlayer inside another program, without a browser.
 +//!
 +//! The web front end drives the VM from JavaScript: it loads the movie, runs the frame loop on
@@ -3078,6 +3748,12 @@ index 00000000..cf7f19d3
 +//! The VM is one global instance (`PLAYER_OPT`): one `NativePlayer` at a time, and every call —
 +//! including the async ones, which must be driven by [`block_on`] on the thread that made it —
 +//! from one thread.
++//!
++//! 1.000.036: Flash cast members. A host that plays them installs a Flash host
++//! ([`super::flash_host::set_host`]); each frame then starts the Flash sprites that came on stage
++//! as the web frame loop does (`pre_dispatch_flash_members`), and what the Flash movies said to
++//! Lingo runs at the start of each frame and after each input event ([`run_flash_calls`]). The
++//! mouse moves over a Flash sprite reach its movie ([`flash_mouse_move`]).
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +use std::path::Path;
@@ -3397,6 +4073,78 @@ index 00000000..cf7f19d3
 +    crate::player::run_startup_do_before().await;
 +}
 +
++/// 1.000.036: what the Flash members said to Lingo since the last time
++/// ([`super::flash_host::post`]), in the order said: `getURL("event:…")` and `fscommand` as the
++/// web front end's `dispatch_flash_event` makes them (the handler, for the sprites showing the
++/// member), `getURL("lingo:…")` as its `dispatch_flash_lingo` (the text as a Lingo command). What
++/// those handlers make the Flash movies say runs too, for 16 rounds; then it waits for the next
++/// time. A script error is logged and the movie goes on, as for the other native input.
++pub async fn run_flash_calls() {
++    use super::flash_host::FlashCall;
++    for _ in 0..16 {
++        let calls = super::flash_host::take_calls();
++        if calls.is_empty() {
++            return;
++        }
++        for call in calls {
++            match call {
++                FlashCall::Event { cast_lib, cast_member, body } => {
++                    let Some(command) = crate::flash_event_command(cast_lib, cast_member, &body) else {
++                        continue;
++                    };
++                    if let Err(err) = run_player_command(command).await {
++                        log::warn!("Flash {cast_lib}:{cast_member} event {body:?}: {}", err.message);
++                    }
++                }
++                FlashCall::Lingo(body) => {
++                    let body = body.trim().to_string();
++                    if body.is_empty() {
++                        log::warn!("Flash: an empty lingo: address");
++                        continue;
++                    }
++                    if let Err(err) = crate::player::eval::eval_lingo_command(body.clone()).await {
++                        log::warn!("Flash lingo: {body:?}: {}", err.message);
++                    }
++                }
++            }
++        }
++    }
++}
++
++thread_local! {
++    /// The Flash sprite the mouse is over (for its `Leave`), as `flash_mouse_move` last found it.
++    static FLASH_HOVER: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
++}
++
++/// 1.000.036: the mouse moved to stage point (`x`, `y`): the topmost sprite there, when it shows a
++/// Flash member, gets the move at its own point (the same lookup and point as the click
++/// forwarding in commands.rs), and a Flash sprite the mouse left gets a `Leave`. On the web the
++/// page's Ruffle players get no moves but those before a click; here their buttons light up under
++/// the mouse as in Director, where the Flash sprite gets the mouse.
++pub fn flash_mouse_move(x: i32, y: i32) {
++    use super::flash_host::{with_host, MouseKind};
++    if !super::flash_host::has_host() {
++        return;
++    }
++    let target = reserve_player_ref(|player| {
++        let sn = crate::player::score::get_sprite_at(player, x, y, false)?;
++        let sprite = player.movie.score.get_sprite(sn as i16)?;
++        let member = player.movie.cast_manager.find_member_by_ref(sprite.member.as_ref()?)?;
++        if !matches!(member.member_type, crate::player::cast_member::CastMemberType::Flash(_)) {
++            return None;
++        }
++        let rect = crate::player::score::get_concrete_sprite_rect(player, sprite);
++        Some((sn as i32, x - rect.left, y - rect.top, rect.right - rect.left, rect.bottom - rect.top))
++    });
++    let before = FLASH_HOVER.with(|h| h.replace(target.map(|t| t.0)));
++    if let Some(left) = before.filter(|b| Some(*b) != target.map(|t| t.0)) {
++        with_host(|h| h.mouse(left, MouseKind::Leave, 0, 0, 0, 0));
++    }
++    if let Some((sn, lx, ly, w, h)) = target {
++        with_host(|host| host.mouse(sn, MouseKind::Move, lx, ly, w, h));
++    }
++}
++
 +/// One score frame the way the web front end's frame loop (`run_frame_loop`) runs one, without
 +/// its pacing (the host decides when frames run, at the movie's tempo):
 +///
@@ -3432,6 +4180,10 @@ index 00000000..cf7f19d3
 +        return reserve_player_ref(|player| player.is_playing);
 +    }
 +
++    // 1.000.036: what the Flash members said, then (as the web frame loop does before each frame)
++    // a player for each Flash sprite that came on stage
++    run_flash_calls().await;
++    reserve_player_mut(|player| player.pre_dispatch_flash_members());
 +    fire_pending_timeouts().await;
 +    let (is_playing, _) = run_single_frame().await;
 +    if !is_playing {
@@ -3488,6 +4240,11 @@ index 00000000..cf7f19d3
 +        }
 +        crate::player::net_task::set_web_root(None);
 +        crate::player::net_task::set_fetcher(None);
++        // 1.000.036: no Flash host (the host installs its own after) and nothing left from the
++        // last movie's Flash members
++        super::flash_host::set_host(None);
++        super::flash_host::clear_calls();
++        FLASH_HOVER.with(|h| h.set(None));
 +        // 1.000.030: a new player draws 3D from nothing (the software renderer keeps members'
 +        // geometry and textures by cast member number).
 +        crate::rendering_gpu::softgl::reset();
@@ -3625,25 +4382,33 @@ index 00000000..cf7f19d3
 +    pub async fn key_down(&mut self, key: &str, code: u16) {
 +        reserve_player_mut(|player| player.keyboard_manager.key_down(key.to_string(), code));
 +        let _ = run_player_command(PlayerVMCommand::KeyDown(key.to_string(), code)).await;
++        run_flash_calls().await;
 +    }
 +
 +    pub async fn key_up(&mut self, key: &str, code: u16) {
 +        reserve_player_mut(|player| player.keyboard_manager.key_up(key, code));
 +        let _ = run_player_command(PlayerVMCommand::KeyUp(key.to_string(), code)).await;
++        run_flash_calls().await;
 +    }
 +
 +    /// The mouse moved to `(x, y)` in stage pixels.
 +    pub async fn mouse_move(&mut self, x: i32, y: i32) {
 +        reserve_player_mut(|player| player.mouse_loc = (x, y));
 +        let _ = run_player_command(PlayerVMCommand::MouseMove((x, y))).await;
++        flash_mouse_move(x, y);
++        run_flash_calls().await;
 +    }
 +
++    /// A click on a Flash sprite reaches its movie too (commands.rs forwards it to the Flash
++    /// host, as the web build forwards it to the sprite's Ruffle player); what the movie says to
++    /// Lingo then runs at once.
 +    pub async fn mouse_down(&mut self, x: i32, y: i32) {
 +        reserve_player_mut(|player| {
 +            player.mouse_loc = (x, y);
 +            player.movie.mouse_down = true;
 +        });
 +        let _ = run_player_command(PlayerVMCommand::MouseDown((x, y))).await;
++        run_flash_calls().await;
 +    }
 +
 +    pub async fn mouse_up(&mut self, x: i32, y: i32) {
@@ -3652,12 +4417,16 @@ index 00000000..cf7f19d3
 +            player.movie.mouse_down = false;
 +        });
 +        let _ = run_player_command(PlayerVMCommand::MouseUp((x, y))).await;
++        run_flash_calls().await;
 +    }
 +}
 +
 +impl Drop for NativePlayer {
 +    fn drop(&mut self) {
 +        crate::player::native_audio::stop_all();
++        // 1.000.036: the Flash members' players go with the movie
++        super::flash_host::set_host(None);
++        super::flash_host::clear_calls();
 +        unsafe {
 +            // As the test harness does: the VM's globals hold references into the player, so it
 +            // is leaked rather than dropped.
@@ -5128,7 +5897,7 @@ index e684a937..efa2c22f 100644
          std::future::pending::<()>(),
      )
 diff --git a/vm-rust/src/player/score.rs b/vm-rust/src/player/score.rs
-index 2499fe7e..f1f2fcb8 100644
+index 2499fe7e..d359e778 100644
 --- a/vm-rust/src/player/score.rs
 +++ b/vm-rust/src/player/score.rs
 @@ -41,6 +41,7 @@ use super::{
@@ -5139,42 +5908,23 @@ index 2499fe7e..f1f2fcb8 100644
  #[wasm_bindgen]
  extern "C" {
      // All sprite-method Flash bridge calls now key by sprite_num — each
-@@ -110,6 +111,34 @@ fn sprite_is_flash(player: &DirPlayer, sprite_id: i16) -> bool {
+@@ -110,6 +111,15 @@ fn sprite_is_flash(player: &DirPlayer, sprite_id: i16) -> bool {
          .map(|m| matches!(m.member_type, CastMemberType::Flash(_)))
          .unwrap_or(false)
  }
-+// PS5_RUFFLE_DIRPLAYER_NATIVE: off the web no Ruffle instance stands behind a Flash member (the
-+// web front end runs one per Flash sprite): its sprite is not playing, has no frames, hits nothing.
++// PS5_RUFFLE_DIRPLAYER_NATIVE: off the web the program DirPlayer is embedded in plays Flash
++// members (1.000.036: player/flash_host.rs); without one the sprite is not playing, has no frames,
++// hits nothing.
 +#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_is_playing(_sprite_num: i32) -> bool {
-+    false
-+}
-+#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_get_frame_count(_sprite_num: i32) -> i32 {
-+    0
-+}
-+#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_get_current_frame(_sprite_num: i32) -> i32 {
-+    0
-+}
-+#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_goto_frame_and_stop(_sprite_num: i32, _frame_or_label: &str) {}
-+#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_hit_test(_sprite_num: i32, _x: f64, _y: f64) -> i32 {
-+    0
-+}
-+#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_get_variable(_sprite_num: i32, _path: &str) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue> {
-+    Err(wasm_bindgen::JsValue::UNDEFINED)
-+}
-+#[cfg(not(target_arch = "wasm32"))]
-+fn ruffle_set_variable(_sprite_num: i32, _path: &str, _value: &str) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue> {
-+    Err(wasm_bindgen::JsValue::UNDEFINED)
-+}
++use crate::player::flash_host::{bridge::{
++    current_frame as ruffle_get_current_frame, frame_count as ruffle_get_frame_count,
++    get_variable as ruffle_get_variable, goto_frame_and_stop as ruffle_goto_frame_and_stop,
++    hit_test as ruffle_hit_test, is_playing as ruffle_is_playing, set_variable as ruffle_set_variable,
++}};
  
  #[derive(Clone, Debug)]
  pub enum ScoreRef {
-@@ -506,7 +535,7 @@ impl Score {
+@@ -506,7 +516,7 @@ impl Score {
                  Ok(result) => result,
  
                  Err(e) => {
@@ -5183,7 +5933,7 @@ index 2499fe7e..f1f2fcb8 100644
                          &format!("Failed to create script instance: {}", e.message).into(),
                      );
                      return None;
-@@ -1319,7 +1348,7 @@ impl Score {
+@@ -1319,7 +1329,7 @@ impl Score {
                      }
  
                      _ => {
@@ -5192,7 +5942,7 @@ index 2499fe7e..f1f2fcb8 100644
                              "Unexpected color flag: {}",
                              data.color_flag
                          )));
-@@ -2579,7 +2608,7 @@ impl Score {
+@@ -2579,7 +2589,7 @@ impl Score {
                      match player.get_datum(&datum_ref) {
                          Datum::ScriptInstanceRef(inst) => inst.clone(),
                          _ => {
@@ -5201,7 +5951,7 @@ index 2499fe7e..f1f2fcb8 100644
                              panic!("Expected ScriptInstanceRef");
                          }
                      }
-@@ -2907,7 +2936,7 @@ impl Score {
+@@ -2907,7 +2917,7 @@ impl Score {
                  }
  
                  _ => {
@@ -5210,7 +5960,7 @@ index 2499fe7e..f1f2fcb8 100644
                          "Unexpected color flag: {}",
                          data.color_flag
                      )));
-@@ -4390,6 +4419,16 @@ fn resolve_sprite_member_assignment(
+@@ -4390,6 +4400,16 @@ fn resolve_sprite_member_assignment(
                      let (l, t, r, b) = flash.effective_rect();
                      Some(((r - l) as i32, (b - t) as i32))
                  }

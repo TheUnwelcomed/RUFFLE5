@@ -167,6 +167,9 @@ ok "wgpu-hal patched (PS5_RUFFLE_WGPU_HAL_PATCH_V1)"
 # 2b'. DirPlayer for Director / Shockwave games (src/shockwave.rs): its VM at a pinned commit plus
 # tools/dirplayer-native.patch. Cargo.toml names it as a path dependency, so it is fetched for 3a too.
 bash "$HERE/tools/fetch-dirplayer.sh" "$HERE/vendor/dirplayer" || die "DirPlayer could not be fetched or patched"
+# 2b''. 1.000.036: Ruffle's crates for the Director Flash patch (Cargo.toml [patch] points at
+# vendor/ruffle; it is named for 3a too).
+bash "$HERE/tools/fetch-ruffle.sh" "$HERE/vendor/ruffle" || die "Ruffle could not be put in vendor/ruffle or patched"
 
 # 2c. cargo: this crate to a staticlib. Same target and shim as milestone 1; std from source
 # (.cargo/config.toml). -Zgit=shallow-deps: the pinned Ruffle revision is fetched shallow, not with

@@ -24,7 +24,11 @@
 //!     the stage is fitted into the part of the screen the keyboard leaves free (src/shell.rs
 //!     `stage_rect`), the pointer's area with it;
 //!   * 1.000.032: the loop names each step to a watchdog (src/watchdog.rs), which writes to
-//!     ruffle.log when one takes 5 s or more.
+//!     ruffle.log when one takes 5 s or more;
+//!   * 1.000.036: the movie's Flash cast members play, each with a Ruffle player of its own
+//!     (src/dirflash.rs): they run at their own frame rates between score frames, their pictures
+//!     are drawn on the GPU and put in their sprites, their sound is mixed with the movie's, and
+//!     Lingo and they talk as through Director's Flash Asset Xtra.
 //!
 //! Everything DirPlayer does runs on this thread, inside its executor (`block_on`): its helper tasks
 //! (loading casts, timeouts) only move while this loop awaits it. 1.000.022: that executor is
@@ -46,6 +50,8 @@ use crate::ui::{Align, Face, Rect, Scene, W};
 use crate::widgets::{self, centred, draw_hold_bar, ease, Glyph, BLACK, INK, NIGHT, ORANGE};
 use crate::{say, App};
 use ruffle_core::events::{KeyDescriptor, LogicalKey, MouseButton, NamedKey, PlayerEvent};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -132,7 +138,8 @@ extern "C" {
 }
 
 impl DcrAudio {
-    fn new(volume: u8) -> Result<DcrAudio, String> {
+    /// 1.000.036: `flash` — the Flash members' sound, mixed in with the movie's.
+    fn new(volume: u8, flash: crate::dirflash::Mixers) -> Result<DcrAudio, String> {
         let mut detail = 0i32;
         let mut port = -1;
         let mut grain = 0u32;
@@ -159,10 +166,12 @@ impl DcrAudio {
                 let frames = grain as usize;
                 let mut mix = vec![0f32; frames * 2];
                 let mut out = vec![0i16; frames * 2];
+                let mut scratch = Vec::new();
                 while !s.load(Ordering::Relaxed) {
                     mix.iter_mut().for_each(|x| *x = 0.0);
                     if !p.load(Ordering::Relaxed) {
                         native_audio::mix(&mut mix, 48_000);
+                        flash.mix_into(&mut mix, &mut scratch);
                     }
                     let g = f32::from_bits(v.load(Ordering::Relaxed));
                     for (o, x) in out.iter_mut().zip(mix.iter()) {
@@ -196,6 +205,61 @@ impl Drop for DcrAudio {
             let _ = t.join();
         }
     }
+}
+
+/// 1.000.036: the game's Flash cast members (src/dirflash.rs). Each one's player draws on the GPU
+/// the display uses, at Settings' quality; loads what its movie asks for as a Flash game does (the
+/// game's folder; its web root and, for a Flashpoint game, Flashpoint's server: src/navigator.rs);
+/// keeps its SharedObjects in the game's saves (`flash` in them); runs ActionScript for at most
+/// Settings' script time limit at a time, as the Flash version Settings say; and plays from the
+/// movie's own file, told the movie's address when it has one.
+fn flash_members(
+    app: &App,
+    path: &str,
+    key: &str,
+    launch: Option<&crate::online::Launch>,
+    movie_address: Option<String>,
+    mixers: crate::dirflash::Mixers,
+) -> Rc<RefCell<crate::dirflash::FlashMembers>> {
+    use ruffle_render::quality::StageQuality;
+    let s = &app.settings;
+    let base = std::path::Path::new(path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let web_root = launch.and_then(|l| l.web_root_or_made());
+    let flashpoint = launch.filter(|l| l.from_flashpoint()).map(|l| (path.to_string(), l.url.clone(), web_root.clone()));
+    let navigator_root = web_root.clone();
+    let saves = format!("{}/flash", app.paths.saves(key));
+    let quality = [
+        StageQuality::Low,
+        StageQuality::Medium,
+        StageQuality::High,
+        StageQuality::Best,
+        StageQuality::High8x8,
+        StageQuality::High8x8Linear,
+        StageQuality::High16x16,
+        StageQuality::High16x16Linear,
+    ][s.quality as usize];
+    let setup = crate::dirflash::Setup {
+        canvas: Box::new(crate::dirflash::WgpuCanvas { descriptors: Arc::clone(&app.descriptors) }),
+        navigator: Box::new(move |executor| {
+            let (mut nav, _) = crate::navigator::Ps5Navigator::new(&base, navigator_root.as_deref().map(std::path::Path::new), executor);
+            if let Some((movie, url, root)) = &flashpoint {
+                nav.set_fetch(crate::fpfetch::FpFetch::new(std::path::Path::new(movie), url.as_deref(), root.as_deref().map(std::path::Path::new)));
+            }
+            Box::new(nav)
+        }),
+        storage: Box::new(move || Box::new(crate::saves::DiskStorage::new(&saves))),
+        mixers: Some(mixers),
+        movie_url: format!("file://{path}"),
+        spoofed_url: movie_address,
+        quality,
+        max_execution: Duration::from_secs(crate::settings::MAX_EXECUTION[s.max_execution as usize] as u64),
+        player_version: match crate::settings::PLAYER_VERSIONS[s.player_version as usize] {
+            0 => None,
+            v => Some(v),
+        },
+        log: say,
+    };
+    crate::dirflash::FlashMembers::new(setup)
 }
 
 /// 1.000.028: text in a font the movie does not carry ("Arial", "Times New Roman", "Verdana"...)
@@ -354,6 +418,9 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
     // the address it was published at (`the moviePath`; the files it asks for there are read from
     // its folder), and the folder its other web addresses are read from (its game data's content).
     let launch = crate::online::launch_for(&path);
+    // 1.000.036: the address the movie is told it is on (online.txt or Pretend to be on), for its
+    // Flash members too
+    let mut movie_address: Option<String> = None;
     if let Some(l) = &launch {
         if let Some(cmd) = &l.command {
             let lc = vm_rust::player::native::parse_launch_command(cmd);
@@ -372,6 +439,7 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
         if let Some(url) = &l.url {
             say(&format!("     address {url} (online.txt)"));
             player.set_movie_address(url);
+            movie_address = Some(url.clone());
         }
         // 1.000.034: a Flashpoint game's files not on the console come from Flashpoint's server
         // as it asks for them (src/fpfetch.rs); an entry without game data gets a `content`
@@ -397,8 +465,13 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
         }
         if let Some(a) = a {
             player.set_movie_address(&a);
+            movie_address = Some(a);
         }
     }
+    // 1.000.036: its Flash cast members, each played by a Ruffle player of its own (src/dirflash.rs)
+    let flash_mixers = crate::dirflash::Mixers::default();
+    let flash = flash_members(app, &path, &key, launch.as_ref(), movie_address.clone(), flash_mixers.clone());
+    vm_rust::player::flash_host::set_host(Some(Box::new(crate::dirflash::MemberHost(Rc::clone(&flash)))));
     if let Err(e) = player.load(&path).await {
         say(&format!("FAIL {name}: {e}"));
         app.menu.toast(&format!("{name}: {e}"));
@@ -440,7 +513,7 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
     app.input.mouse_speed = s.mouse_multiplier();
 
     // ---- sound ----
-    let audio = match DcrAudio::new(s.volume) {
+    let audio = match DcrAudio::new(s.volume, flash_mixers.clone()) {
         Ok(a) => Some(a),
         Err(e) => {
             say(&format!("warn no sound: {e}"));
@@ -500,6 +573,8 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
     let mut first_frame = true;
     let mut picture: Vec<u8> = Vec::new();
     let mut events: Vec<PlayerEvent> = Vec::new();
+    // ms the Flash members took in the 5 s (their frames, drawing, reading back)
+    let mut flash_ms = 0.0f64;
 
     loop {
         wd.step(Step::Loop);
@@ -607,7 +682,7 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
                 options_armed = false;
                 app.input.release_all(&mut events);
                 events.extend(osk.release_all());
-                send_events(&mut player, &mut events).await;
+                send_events(&mut player, &mut events, &flash).await;
                 if let Some(a) = &audio {
                     a.set_paused(true);
                 }
@@ -651,7 +726,7 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
         let mut stepped = false;
         wd.step(Step::Frame);
         if !paused && !stopped {
-            send_events(&mut player, &mut events).await;
+            send_events(&mut player, &mut events, &flash).await;
             if first_frame || t >= next_frame_at {
                 first_frame = false;
                 stepped = true;
@@ -673,10 +748,26 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
         spent[0] += ms(t);
         ticks += 1;
 
-        // ---- the stage: rendered when the score moved ----
+        // ---- 1.000.036: the Flash members, on at their own frame rates; a changed picture is drawn
+        // into its sprite, and then the stage too ----
+        let mut flash_drew = false;
+        if !paused {
+            let t = Instant::now();
+            if let Ok(mut f) = flash.try_borrow_mut() {
+                if f.count() > 0 {
+                    wd.step(Step::Jobs);
+                    f.tick(dt);
+                    flash_drew = f.draw();
+                    wd.step(Step::Loop);
+                }
+            }
+            flash_ms += ms(t);
+        }
+
+        // ---- the stage: rendered when the score moved (or a Flash member) ----
         let t = Instant::now();
         let mut upload: Option<(u32, u32)> = None;
-        if stepped || picture.is_empty() {
+        if stepped || flash_drew || picture.is_empty() {
             wd.step(Step::Drawing);
             let (rgba, w, h) = player.render();
             wd.step(Step::Loop);
@@ -853,6 +944,18 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
                     vm_rust::rendering_gpu::softgl::threads()
                 ));
             }
+            // 1.000.036: the Flash members
+            if let Ok(mut f) = flash.try_borrow_mut() {
+                let (n, pictures, read_ms) = f.take_stats();
+                if n > 0 || pictures > 0 {
+                    say(&format!(
+                        "[Game] Shockwave Flash members: {n} playing; {pictures} pictures drawn; ms per loop {:.1}, read back {:.2} per picture",
+                        flash_ms / ticks.max(1) as f64,
+                        read_ms / pictures.max(1) as f64
+                    ));
+                }
+            }
+            flash_ms = 0.0;
             (ticks, steps, drawn) = (0, 0, 0);
             spent = [0.0; 3];
             last_stats = Instant::now();
@@ -870,9 +973,11 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
     let mut release = Vec::new();
     app.input.release_all(&mut release);
     release.extend(osk.release_all());
-    send_events(&mut player, &mut release).await;
+    send_events(&mut player, &mut release, &flash).await;
     drop(audio);
+    // the Flash members' players go with the movie (DirPlayer lets go of its host), then ours
     drop(player);
+    drop(flash);
     drop(wd);
     app.display.set_overlay(Scene::new());
     app.display.release_offscreen();
@@ -907,8 +1012,14 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
 }
 
 /// The input of this loop to the movie: keys as browser key events, the left button as its mouse.
-async fn send_events(player: &mut NativePlayer, events: &mut Vec<PlayerEvent>) {
+/// 1.000.036: keys go to the Flash sprite clicked last too (src/dirflash.rs).
+async fn send_events(player: &mut NativePlayer, events: &mut Vec<PlayerEvent>, flash: &Rc<RefCell<crate::dirflash::FlashMembers>>) {
     for e in events.drain(..) {
+        if matches!(e, PlayerEvent::KeyDown { .. } | PlayerEvent::KeyUp { .. } | PlayerEvent::TextInput { .. } | PlayerEvent::TextControl { .. }) {
+            if let Ok(mut f) = flash.try_borrow_mut() {
+                f.key(&e);
+            }
+        }
         match e {
             PlayerEvent::KeyDown { key } => {
                 if let Some((k, c)) = js_key(&key) {

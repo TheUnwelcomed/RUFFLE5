@@ -1,0 +1,395 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index a47c3df..d8b2ad4 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,45 +1,25 @@
+ [workspace]
++# PS5_RUFFLE_DIRPLAYER_FLASH_V1 (Ruffle5): only the crates Ruffle5 builds, which is all
++# tools/fetch-ruffle.sh copies into vendor/ruffle (the frontends, tests and tools stay out).
+ members = [
+     "core",
+     "core/macros",
+     "core/build_playerglobal",
+-    "desktop",
+     "swf",
+     "flv",
+-    "web",
+-    "web/packages/extension/safari",
+     "wstr",
+-    "scanner",
+-
+-    "exporter",
+-    "exporter/integration_tests",
+-
+-    "frontend-utils",
+ 
+     "render",
+-    "render/canvas",
+     "render/naga-agal",
+     "render/pixel_bender",
+-    "render/pixel_bender/assembly_tests",
+     "render/wgpu",
+-    "render/webgl",
+ 
+     "video",
+     "video/software",
+-    "video/external",
+-
+-    "tests",
+-    "tests/fs-tests-runner",
+-    "tests/input-format",
+-    "tests/socket-format",
+-    "tests/mocket",
+-    "tests/framework",
+ 
+     "tools/asc",
+-    "tools/fuzzer",
+-    "tools/stub-report",
+ ]
+-default-members = ["desktop"]
++default-members = ["core"]
+ resolver = "2"
+ 
+ [workspace.package]
+diff --git a/core/src/dirplayer.rs b/core/src/dirplayer.rs
+new file mode 100644
+index 0000000..0e94b88
+--- /dev/null
++++ b/core/src/dirplayer.rs
+@@ -0,0 +1,323 @@
++//! PS5_RUFFLE_DIRPLAYER_FLASH_V1 — what a Director (Shockwave) movie asks of its Flash members.
++//!
++//! Ruffle5 plays a Shockwave game's Flash cast members with Ruffle, one player per Flash sprite,
++//! the way DirPlayer's web front end does. These are the calls Lingo makes into a Flash movie
++//! through Director's Flash Asset Xtra: `getVariable` / `setVariable`, `callFunction` and the
++//! methods of a Flash object handle, `newObject`, the root timeline's frame and playing state,
++//! `callFrame`, and `hitTest` / `mouseOverButton`.
++//!
++//! The variable and function calls follow DirPlayer's own fork of Ruffle (github.com/chameleonxxl/
++//! ruffle, branch `dirplayer-integration`: `Player::get_variable`, `set_variable`, `call_function`,
++//! `Activation::store_and_convert_for_lingo`, `Player::dirplayer_hit_classify`), written again for
++//! this revision, with these differences:
++//!
++//! * `getVariable` answers a primitive as ActionScript's own `toString` makes it — the classic,
++//!   string-valued GetVariable a Director movie reaches the Flash player through (DirPlayer's
++//!   flashPlayerManager.ts `coerceFlashValue` stringifies the fork's answer the same way in
++//!   JavaScript) — and an object or movie clip as the path it was asked by, nothing stored;
++//! * an object a function returns is kept for later calls at `_root.__dirplayer_ref_N` (as in the
++//!   fork), a movie clip too (the fork answered null for one);
++//! * `newObject` makes the ActionScript object (DirPlayer's web build answers a handle to a path
++//!   nothing is at);
++//! * `callFrame` runs the frame's actions without moving the playhead, as ActionScript's `call()`
++//!   does (the web build goes to the frame and stops there);
++//! * no getter fallback (`getX()` answering property `x` when the method returns nothing).
++//!
++//! Every call runs through [`Player::update`], so the actions it queues (a `gotoAndStop`'s frame)
++//! run before it returns, as they do after a frame's own actions.
++// SPDX-License-Identifier: MIT OR Apache-2.0 (as the rest of Ruffle)
++
++use crate::avm1::{Activation, ActivationIdentifier, ArrayBuilder, ExecutionReason, Object, Value};
++use crate::backend::ui::MouseCursor;
++use crate::context::UpdateContext;
++use crate::display_object::{GotoInfo, HitTestOptions, MovieClip, StopOrPlay, TDisplayObject};
++use crate::events::PlayerEvent;
++use crate::player::Player;
++use crate::string::AvmString;
++use std::sync::atomic::{AtomicU32, Ordering};
++
++/// A value between Lingo and ActionScript.
++#[derive(Debug, Clone, PartialEq)]
++pub enum LingoValue {
++    Undefined,
++    Null,
++    Bool(bool),
++    Number(f64),
++    String(String),
++    /// An ActionScript object or movie clip: the path it is reached by in the movie
++    /// (`_level0.__dirplayer_ref_N` for one a function returned).
++    Object(String),
++    /// An ActionScript array.
++    List(Vec<LingoValue>),
++}
++
++/// The root timeline, as Director's Flash sprite properties read it.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct RootState {
++    pub current_frame: u16,
++    pub total_frames: u16,
++    pub frames_loaded: i32,
++    pub playing: bool,
++}
++
++/// Objects functions returned, kept at `_root.__dirplayer_ref_N` (the fork's numbering starts at 1000).
++static NEXT_REF: AtomicU32 = AtomicU32::new(1000);
++
++/// `_level0` as `_root`: DirPlayer roots a bare name at `_level0`, and flashPlayerManager.ts
++/// (`translateLevel0`) hands such a path to Ruffle as `_root`.
++pub fn root_path(path: &str) -> String {
++    match path.strip_prefix("_level0") {
++        Some(rest) => format!("_root{rest}"),
++        None => path.to_string(),
++    }
++}
++
++fn with_root<'gc, R>(
++    context: &mut UpdateContext<'gc>,
++    name: &'static str,
++    f: impl FnOnce(&mut Activation<'_, 'gc>) -> R,
++) -> Option<R> {
++    let root = context.stage.root_clip()?;
++    // A Flash member made for ActionScript 3 has no AVM1 to ask.
++    if root.movie().is_action_script_3() {
++        return None;
++    }
++    let mut activation = Activation::from_nothing(context, ActivationIdentifier::root(name), root);
++    Some(f(&mut activation))
++}
++
++fn root_clip<'gc>(context: &UpdateContext<'gc>) -> Option<MovieClip<'gc>> {
++    context.stage.root_clip().and_then(|r| r.as_movie_clip())
++}
++
++fn lookup<'gc>(activation: &mut Activation<'_, 'gc>, path: &str) -> Option<Value<'gc>> {
++    let name = AvmString::new_utf8(activation.gc(), root_path(path));
++    activation.get_variable(name).ok().map(Value::from)
++}
++
++/// A Lingo argument as an ActionScript value: an object handle is the object at its path.
++fn to_avm1<'gc>(activation: &mut Activation<'_, 'gc>, value: &LingoValue) -> Value<'gc> {
++    match value {
++        LingoValue::Undefined => Value::Undefined,
++        LingoValue::Null => Value::Null,
++        LingoValue::Bool(b) => (*b).into(),
++        LingoValue::Number(n) => (*n).into(),
++        LingoValue::String(s) => AvmString::new_utf8(activation.gc(), s.as_str()).into(),
++        LingoValue::Object(path) => lookup(activation, path).unwrap_or(Value::Undefined),
++        LingoValue::List(items) => {
++            let values: Vec<Value<'gc>> = items.iter().map(|i| to_avm1(activation, i)).collect();
++            ArrayBuilder::new(activation).with(values).into()
++        }
++    }
++}
++
++/// An ActionScript answer for Lingo: an array element by element, an object (or movie clip) kept
++/// at `_root.__dirplayer_ref_N` so later calls reach it.
++fn to_lingo<'gc>(activation: &mut Activation<'_, 'gc>, value: Value<'gc>) -> LingoValue {
++    match value {
++        Value::Undefined => LingoValue::Undefined,
++        Value::Null => LingoValue::Null,
++        Value::Bool(b) => LingoValue::Bool(b),
++        Value::Number(n) => LingoValue::Number(n),
++        Value::String(s) => LingoValue::String(s.to_string()),
++        Value::Object(o) if o.is_native_array() => {
++            let length = o.length(activation).unwrap_or(0).max(0);
++            let mut items = Vec::with_capacity(length as usize);
++            for i in 0..length {
++                let element = o.get_element(activation, i);
++                items.push(to_lingo(activation, element));
++            }
++            LingoValue::List(items)
++        }
++        Value::Object(_) | Value::MovieClip(_) => {
++            let n = NEXT_REF.fetch_add(1, Ordering::Relaxed);
++            let at = AvmString::new_utf8(activation.gc(), format!("_root.__dirplayer_ref_{n}"));
++            if activation.set_variable(at, value).is_err() {
++                return LingoValue::Null;
++            }
++            LingoValue::Object(format!("_level0.__dirplayer_ref_{n}"))
++        }
++    }
++}
++
++impl Player {
++    /// `getVariable(sprite, path)`: a primitive as ActionScript's `toString` makes it, an object
++    /// or movie clip as `Object(path)`, Undefined when there is nothing there.
++    pub fn dirplayer_get_variable(&mut self, path: &str) -> LingoValue {
++        self.update(|context| {
++            with_root(context, "[Director getVariable]", |activation| match lookup(activation, path) {
++                None | Some(Value::Undefined) => LingoValue::Undefined,
++                Some(Value::Null) => LingoValue::Null,
++                Some(Value::Object(_) | Value::MovieClip(_)) => LingoValue::Object(path.to_string()),
++                Some(v) => match v.coerce_to_string(activation) {
++                    Ok(s) => LingoValue::String(s.to_string()),
++                    Err(_) => LingoValue::Undefined,
++                },
++            })
++            .unwrap_or(LingoValue::Undefined)
++        })
++    }
++
++    /// `setVariable(sprite, path, value)`: the variable becomes the string, as Director sets it.
++    pub fn dirplayer_set_variable(&mut self, path: &str, value: &str) -> bool {
++        self.update(|context| {
++            with_root(context, "[Director setVariable]", |activation| {
++                let name = AvmString::new_utf8(activation.gc(), root_path(path));
++                let value = AvmString::new_utf8(activation.gc(), value);
++                activation.set_variable(name, value.into()).is_ok()
++            })
++            .unwrap_or(false)
++        })
++    }
++
++    /// `callFunction` and a Flash object handle's methods: `path` is the object's path, a dot, and
++    /// the function's name (`_root.mcLoading.gotoAndStop`). The function is called with the object
++    /// as `this`.
++    pub fn dirplayer_call_function(&mut self, path: &str, args: &[LingoValue]) -> LingoValue {
++        self.update(|context| {
++            with_root(context, "[Director callFunction]", |activation| {
++                let Some(dot) = path.rfind('.') else {
++                    return LingoValue::Undefined;
++                };
++                let (object_path, function_name) = (&path[..dot], &path[dot + 1..]);
++                let avm_args: Vec<Value<'_>> = args.iter().map(|a| to_avm1(activation, a)).collect();
++                let name = AvmString::new_utf8(activation.gc(), function_name);
++                // As the fork: the function found at the whole path, called on the object it was
++                // found on (not for a kept object: those are called as its method, below).
++                if !object_path.contains("__dirplayer_ref_") {
++                    let full = AvmString::new_utf8(activation.gc(), root_path(path));
++                    if let Ok(callable) = activation.get_variable(full) {
++                        let this: Value<'_> = match lookup(activation, object_path) {
++                            Some(v @ Value::Object(_)) => v,
++                            Some(v @ Value::MovieClip(_)) => match v.as_object(activation) {
++                                Some(o) => o.into(),
++                                None => activation.global_object().into(),
++                            },
++                            _ => activation.global_object().into(),
++                        };
++                        if let Ok(result) = callable.call_with_default_this(this, name, activation, &avm_args) {
++                            return to_lingo(activation, result);
++                        }
++                    }
++                }
++                let object: Option<Object<'_>> = lookup(activation, object_path).and_then(|v| v.as_object(activation));
++                match object.map(|o| o.call_method(name, &avm_args, activation, ExecutionReason::FunctionCall)) {
++                    Some(Ok(result)) => to_lingo(activation, result),
++                    _ => LingoValue::Undefined,
++                }
++            })
++            .unwrap_or(LingoValue::Undefined)
++        })
++    }
++
++    /// `newObject(sprite, "class", args)`: `new class(args)`, kept at `store_at`.
++    pub fn dirplayer_new_object(&mut self, class: &str, args: &[LingoValue], store_at: &str) -> bool {
++        self.update(|context| {
++            with_root(context, "[Director newObject]", |activation| {
++                let Some(Value::Object(constructor)) = lookup(activation, class) else {
++                    return false;
++                };
++                let avm_args: Vec<Value<'_>> = args.iter().map(|a| to_avm1(activation, a)).collect();
++                let object = match constructor.construct(activation, &avm_args) {
++                    Ok(v @ (Value::Object(_) | Value::MovieClip(_))) => v,
++                    _ => return false,
++                };
++                let at = AvmString::new_utf8(activation.gc(), root_path(store_at));
++                activation.set_variable(at, object).is_ok()
++            })
++            .unwrap_or(false)
++        })
++    }
++
++    /// The root timeline's frame, frame count and playing state.
++    pub fn dirplayer_root(&mut self) -> Option<RootState> {
++        self.mutate_with_update_context(|context| {
++            let mc = root_clip(context)?;
++            Some(RootState {
++                current_frame: mc.current_frame(),
++                total_frames: mc.header_frames(),
++                frames_loaded: mc.frames_loaded(),
++                playing: mc.playing(),
++            })
++        })
++    }
++
++    /// The root timeline to a frame (1-based), stopped there or playing on.
++    pub fn dirplayer_goto(&mut self, frame: u16, stop: bool) {
++        self.update(|context| {
++            if let Some(mc) = root_clip(context) {
++                let stop_or_play = if stop { StopOrPlay::Stop } else { StopOrPlay::Play };
++                mc.goto_frame(context, GotoInfo { frame, stop_or_play });
++            }
++        })
++    }
++
++    /// The root timeline plays on from where it is (clearing a `stop()` of its own).
++    pub fn dirplayer_play(&mut self) {
++        self.update(|context| {
++            if let Some(mc) = root_clip(context) {
++                mc.play();
++            }
++        })
++    }
++
++    /// The root timeline stops where it is; the player goes on (it still draws and plays sound).
++    pub fn dirplayer_stop(&mut self) {
++        self.update(|context| {
++            if let Some(mc) = root_clip(context) {
++                mc.stop(context);
++            }
++        })
++    }
++
++    /// `callFrame(sprite, frame)`: the actions of a root frame (a number or a label) run, the
++    /// playhead stays. False when there is no such frame.
++    pub fn dirplayer_call_frame(&mut self, frame: &str) -> bool {
++        self.update(|context| {
++            with_root(context, "[Director callFrame]", |activation| {
++                let Some(mc) = activation.base_clip().as_movie_clip() else {
++                    return false;
++                };
++                let number = match frame.trim().parse::<u32>() {
++                    Ok(n) if n >= 1 && n <= u16::MAX as u32 => Some(n as u16),
++                    Ok(_) => None,
++                    Err(_) => {
++                        let label = crate::string::WString::from_utf8(frame);
++                        mc.frame_label_to_number(&label, activation.context)
++                    }
++                };
++                let Some(number) = number else {
++                    return false;
++                };
++                for action in mc.actions_on_frame(number) {
++                    let _ = activation.run_child_frame_for_action("[Frame Call]", mc.into(), action);
++                }
++                true
++            })
++            .unwrap_or(false)
++        })
++    }
++
++    /// Director's Flash `hitTest(point)`, and `mouseOverButton` (the `#button` answer): what is
++    /// under a point of the player's viewport. 0 `#background`, 1 `#normal`, 2 `#button`,
++    /// 3 `#editText`. The mouse is moved there first, so a button's hover state is the one there
++    /// (the fork's `dirplayer_hit_classify`).
++    pub fn dirplayer_hit_classify(&mut self, x: f64, y: f64) -> u8 {
++        self.handle_event(PlayerEvent::MouseMove { x, y });
++        if !self.mouse_in_stage() {
++            return 0;
++        }
++        match self.mouse_cursor() {
++            MouseCursor::Hand => 2,
++            MouseCursor::IBeam => 3,
++            _ => {
++                let hit = self.mutate_with_update_context(|context| {
++                    let point = *context.mouse_position;
++                    let stage = context.stage;
++                    stage.hit_test_shape(context, point, HitTestOptions::AVM_HIT_TEST)
++                });
++                u8::from(hit)
++            }
++        }
++    }
++}
+diff --git a/core/src/lib.rs b/core/src/lib.rs
+index d76c1cb..dd485aa 100644
+--- a/core/src/lib.rs
++++ b/core/src/lib.rs
+@@ -54,6 +54,8 @@ pub mod compatibility_rules;
+ pub mod config;
+ #[cfg(feature = "egui")]
+ pub mod debug_ui;
++/// PS5_RUFFLE_DIRPLAYER_FLASH_V1 (Ruffle5): what a Director movie asks of its Flash members.
++pub mod dirplayer;
+ pub mod external;
+ pub mod i18n;
+ pub mod stub;

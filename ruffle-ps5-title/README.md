@@ -91,6 +91,8 @@ two settings can be compared on the same game.
 | `src/navigator.rs` | where a Flash game's files come from: beside the movie, and (a Flashpoint game) by web address from its game data's `content/` (1.000.033), or from Flashpoint's server (1.000.034) |
 | `src/fpfetch.rs` | a Flashpoint game's files that are not on the console: asked of Flashpoint's server when the game asks for them, and kept (1.000.034) |
 | `src/pretend.rs` | Pretend to be on for Flash and Shockwave games, and its Automatic choice: the site the game's own file names (1.000.035) |
+| `src/dirflash.rs` | a Shockwave game's Flash cast members: a Ruffle player per Flash sprite, drawn into the sprite, talking with Lingo as through Director's Flash Asset Xtra (1.000.036) |
+| `tools/fetch-ruffle.sh`, `tools/ruffle-dirplayer.patch` | Ruffle's crates at the pinned revision in `vendor/ruffle`, with what Lingo asks of a Flash member (`core/src/dirplayer.rs`) (1.000.036) |
 | `src/fsutil.rs` | writing files safely; removing a game's folder with the calls the console allows a title (no `lstat`, 1.000.034), or moving it to `games/.ruffle5-trash` when it refuses (1.000.032) |
 | `src/watchdog.rs` | names the step of a game's loop that takes 5 s or more, in ruffle.log (1.000.032) |
 | `src/background.rs` | the menu's moving background: ruffle.rs's logo animation, played by Ruffle at the display's size |
@@ -232,6 +234,52 @@ game data (`http://host/path` → `content/host/path`, `set_web_root`); nothing 
 `dcr-probe/` (at the repository root) runs a movie in DirPlayer on a PC or server and saves the
 stage as PNGs — for checking a game before it goes on the console (`DCR_PROBE_LAUNCH`,
 `DCR_PROBE_ADDRESS` and `DCR_PROBE_WEBROOT` start it as a Flashpoint game).
+
+### Flash cast members (1.000.036)
+
+A Director movie can hold Flash movies as cast members, and Lingo works them through Director's
+Flash Asset Xtra: it reads and sets their ActionScript variables (`getVariable`, `setVariable`,
+`sprite(n).someVariable`), calls their functions (`callFunction`, a Flash object handle's methods:
+`getVariable(sprite(n), "_level0", 0).mcLoading.gotoAndStop(101)`), moves their timelines
+(`gotoFrame`, `sprite.frame`, `play`, `stop`, `rewind`, `callFrame`), makes ActionScript objects in
+them (`newObject`) and asks what is under the mouse (`hitTest`, `mouseOverButton`); they answer
+with `getURL("event:…")`, `getURL("lingo:…")` and `fscommand`. Game loaders and menus are made
+this way: Miniclip's loader (in front of Golfish, Golf Ace, Paul Blart) waits for its Flash intro's
+`isReady`, Paul Blart's frame 6 waits for its Flash check's `getURL("event:flash_start_game")` and
+its menus are Flash. Until 1.000.036 such a member drew nothing and answered nothing.
+
+Ruffle5 plays them the way DirPlayer's web front end does (its `flashPlayerManager.ts`), with the
+Ruffle it plays Flash games with (`src/dirflash.rs`):
+
+* a Flash sprite gets a Ruffle player of its own when DirPlayer shows the member; its first frame
+  runs at once, then the Lingo calls made for the sprite before it was there (kept, in order, as the
+  web build keeps them); it goes when the sprite stops showing the member;
+* it is drawn on the GPU at the sprite's size on the stage, never below the Flash movie's own,
+  transparent where the movie draws nothing, read back and put in the sprite with the sprite's
+  ink and blend; between score frames the players run at their own frame rates, and a picture
+  that changed is drawn into the stage again;
+* clicks on a Flash sprite reach its movie (as on the web) and so do the mouse's moves over it
+  (its buttons light up); keys go to the Flash sprite clicked last;
+* its sound is mixed with the movie's; it loads what it asks for as a Flash game does (the game's
+  folder, its web root, Flashpoint's server for a Flashpoint game) and keeps its SharedObjects in
+  the game's saves (`flash/`); it runs ActionScript under Settings' script time limit;
+* a Flash member whose `fileName` is set to an address gets that movie once it has been fetched
+  (the web build leaves it empty unless `preloadNetThing` fetched it first); Miniclip's loader
+  sets its intro's to `http://www.miniclip.com/swfcontent/components/intro_as2.swf`, which plays
+  where the game's data or Flashpoint's server has that file;
+* what Lingo asks goes to `core/src/dirplayer.rs`, added to Ruffle by `tools/ruffle-dirplayer.patch`
+  (`tools/fetch-ruffle.sh`, run by `build-title.sh`, puts the pinned Ruffle in `vendor/ruffle`
+  and Cargo.toml builds Ruffle from there). It follows DirPlayer's own fork of Ruffle: a variable
+  is answered as a string, as the classic GetVariable gives it (ActionScript's `toString`), an
+  object or movie clip as a handle; an object a function returns is kept in the movie
+  (`_root.__dirplayer_ref_N`) for later calls; `newObject` makes the object (the web build answers
+  a handle to nothing); `callFrame` runs a frame's actions and leaves the playhead (the web build
+  goes to the frame); `sprite.playing` is FALSE when Lingo stopped the sprite or the movie's root
+  timeline stopped itself.
+
+Not there yet: `setCallback` (a Lingo handler run when an ActionScript object's method is called),
+a LocalConnection between a Director movie and its Flash members, `convert(#image, …)` of a
+BitmapData, and Lingo reading the variables of a Flash member made for ActionScript 3 (it plays).
 
 ### Shockwave 3D (1.000.030)
 

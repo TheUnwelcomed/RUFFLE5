@@ -135,6 +135,18 @@
 //! games Off deletes only a game fetched in this run (1.000.034 also deleted games fetched before:
 //! Pacman).
 //!
+//! 1.000.036 (2026-10-28): Flash inside Shockwave. A Director movie's Flash cast members play, each
+//! with a Ruffle player of its own (src/dirflash.rs), drawn on the GPU into the sprite, their sound
+//! mixed with the movie's, and Lingo and they talk as through Director's Flash Asset Xtra:
+//! getVariable / setVariable, callFunction and a Flash object handle's methods, newObject, the
+//! timeline (gotoFrame, frame, play, stop, rewind, callFrame), hitTest / mouseOverButton, and
+//! back `getURL("event:…")`, `getURL("lingo:…")` and fscommand. DirPlayer's Flash bridge off the
+//! web goes to a Flash host (vm-rust player/flash_host.rs); Ruffle gets what Lingo asks
+//! (core/src/dirplayer.rs, tools/ruffle-dirplayer.patch, applied by tools/fetch-ruffle.sh into
+//! vendor/ruffle). A Flash member whose fileName is set to an address gets the movie once fetched.
+//! Paul Blart's Flash check and menus (its white screen since 1.000.033) and Miniclip's game
+//! loader (Golfish, Golf Ace: its intro) are what this is for.
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -142,7 +154,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.035";
+pub const APP_VERSION: &str = "1.000.036";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 
@@ -164,6 +176,8 @@ mod cursor;
 mod dir3d;
 #[cfg(feature = "ruffle")]
 mod dirinfo;
+#[cfg(feature = "ruffle")]
+mod dirflash;
 #[cfg(feature = "ruffle")]
 mod fpfetch;
 #[cfg(feature = "ruffle")]

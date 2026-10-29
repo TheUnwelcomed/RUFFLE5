@@ -85,6 +85,17 @@ wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }
 wgpu-types = { path = "vendor/wgpu/wgpu-types" }
 naga = { path = "vendor/wgpu/naga" }
 
+# 1.000.036: Ruffle with what a Director (Shockwave) movie asks of its Flash cast members — their
+# variables, functions and timelines — in core/src/dirplayer.rs (tools/ruffle-dirplayer.patch).
+# build-title.sh puts the revision pinned above in vendor/ruffle (tools/fetch-ruffle.sh: the crates
+# Ruffle5 builds, from cargo's own checkout of it or fetched) and patches it. The crates the title
+# names come from that tree, and with them the rest of Ruffle's, which they name by path.
+[patch."https://github.com/ruffle-rs/ruffle"]
+ruffle_core = { path = "vendor/ruffle/core" }
+ruffle_render = { path = "vendor/ruffle/render" }
+ruffle_render_wgpu = { path = "vendor/ruffle/render/wgpu" }
+ruffle_video_software = { path = "vendor/ruffle/video/software" }
+
 [profile.release]
 panic = "abort"
 # Speed over size (2026-10-24): ActionScript-heavy games spend their time in Ruffle's interpreter on
