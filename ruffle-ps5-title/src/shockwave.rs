@@ -455,10 +455,16 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
             say("     files not here are asked of Flashpoint's server");
         }
     }
+    // 1.000.037: a projector (mallcop.exe) is started by the movie inside it (src/dirinfo.rs); it
+    // runs where it is, as on a PC, so no site is pretended for it
+    let projector = crate::dirinfo::projector(&path);
+    if let Some(p) = projector {
+        say(&format!("     projector: its movie, {} bytes at {}, played from {}", p.len, p.offset, path.rsplit('/').next().unwrap_or(&path)));
+    }
     // 1.000.035: Pretend to be on, as for Flash games, when the game has no address of its own
     // (`the moviePath` / `the movieName` say the site's; the files under it are read from the
     // movie's folder): a chosen site, or Automatic — the site the movie names (src/pretend.rs)
-    if launch.as_ref().and_then(|l| l.url.as_ref()).is_none() {
+    if launch.as_ref().and_then(|l| l.url.as_ref()).is_none() && projector.is_none() {
         let (a, line) = crate::pretend::address(&app.settings, &path, true);
         if let Some(line) = line {
             say(&line);
@@ -472,7 +478,11 @@ async fn run(app: &mut App, gi: usize, shown: Instant) -> GameEnd {
     let flash_mixers = crate::dirflash::Mixers::default();
     let flash = flash_members(app, &path, &key, launch.as_ref(), movie_address.clone(), flash_mixers.clone());
     vm_rust::player::flash_host::set_host(Some(Box::new(crate::dirflash::MemberHost(Rc::clone(&flash)))));
-    if let Err(e) = player.load(&path).await {
+    let loaded = match projector.and_then(|_| crate::dirinfo::projector_movie(&path)) {
+        Some(movie) => player.load_bytes(movie, &path).await,
+        None => player.load(&path).await,
+    };
+    if let Err(e) = loaded {
         say(&format!("FAIL {name}: {e}"));
         app.menu.toast(&format!("{name}: {e}"));
         drop(player);

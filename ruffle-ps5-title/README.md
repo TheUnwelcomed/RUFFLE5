@@ -88,6 +88,7 @@ two settings can be compared on the same game.
 | `net/` | `r5net`, its own crate: HTTPS on the console's sockets (rustls + RustCrypto, Mozilla's roots), the three sources' APIs and pages, a zip reader for Flashpoint's game data; `examples/online-check.rs`, `examples/fetch.rs` |
 | `src/game.rs` | one game: loading screen, the player and its options, quick menu, overlay, the frame-time log |
 | `src/dir3d.rs` | which Director games have Shockwave 3D (the menu's categories, 1.000.033) |
+| `src/dirinfo.rs` | what the menu says of a Director game and which file in its folder starts it: `Projector.ini`'s movie, the movie inside a Windows projector (`mallcop.exe`, 1.000.037), else its `.dcr` |
 | `src/navigator.rs` | where a Flash game's files come from: beside the movie, and (a Flashpoint game) by web address from its game data's `content/` (1.000.033), or from Flashpoint's server (1.000.034) |
 | `src/fpfetch.rs` | a Flashpoint game's files that are not on the console: asked of Flashpoint's server when the game asks for them, and kept (1.000.034) |
 | `src/pretend.rs` | Pretend to be on for Flash and Shockwave games, and its Automatic choice: the site the game's own file names (1.000.035) |
@@ -146,9 +147,12 @@ Lingo; Ruffle5 plays them with [DirPlayer](https://github.com/igorlira/dirplayer
 player in Rust, built into the title (`src/shockwave.rs`):
 
 * put a `.dcr` in the games folder, or a game's whole folder (movie, `.cct` casts, `Xtras/`,
-  `Projector.ini`): the menu lists the folder as one game, started by the movie its
-  `Projector.ini` names (`[Movies] Movie01=`), else its only `.dcr`; its controls are
-  `Custom Mappings/<folder name>.controls.txt`;
+  `Projector.ini`, a projector): the menu lists the folder as one game, started by the movie its
+  `Projector.ini` names (`[Movies] Movie01=`), else by the movie inside its Windows projector
+  (1.000.037: a `.exe` with a Director movie appended — Paul Blart: Mall Cop's `mallcop.exe` holds a
+  6 KB movie that mounts Miniclip's loader casts and goes to `paul_blart.dcr`; started on
+  `gameloader.dcr`, the first `.dcr` by name, the folder showed the web loader's white screen),
+  else its only `.dcr`; its controls are `Custom Mappings/<folder name>.controls.txt`;
 * the stage is rendered on the CPU and scaled to the TV: Settings › Display › Scale mode
   *Unscaled* = whole multiples (every pixel the same size), *Zoom to Fit*/*Crop* = as large as fits,
   *Stretch* = the whole screen; Quality Low/Medium = sharp pixels, High and up = smooth;

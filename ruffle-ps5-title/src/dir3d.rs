@@ -283,7 +283,9 @@ impl Cache {
     /// A game: its movie, and when it is in a folder of its own every Director file beside it.
     pub fn game(&mut self, movie: &str, own_folder: bool, report: &mut Vec<String>) -> bool {
         let movie = Path::new(movie);
-        if self.file(movie, report) == Some(true) {
+        // (1.000.037: a projector, mallcop.exe, is not read: the movies beside it are)
+        let is_file = is_director_file(&movie.file_name().unwrap_or_default().to_string_lossy());
+        if is_file && self.file(movie, report) == Some(true) {
             return true;
         }
         if !own_folder {

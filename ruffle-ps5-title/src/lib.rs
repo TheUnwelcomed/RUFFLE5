@@ -147,6 +147,14 @@
 //! Paul Blart's Flash check and menus (its white screen since 1.000.033) and Miniclip's game
 //! loader (Golfish, Golf Ace: its intro) are what this is for.
 //!
+//! 1.000.037 (2026-10-29): a game folder with a Director projector (mallcop.exe) is started by the
+//! movie inside the program (src/dirinfo.rs), as the projector starts it: Paul Blart's folder was
+//! started on gameloader.dcr, Miniclip's web loader, which waited for an intro from miniclip.com
+//! and a game address it never had (the white screen of 1.000.036's console run); the projector's
+//! 6 KB movie mounts the loader's casts and goes to paul_blart.dcr. DirPlayer: `the volume of
+//! sound N` can be read (3D Pool's PlayMusic stopped its movie on it), `sqrt` of a negative number
+//! is NaN, not a script error (DQ Minigolf stopped in a beginSprite).
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -154,7 +162,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.036";
+pub const APP_VERSION: &str = "1.000.037";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 
