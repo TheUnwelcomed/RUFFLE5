@@ -355,6 +355,7 @@ impl FlashMembers {
             .with_storage((self.setup.storage)())
             .with_ui(NullUiBackend::new())
             .with_fs_commands(Box::new(MemberFsCommands { cast: (cast_lib, cast_member), sprite, logged: Arc::clone(&self.calls_logged), log }))
+            .with_log(MemberLog { cast: (cast_lib, cast_member), sprite, logged: Arc::clone(&self.calls_logged), log })
             .with_movie(movie)
             .with_viewport_dimensions(render.0, render.1, 1.0)
             .with_scale_mode(StageScaleMode::ShowAll, false)
@@ -842,6 +843,24 @@ struct MemberFsCommands {
     log: fn(&str),
 }
 
+/// 1.000.038: a member's `trace()` output in ruffle.log (counted with the calls to Lingo, the
+/// same cap): what a loader or menu is waiting for is usually said there.
+struct MemberLog {
+    cast: (i32, i32),
+    sprite: i32,
+    logged: Arc<Mutex<u32>>,
+    log: fn(&str),
+}
+
+impl ruffle_core::backend::log::LogBackend for MemberLog {
+    fn avm_trace(&self, message: &str) {
+        log_call(&self.logged, self.log, &format!("     flash: sprite {} (member {}:{}) trace: {message}", self.sprite, self.cast.0, self.cast.1));
+    }
+    fn avm_warning(&self, message: &str) {
+        log_call(&self.logged, self.log, &format!("     flash: sprite {} (member {}:{}) warning: {message}", self.sprite, self.cast.0, self.cast.1));
+    }
+}
+
 impl FsCommandProvider for MemberFsCommands {
     fn on_fs_command(&self, command: &str, args: &str) -> bool {
         let (command, args) = (command.trim(), args.trim());
@@ -1020,13 +1039,15 @@ mod tests {
             ]
         );
 
-        // getVariable: a primitive as ActionScript's toString makes it, an object by its path
-        assert_eq!(host.get_variable(5, "_level0.n"), text("3"));
-        assert_eq!(host.get_variable(5, "_level0.b"), text("true"));
+        // getVariable: a primitive as it is (DirPlayer writes it as Flash's String() does for
+        // `returnAsString`, the default, and hands it over typed for `returnAsString 0`), an
+        // object by its path
+        assert_eq!(host.get_variable(5, "_level0.n"), FlashValue::Number(3.0));
+        assert_eq!(host.get_variable(5, "_level0.b"), FlashValue::Bool(true));
         assert_eq!(host.get_variable(5, "_level0.o"), FlashValue::Object("_level0.o".into()));
-        assert_eq!(host.get_variable(5, "_level0.o.x"), text("5"));
+        assert_eq!(host.get_variable(5, "_level0.o.x"), FlashValue::Number(5.0));
         assert_eq!(host.get_variable(5, "_level0.nothing"), FlashValue::Undefined);
-        assert_eq!(host.get_variable(5, "/:n"), text("3"), "Flash 4 paths, as getFlashProperty uses");
+        assert_eq!(host.get_variable(5, "/:n"), FlashValue::Number(3.0), "Flash 4 paths, as getFlashProperty uses");
 
         // functions: typed answers, `this` the object, objects kept for later calls
         assert_eq!(host.call_function(5, "_level0.o.add", &[FlashValue::Number(1.0), FlashValue::Number(2.0)]), FlashValue::Number(8.0));
@@ -1040,7 +1061,7 @@ mod tests {
 
         // newObject: the object is made, where the handle says
         assert!(host.new_object(5, "Array", &[FlashValue::Number(1.0), FlashValue::Number(2.0), FlashValue::Number(3.0)], "_root.__dpObj_Array_1"));
-        assert_eq!(host.get_variable(5, "_level0.__dpObj_Array_1.length"), text("3"));
+        assert_eq!(host.get_variable(5, "_level0.__dpObj_Array_1.length"), FlashValue::Number(3.0));
         assert!(host.new_object(5, "Object", &[], "_root.__dpObj_Object_2"));
         assert!(host.set_variable(5, "_root.__dpObj_Object_2.y", "7"));
         assert_eq!(host.get_variable(5, "_level0.__dpObj_Object_2.y"), text("7"));

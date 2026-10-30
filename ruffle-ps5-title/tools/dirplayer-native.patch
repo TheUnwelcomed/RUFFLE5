@@ -824,7 +824,7 @@ index 6ce9e980..ed6cb3ed 100644
          self.state = CastLibState::None;
      }
 diff --git a/vm-rust/src/player/cast_member.rs b/vm-rust/src/player/cast_member.rs
-index 1f66939a..b0b12337 100644
+index 1f66939a..c4284288 100644
 --- a/vm-rust/src/player/cast_member.rs
 +++ b/vm-rust/src/player/cast_member.rs
 @@ -1025,6 +1025,9 @@ pub struct FilmLoopMember {
@@ -837,7 +837,17 @@ index 1f66939a..b0b12337 100644
  }
  
  /// A Linked Movie cast member (`#movie`) — references an external Director
-@@ -5211,7 +5214,7 @@ impl CastMember {
+@@ -2710,6 +2713,9 @@ pub struct RestingContact {
+     pub ground_friction: f64,
+     pub aabb_min: [f64; 3],
+     pub aabb_max: [f64; 3],
++    /// The surface's model, the contact partner the step reports while the body
++    /// is held on it
++    pub mesh_name: Symbol,
+ }
+ 
+ #[derive(Clone, Debug)]
+@@ -5211,7 +5217,7 @@ impl CastMember {
          let payload = &raw[flsh_start + 8..];
          let vector_member = Self::parse_flsh_payload(payload);
  
@@ -846,7 +856,7 @@ index 1f66939a..b0b12337 100644
              &format!(
                  "OLE member #{} identified as vectorShape: {} vertices, strokeWidth={}, fillMode={}, closed={}, bbox=({},{},{},{})",
                  number,
-@@ -6486,7 +6489,7 @@ impl CastMember {
+@@ -6486,7 +6492,7 @@ impl CastMember {
                          name: member_info.name.clone(),
                      })
                  } else {
@@ -855,7 +865,7 @@ index 1f66939a..b0b12337 100644
                      CastMemberType::Unknown
                  }
              }
-@@ -6686,7 +6689,7 @@ impl CastMember {
+@@ -6686,7 +6692,7 @@ impl CastMember {
                                  Some(std::rc::Rc::new(scene))
                              }
                              Err(e) => {
@@ -864,7 +874,7 @@ index 1f66939a..b0b12337 100644
                                  Some(std::rc::Rc::new(Self::create_empty_w3d_scene()))
                              }
                          }
-@@ -7025,6 +7028,7 @@ impl CastMember {
+@@ -7025,6 +7031,7 @@ impl CastMember {
                          current_frame: 1, // Start at frame 1
                          initial_rect,
                          cached_total_frames: Some(total_frames),
@@ -872,7 +882,7 @@ index 1f66939a..b0b12337 100644
                      })
                  } else {
                      warn!("FilmLoop {} has no valid score chunk, creating empty film loop", number);
-@@ -7045,6 +7049,7 @@ impl CastMember {
+@@ -7045,6 +7052,7 @@ impl CastMember {
                          current_frame: 1,
                          initial_rect: super::geometry::IntRect { left: 0, top: 0, right: 0, bottom: 0 },
                          cached_total_frames: None,
@@ -1024,10 +1034,10 @@ index 184a4962..d35d06e5 100644
                          handler_name, sprite_number, err.message
 diff --git a/vm-rust/src/player/flash_host.rs b/vm-rust/src/player/flash_host.rs
 new file mode 100644
-index 00000000..28589f1f
+index 00000000..e3bf1ab3
 --- /dev/null
 +++ b/vm-rust/src/player/flash_host.rs
-@@ -0,0 +1,525 @@
+@@ -0,0 +1,556 @@
 +//! PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.036): Flash cast members off the web.
 +//!
 +//! On the web, DirPlayer's front end gives each Flash sprite a Ruffle player in the page
@@ -1104,6 +1114,37 @@ index 00000000..28589f1f
 +            _ => None,
 +        }
 +    }
++
++    /// The value as Flash's `String()` writes it — what Director's getVariable returns by
++    /// default (returnAsString TRUE): "true" / "false", a whole number without a point, else the
++    /// shortest decimal. None for an object, a list, null and undefined.
++    pub fn flash_string(&self) -> Option<String> {
++        match self {
++            FlashValue::String(s) => Some(s.clone()),
++            FlashValue::Bool(b) => Some(if *b { "true".into() } else { "false".into() }),
++            FlashValue::Number(n) => Some(if n.is_nan() {
++                "NaN".into()
++            } else if n.fract() == 0.0 && n.abs() < 1e15 {
++                format!("{}", *n as i64)
++            } else {
++                format!("{n}")
++            }),
++            _ => None,
++        }
++    }
++
++    /// The value as Director's getVariable returns it with returnAsString FALSE: a Boolean as
++    /// 1 / 0, a whole number as an integer, another number as a float, a string as itself. None
++    /// for an object, a list, null and undefined (an object handle then).
++    pub fn lingo_value(&self) -> Option<crate::director::lingo::datum::Datum> {
++        use crate::director::lingo::datum::Datum;
++        match self {
++            FlashValue::String(s) => Some(Datum::String(s.clone())),
++            FlashValue::Bool(b) => Some(Datum::Int(if *b { 1 } else { 0 })),
++            FlashValue::Number(n) => Some(if n.fract() == 0.0 && n.abs() < i32::MAX as f64 { Datum::Int(*n as i32) } else { Datum::Float(*n) }),
++            _ => None,
++        }
++    }
 +}
 +
 +/// A mouse event for a Flash sprite (`dirplayer_ruffleDispatchMouse`'s "move", "down", "up"), and
@@ -1155,9 +1196,9 @@ index 00000000..28589f1f
 +    fn frame_count(&mut self, sprite: i32) -> i32;
 +    /// `getCurrentFrame`.
 +    fn current_frame(&mut self, sprite: i32) -> i32;
-+    /// `getVariable`: Null when the sprite has no player yet; else a primitive as a String (as
-+    /// the classic GetVariable gives it), an object as `Object(path)`, Undefined when there is
-+    /// nothing at the path.
++    /// `getVariable`: Null when the sprite has no player yet; else a primitive as it is (the
++    /// caller writes it as Flash's String() does when `returnAsString` asks for text), an object
++    /// as `Object(path)`, Undefined when there is nothing at the path.
 +    fn get_variable(&mut self, sprite: i32, path: &str) -> FlashValue;
 +    /// `setVariable`: the variable becomes the string (queued until the sprite plays).
 +    fn set_variable(&mut self, sprite: i32, path: &str, value: &str) -> bool;
@@ -1657,6 +1698,89 @@ index a6ac50b8..d916a8ec 100644
  pub async fn player_load_system_font(path: &str) {
      let window = web_sys::window().unwrap();
      let result = JsFuture::from(window.fetch_with_str(path)).await;
+diff --git a/vm-rust/src/player/handlers/datum_handlers/cast_member/bitmap.rs b/vm-rust/src/player/handlers/datum_handlers/cast_member/bitmap.rs
+index 03f1461f..02257fa9 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/cast_member/bitmap.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/cast_member/bitmap.rs
+@@ -91,11 +91,78 @@ impl BitmapMemberHandlers {
+         }
+     }
+ 
++    /// PS5_RUFFLE_DIRPLAYER_NATIVE (Ruffle5 1.000.038): the member's picture replaced by an image
++    /// file's (PNG, JPEG, GIF, BMP: what the `image` crate reads), as `importFileInto` replaces it:
++    /// 32-bit RGBA, the member's size and regPoint (centred) after it. Err: what went wrong.
++    pub fn replace_with_image_bytes(player: &mut DirPlayer, member_ref: &CastMemberRef, bytes: &[u8], trim_white_space: bool) -> Result<(u16, u16), String> {
++        use crate::player::bitmap::bitmap::Bitmap;
++        use crate::player::cast_member::CastMemberType;
++        let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?.to_rgba8();
++        let (w, h) = (img.width() as u16, img.height() as u16);
++        if w == 0 || h == 0 {
++            return Err("an empty image".into());
++        }
++        let mut bitmap = Bitmap::new(w, h, 32, 32, 8, PaletteRef::BuiltIn(BuiltInPalette::SystemWin));
++        bitmap.data = img.into_raw();
++        bitmap.trim_white_space = trim_white_space;
++        let image_ref = {
++            let member = player.movie.cast_manager.find_mut_member_by_ref(member_ref).ok_or("no such member")?;
++            let CastMemberType::Bitmap(b) = &mut member.member_type else {
++                return Err("not a bitmap member".into());
++            };
++            b.info.width = w;
++            b.info.height = h;
++            b.info.bit_depth = 32;
++            b.info.pitch = w.saturating_mul(4);
++            b.info.trim_white_space = trim_white_space;
++            b.reg_point = ((w as i32 / 2) as i16, (h as i32 / 2) as i16);
++            member.reg_point = (w as i32 / 2, h as i32 / 2);
++            b.image_ref
++        };
++        player.bitmap_manager.replace_bitmap(image_ref, bitmap);
++        Ok((w, h))
++    }
++
+     pub fn set_prop(
+         member_ref: &CastMemberRef,
+         prop: Symbol,
+         value: Datum,
+     ) -> Result<(), ScriptError> {
++        // PS5_RUFFLE_DIRPLAYER_NATIVE (Ruffle5 1.000.038): `member.fileName = <file or address>`
++        // on a bitmap member links it to that image: "to minimize download time, use
++        // preloadNetThing() ... then set the fileName property" (Director 11.5, fileName). The
++        // image comes from the net task that preloaded it, else it is read now (a file beside
++        // the movie, a web address under the web root). 3D Golf (zapak) makes bitmap members for
++        // its preloaded sponsor and logo images this way and turns them into 3D textures
++        // (`newTexture(name, #fromImageObject, member.image)`); the "Cannot set castMember prop
++        // fileName for bitmap" error stopped the movie as the game started.
++        #[cfg(not(target_arch = "wasm32"))]
++        if prop.eq_ignore_ascii_case("fileName") || prop.eq_ignore_ascii_case("pathName") {
++            let url = value.string_value()?;
++            return reserve_player_mut(|player| {
++                let bytes = match player.net_manager.find_task_by_url(&url) {
++                    Some(id) if player.net_manager.is_task_done(Some(id)) => player.net_manager.get_task_result(Some(id)).and_then(|r| r.ok()),
++                    _ => {
++                        let resolved = player.net_manager.resolve_for_read(&url);
++                        crate::player::net_task::native_read(&resolved, true).ok()
++                    }
++                };
++                let trim = player
++                    .movie
++                    .cast_manager
++                    .find_member_by_ref(member_ref)
++                    .and_then(|m| m.member_type.as_bitmap().map(|b| b.info.trim_white_space))
++                    .unwrap_or(true);
++                match bytes {
++                    Some(b) if !b.is_empty() => match Self::replace_with_image_bytes(player, member_ref, &b, trim) {
++                        Ok((w, h)) => log::info!("bitmap member {}:{} linked to {url} ({w}x{h})", member_ref.cast_lib, member_ref.cast_member),
++                        Err(e) => log::warn!("bitmap member {}:{}: {url} is not an image it can read: {e}", member_ref.cast_lib, member_ref.cast_member),
++                    },
++                    _ => log::warn!("bitmap member {}:{}: {url} not read; the member stays as it is", member_ref.cast_lib, member_ref.cast_member),
++                }
++                Ok(())
++            });
++        }
+         match prop.into_builtin() {
+             Some(BuiltInSymbol::Image | BuiltInSymbol::Picture) => {
+                 if value.is_void() {
 diff --git a/vm-rust/src/player/handlers/datum_handlers/cast_member/font.rs b/vm-rust/src/player/handlers/datum_handlers/cast_member/font.rs
 index 3181f34d..9a7f01e9 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/cast_member/font.rs
@@ -1751,6 +1875,509 @@ index 3181f34d..9a7f01e9 100644
                              &format!(
                                  "Using font: '{}' (size: {}, char_width: {}, char_height: {})",
                                  font.font_name, font.font_size, font.char_width, font.char_height
+diff --git a/vm-rust/src/player/handlers/datum_handlers/cast_member/havok.rs b/vm-rust/src/player/handlers/datum_handlers/cast_member/havok.rs
+index dd71d54d..6e5bf6f5 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/cast_member/havok.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/cast_member/havok.rs
+@@ -408,6 +408,17 @@ impl HavokPhysicsMemberHandlers {
+         });
+         let mut raw_collisions: Vec<(Symbol, DatumRef, Symbol, Symbol, [f64;3], [f64;3], f64)> = Vec::new();
+         if let Some(havok) = havok {
++            // Ruffle5 1.000.038: what this step's contacts are against which interests (the
++            // probe's `debug` action shows them; a game whose collision handler never ran is
++            // read here)
++            if !havok.state.collision_list_cache.is_empty() && !havok.state.collision_interests.is_empty() {
++                log::debug!(
++                    "[HAVOK] contacts {} vs interests {}: {}",
++                    havok.state.collision_list_cache.len(),
++                    havok.state.collision_interests.iter().map(|i| format!("{}/{} thr {}", i.rb_name1, i.rb_name2, i.threshold)).collect::<Vec<_>>().join(", "),
++                    havok.state.collision_list_cache.iter().take(6).map(|c| format!("{}~{} nrv {:.1}", c.body_a, c.body_b, c.normal_rel_vel)).collect::<Vec<_>>().join("; ")
++                );
++            }
+         // Collision interests matched against cached contacts
+             for contact in &havok.state.collision_list_cache {
+                 for interest in &havok.state.collision_interests {
+@@ -790,8 +801,13 @@ impl HavokPhysicsMemberHandlers {
+         // The real Havok Xtra creates rigid bodies during Initialize() so that
+         // scripts can look them up via rigidBody("name") without explicit
+         // makeFixedRigidBody/makeMovableRigidBody calls.
++        log::debug!("[HAVOK] initialize: hke data {} bytes", havok.state.hke_data.len());
++        if let Ok(dir) = std::env::var("DIRPLAYER_HKE_DUMP") {
++            let _ = std::fs::write(format!("{dir}/hke-{}-{}.bin", member_ref.cast_lib, member_ref.cast_member), &havok.state.hke_data);
++        }
+         if !havok.state.hke_data.is_empty() {
+             let hke = super::hke_parser::parse_hke(&havok.state.hke_data);
++            log::debug!("[HAVOK] hke: {} meshes, {} bodies ({})", hke.meshes.len(), hke.bodies.len(), hke.bodies.iter().map(|b| format!("{} mass {}", b.name, b.total_mass)).collect::<Vec<_>>().join(", "));
+ 
+             // Apply HKE gravity (in Havok meters/s², convert to display units)
+             if let Some(g) = hke.gravity {
+@@ -2280,6 +2296,7 @@ impl HavokPhysicsMemberHandlers {
+             _ => return Err(ScriptError::new("Not a Havok member".to_string())),
+         };
+ 
++        log::debug!("[HAVOK] registerInterest {rb_name1} / {rb_name2} freq {frequency} thr {threshold} -> {:?}", handler_name);
+         havok.state.collision_interests.push(HavokCollisionInterest {
+             rb_name1,
+             rb_name2,
+@@ -2653,3 +2670,188 @@ refuted metre-inertia shortcut — see the doc comment before attempting a fix."
+             "settled yaw {long:.3} rad/s is outside Director's band (~0.24, p90 0.305)");
+     }
+ }
++
++#[cfg(all(test, not(target_arch = "wasm32")))]
++mod golf_flight_tests {
++    //! A golf ball in free flight, with 3D Golf's (zapak 1178, the Golf Ace
++    //! engine) own numbers: the HKE's unit-mass sphere, worldScale 0.01,
++    //! `dragParameters [0.45, 0.0025]`, gravity (0, 0, -981), 14 substeps,
++    //! and `Shoot`'s impulse `dir * energy * 100 * shootPower`.
++    //!
++    //! Linear drag is F = -k v, which in display units reads the same as in
++    //! metres (both v and F/m scale by 1/worldScale), so the carry has a closed
++    //! form to check against: x(t) = vx0 (1 - e^{-kt}) / k.
++    use crate::player::cast_member::{HavokPhysicsState, HavokRigidBody};
++    use crate::player::symbols::symbol::Symbol;
++    use crate::player::symbols::symbol_table::init_symbol_table;
++    use super::super::havok_physics::{recompute_body_inertia, sphere_inertia, step_native};
++
++    fn carry(shoot_power: f64, inclination: f64, energy: f64, dt: f64) -> (f64, f64) {
++        init_symbol_table();
++        let mut state = HavokPhysicsState::default();
++        state.scale = 0.01;
++        state.gravity = [0.0, 0.0, -981.0];
++        state.drag_params = [0.45, 0.0025];
++        let mut rb = HavokRigidBody::new_movable(Symbol::from_str("golf_ball_1"), 1.0, true);
++        let r = 0.054 / 0.01;
++        let i = sphere_inertia(1.0, r);
++        let unit_i: [f64; 9] = std::array::from_fn(|k| i[k]);
++        recompute_body_inertia(1.0, unit_i, &mut rb.inertia_tensor, &mut rb.inverse_inertia_tensor, &mut rb.inverse_mass);
++        rb.unit_inertia_tensor = unit_i;
++        rb.position = [0.0, 0.0, 1000.0];
++        rb.active = true;
++        state.rigid_bodies.push(rb);
++        let (c, s) = (inclination.cos(), inclination.sin());
++        let v = energy * 100.0 * shoot_power;
++        state.rigid_bodies[0].linear_velocity = [v * c, 0.0, v * s];
++        let mut t = 0.0;
++        loop {
++            step_native(&mut state, dt, 14);
++            t += dt;
++            if state.rigid_bodies[0].position[2] <= 1000.0 || t > 30.0 {
++                break;
++            }
++        }
++        (state.rigid_bodies[0].position[0], t)
++    }
++
++    fn closed_form(shoot_power: f64, inclination: f64, energy: f64) -> (f64, f64) {
++        let (k, g) = (0.45, 981.0);
++        let v = energy * 100.0 * shoot_power;
++        let (vx, vz) = (v * inclination.cos(), v * inclination.sin());
++        let (mut z, mut vzz, mut t) = (0.0, vz, 0.0);
++        let h = 0.0005;
++        while t == 0.0 || z > 0.0 {
++            vzz += (-g - k * vzz) * h;
++            z += vzz * h;
++            t += h;
++        }
++        (vx * (1.0 - (-k * t).exp()) / k, t)
++    }
++
++    /// A step in which the ball touches nothing reports no contact: the previous
++    /// step's contact must not linger (it did, and 3D Golf's ball then never left
++    /// the script's OnGround state).
++    #[test]
++    fn a_free_flight_step_reports_no_contact() {
++        init_symbol_table();
++        let mut state = HavokPhysicsState::default();
++        state.scale = 0.01;
++        state.gravity = [0.0, 0.0, -981.0];
++        let mut rb = HavokRigidBody::new_movable(Symbol::from_str("golf_ball_1"), 1.0, true);
++        rb.position = [0.0, 0.0, 1000.0];
++        rb.linear_velocity = [5000.0, 0.0, 3000.0];
++        rb.active = true;
++        state.rigid_bodies.push(rb);
++        state.collision_list_cache.push(crate::player::cast_member::HavokCollisionInfo {
++            body_a: Symbol::from_str("golf_ball_1"),
++            body_b: Symbol::from_str("f_farway01"),
++            point: [0.0; 3],
++            normal: [0.0, 0.0, 1.0],
++            normal_rel_vel: 315.3,
++        });
++        step_native(&mut state, 1.0 / 17.0, 14);
++        assert!(state.collision_list_cache.is_empty(), "last step's contact still reported: {:?}",
++            state.collision_list_cache.iter().map(|c| format!("{}~{}", c.body_a, c.body_b)).collect::<Vec<_>>());
++    }
++
++    /// A ball held on its green by a resting contact is reported against the green
++    /// every step (the narrow phase skips a held body, so nothing else reports it),
++    /// and no longer once it sleeps.
++    #[test]
++    fn a_ball_held_on_a_surface_is_in_contact_with_it_every_step() {
++        init_symbol_table();
++        let mut state = HavokPhysicsState::default();
++        state.scale = 0.01;
++        state.gravity = [0.0, 0.0, -981.0];
++        let mut rb = HavokRigidBody::new_movable(Symbol::from_str("golf_ball_1"), 1.0, true);
++        rb.position = [0.0, 0.0, 5.4];
++        rb.inertia_half_extents = [5.4; 3];
++        rb.linear_velocity = [100.0, 0.0, 0.0];
++        rb.active = true;
++        rb.resting_normal = Some(crate::player::cast_member::RestingContact {
++            normal: [0.0, 0.0, 1.0],
++            plane_point: [0.0, 0.0, 0.0],
++            ground_friction: 0.0,
++            aabb_min: [-1e6, -1e6, -1e6],
++            aabb_max: [1e6, 1e6, 1e6],
++            mesh_name: Symbol::from_str("g_green01"),
++        });
++        state.rigid_bodies.push(rb);
++        for _ in 0..3 {
++            step_native(&mut state, 1.0 / 17.0, 14);
++            let named: Vec<String> = state.collision_list_cache.iter().map(|c| format!("{}~{} nrv {}", c.body_a, c.body_b, c.normal_rel_vel)).collect();
++            assert_eq!(named, vec!["golf_ball_1~g_green01 nrv 0".to_string()], "{named:?}");
++        }
++        state.rigid_bodies[0].active = false;
++        step_native(&mut state, 1.0 / 17.0, 14);
++        assert!(state.collision_list_cache.is_empty(), "a sleeping ball reports no contact");
++    }
++
++    /// A green with its cup cut out: the ball held on the green's plane drops once
++    /// it is over the opening, and stays up where the green is under it.
++    #[test]
++    fn a_ball_over_the_cup_falls_in() {
++        use super::super::havok_physics::CollisionMesh;
++        init_symbol_table();
++        let green = |state: &mut HavokPhysicsState| {
++            // a 2000 x 2000 green at z 0 with a 40 x 40 opening at its centre: a ring
++            // of 8 triangles between the outer square and the opening
++            let outer = [[-1000.0, -1000.0, 0.0], [1000.0, -1000.0, 0.0], [1000.0, 1000.0, 0.0], [-1000.0, 1000.0, 0.0]];
++            let inner = [[-20.0, -20.0, 0.0], [20.0, -20.0, 0.0], [20.0, 20.0, 0.0], [-20.0, 20.0, 0.0]];
++            let mut vertices = Vec::new();
++            vertices.extend_from_slice(&outer);
++            vertices.extend_from_slice(&inner);
++            let mut triangles = Vec::new();
++            for i in 0..4u32 {
++                let j = (i + 1) % 4;
++                triangles.push([i, j, 4 + i]);
++                triangles.push([j, 4 + j, 4 + i]);
++            }
++            let mut m = CollisionMesh { name: Symbol::from_str("g_green"), vertices, triangles, aabb_min: [0.0; 3], aabb_max: [0.0; 3], body_index: None };
++            m.compute_aabb();
++            state.collision_meshes.push(m);
++        };
++        let ball_at = |x: f64| {
++            let mut state = HavokPhysicsState::default();
++            state.scale = 0.01;
++            state.tolerance = 0.7;
++            state.gravity = [0.0, 0.0, -981.0];
++            green(&mut state);
++            let mut rb = HavokRigidBody::new_movable(Symbol::from_str("golf_ball_1"), 1.0, true);
++            rb.position = [x, 0.0, 6.1];
++            rb.inertia_half_extents = [5.4; 3];
++            rb.active = true;
++            rb.resting_normal = Some(crate::player::cast_member::RestingContact {
++                normal: [0.0, 0.0, 1.0],
++                plane_point: [x + 10.0, 0.0, 0.0],
++                ground_friction: 0.4,
++                aabb_min: [-1000.0, -1000.0, 0.0],
++                aabb_max: [1000.0, 1000.0, 0.0],
++                mesh_name: Symbol::from_str("g_green"),
++            });
++            state.rigid_bodies.push(rb);
++            state
++        };
++        let mut on_green = ball_at(300.0);
++        let mut over_cup = ball_at(0.0);
++        for _ in 0..5 {
++            step_native(&mut on_green, 1.0 / 17.0, 14);
++            step_native(&mut over_cup, 1.0 / 17.0, 14);
++        }
++        assert!(on_green.rigid_bodies[0].resting_normal.is_some(), "the ball on the green is still held on it");
++        assert!((on_green.rigid_bodies[0].position[2] - 6.1).abs() < 0.5, "the ball on the green stays up: z {}", on_green.rigid_bodies[0].position[2]);
++        assert!(over_cup.rigid_bodies[0].resting_normal.is_none(), "the ball over the cup is released");
++        assert!(over_cup.rigid_bodies[0].position[2] < 0.0, "the ball over the cup falls: z {}", over_cup.rigid_bodies[0].position[2]);
++    }
++
++    #[test]
++    fn a_pitching_wedge_carries_what_the_drag_law_says() {
++        for (name, power, incl) in [("1w", 100.5, 0.5), ("9i", 57.11, 0.8), ("pw", 49.0, 0.85)] {
++            let (x, t) = carry(power, incl, 1.0, 1.0 / 17.0);
++            let (xc, tc) = closed_form(power, incl, 1.0);
++            println!("{name}: carry {:.0} display ({:.0} y) in {t:.2} s; drag law says {:.0} ({:.0} y) in {tc:.2} s", x, x / 91.44, xc, xc / 91.44);
++            assert!((x - xc).abs() < 0.08 * xc, "{name}: {x:.0} vs {xc:.0}");
++        }
++    }
++}
+diff --git a/vm-rust/src/player/handlers/datum_handlers/cast_member/havok_physics.rs b/vm-rust/src/player/handlers/datum_handlers/cast_member/havok_physics.rs
+index d967c0ed..1b61c623 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/cast_member/havok_physics.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/cast_member/havok_physics.rs
+@@ -1629,6 +1629,15 @@ pub fn step_begin(state: &mut HavokPhysicsState, time_increment: f64, num_sub_st
+     let n_subs = num_sub_steps.max(1) as usize;
+     let sub_dt = time_increment / n_subs as f64;
+ 
++    // Ruffle5 1.000.038: the contacts Lingo reads back (`collisions`, and the
++    // registerInterest callbacks) are THIS step's. The list was only rewritten by a
++    // substep that found contacts, so a body that had left a surface kept reporting
++    // its last contact until it touched something else: 3D Golf's ball (the Golf
++    // Ace engine) got its fairway contact every frame of its flight, stayed in the
++    // script's OnGround state and had the ground drag applied in the air, so a
++    // pitching wedge carried 20 yards instead of 72.
++    state.collision_list_cache.clear();
++
+     // Game forces (from applyForceAtPoint) are applied with per-axis dividers
+     // calibrated against Director's observed behaviour. The torque dividers
+     // differ between pitch/roll and yaw, matching the empirical asymmetry we
+@@ -1787,6 +1796,30 @@ pub fn step_substep(state: &mut HavokPhysicsState, prep: &StepPrep) {
+ 
+ /// Everything that runs once per step, after the last substep.
+ pub fn step_finish(state: &mut HavokPhysicsState, time_increment: f64) {
++    // Ruffle5 1.000.038: a body held on a surface by its resting contact is touching
++    // that surface, so the step reports the contact (at rest: no closing speed) as the
++    // engine does every step for an awake body on a surface. While the plane is held
++    // the narrow phase skips the body, so nothing else would report it, and the contact
++    // only showed up on the steps the plane was re-sampled: 3D Golf's ball (the Golf
++    // Ace engine) saw its green every other frame, flipped between the script's
++    // OnGround and OnAir states and rolled 35 yards off a 10-yard putt, as the ground
++    // drag the script applies from its collision callback was reset each time.
++    for bi in 0..state.rigid_bodies.len() {
++        let rb = &state.rigid_bodies[bi];
++        let Some(rc) = &rb.resting_normal else { continue };
++        if rb.pinned || !rb.active || rb.inverse_mass <= 0.0 { continue; }
++        if state.collision_list_cache.iter().any(|c| c.body_a == rb.name || c.body_b == rb.name) { continue; }
++        let he = rb.inertia_half_extents;
++        let r = he[0].max(he[1]).max(he[2]);
++        state.collision_list_cache.push(crate::player::cast_member::HavokCollisionInfo {
++            body_a: rb.name.clone(),
++            body_b: rc.mesh_name.clone(),
++            point: [rb.position[0] - rc.normal[0] * r, rb.position[1] - rc.normal[1] * r, rb.position[2] - rc.normal[2] * r],
++            normal: rc.normal,
++            normal_rel_vel: 0.0,
++        });
++    }
++
+     // Clear forces after all substeps. step_force too — the step callback re-sets
+     // it fresh each frame (post-step), so it must not accumulate across frames.
+     for rb in &mut state.rigid_bodies {
+@@ -2037,6 +2070,7 @@ fn step_single(state: &mut HavokPhysicsState, dt: f64) {
+                                     ground_friction,
+                                     aabb_min: m.aabb_min,
+                                     aabb_max: m.aabb_max,
++                                    mesh_name: m.name.clone(),
+                                 });
+                             }
+                         }
+@@ -2249,6 +2283,41 @@ fn apply_surface_contacts(state: &mut HavokPhysicsState, dt: f64) {
+             continue;
+         }
+ 
++        // Ruffle5 1.000.038: the plane is only held while the surface is under the
++        // body. The mesh's AABB says nothing about a hole IN the surface: 3D Golf's
++        // green (the Golf Ace engine) has its cup cut out of it, with the cup's own
++        // models below, and a ball rolled onto the opening sat on the held plane
++        // over nothing, "0y" from the hole, instead of dropping in and touching the
++        // cup, which is how the game knows the hole is finished. The point of the
++        // held plane under the body's centre must lie on (or within `reach` of) one
++        // of the mesh's own triangles; otherwise the body is released to the narrow
++        // phase, which finds whatever is really there. `reach` is a seam's worth:
++        // the adjacent triangle's plane differs from the held one by the surface's
++        // curvature, and separate road boxes meet with small gaps.
++        {
++            let reach = state.tolerance + 0.25 * eff_radius;
++            let dn = v3_dot(v3_sub(pos, rc.plane_point), n);
++            let foot = v3_sub(pos, v3_scale(n, dn));
++            let supported = match state.collision_meshes.iter().find(|m| m.name == rc.mesh_name) {
++                None => true,
++                Some(m) => m.triangles.iter().any(|tri| {
++                    let (v0, v1, v2) = (m.vertices[tri[0] as usize], m.vertices[tri[1] as usize], m.vertices[tri[2] as usize]);
++                    for k in 0..3 {
++                        let lo = v0[k].min(v1[k]).min(v2[k]);
++                        let hi = v0[k].max(v1[k]).max(v2[k]);
++                        if foot[k] < lo - reach || foot[k] > hi + reach {
++                            return false;
++                        }
++                    }
++                    v3_len_sq(v3_sub(closest_pt_on_tri(foot, v0, v1, v2), foot)) <= reach * reach
++                }),
++            };
++            if !supported {
++                state.rigid_bodies[bi].resting_normal = None;
++                continue;
++            }
++        }
++
+         // Compute the Z position that keeps the ball at eff_radius from the
+         // tilted plane.  Adjusting only Z avoids the X-jitter that occurs when
+         // projecting along the tilted normal (which has an X component).
+diff --git a/vm-rust/src/player/handlers/datum_handlers/cast_member/hke_parser.rs b/vm-rust/src/player/handlers/datum_handlers/cast_member/hke_parser.rs
+index aa77b748..ab0a416a 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/cast_member/hke_parser.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/cast_member/hke_parser.rs
+@@ -201,6 +201,22 @@ pub fn parse_hke(data: &[u8]) -> HkeWorld {
+         cables: Vec::new(),
+     };
+ 
++    // PS5_RUFFLE_DIRPLAYER_NATIVE (Ruffle5 1.000.038): the text form of the export — the same
++    // keywords the binary form's tokens hash, one per line ("A", "BEGIN_WORLD name", "WORLD_SCALE
++    // 0.01", "BEGIN_RIGID_BODY golf_ball_1", "BEGIN_PRIMITIVE SphericalPrimitive golf_ball_1",
++    // "MASS 1", "RADIUS 0.054" ...). 3D Golf (zapak 1178) carries its two balls so; read as
++    // binary it gave no bodies, the game then made the ball a fixed body of its own and its
++    // collision handler never ran (the ball lay still after the first shot).
++    if is_text_hke(data) {
++        parse_hke_text(data, &mut world);
++        let movable: Vec<&str> = world.bodies.iter().filter(|b| b.total_mass > 0.0).map(|b| b.name.as_str()).collect();
++        debug!(
++            "HKE (text) parsed: {} bodies ({} movable: {:?}), worldScale={}",
++            world.bodies.len(), movable.len(), movable, world.world_scale
++        );
++        return world;
++    }
++
+     // Parse header
+     if data.len() > 5 {
+         let mut pos = 5;
+@@ -639,3 +655,141 @@ fn find_bytes(data: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+     }
+     None
+ }
++
++/// The export's text form: a line "A" (or "B"), then `BEGIN_WORLD`.
++fn is_text_hke(data: &[u8]) -> bool {
++    let head = &data[..data.len().min(64)];
++    let Ok(text) = std::str::from_utf8(head) else { return false };
++    text.contains("BEGIN_WORLD")
++}
++
++/// The text form, keyword per line, nested with BEGIN_… / END_… — into the same world the binary
++/// form gives. ROTATION's four numbers are kept as written (the binary form's order: angle, then
++/// the axis). Primitives other than spheres are kept by name (a mesh of that name, if any).
++fn parse_hke_text(data: &[u8], world: &mut HkeWorld) {
++    let text = String::from_utf8_lossy(data);
++    let mut body: Option<HkeBodyProps> = None;
++    let mut prim: Option<HkePrimitive> = None;
++    let mut action: Option<String> = None;
++    let (mut drag_lin, mut drag_ang) = (0.0f32, 0.0f32);
++    let nums = |rest: &[&str]| -> Vec<f32> { rest.iter().filter_map(|t| t.parse::<f32>().ok()).collect() };
++    for line in text.lines() {
++        let parts: Vec<&str> = line.split_whitespace().collect();
++        let Some(&key) = parts.first() else { continue };
++        let rest = &parts[1..];
++        let v = nums(rest);
++        let v3 = |v: &Vec<f32>| if v.len() >= 3 { Some([v[0], v[1], v[2]]) } else { None };
++        let flag = |rest: &[&str]| rest.first().map(|t| t.eq_ignore_ascii_case("TRUE") || *t == "1");
++        match key {
++            "BEGIN_WORLD" => world.world_name = rest.first().unwrap_or(&"").to_string(),
++            "WORLD_SCALE" => if let Some(&s) = v.first() { if s > 0.0 { world.world_scale = s; } },
++            "GRAVITY" => world.gravity = v3(&v),
++            "TOLERANCE" => world.tolerance = v.first().copied(),
++            "BEGIN_RIGID_BODY" => {
++                body = Some(HkeBodyProps {
++                    name: Symbol::from_str(rest.first().unwrap_or(&"")),
++                    total_mass: 0.0,
++                    restitution: None,
++                    static_friction: None,
++                    dynamic_friction: None,
++                    translation: None,
++                    orientation: None,
++                    linear_velocity: None,
++                    angular_velocity: None,
++                    active: None,
++                    collisions_disabled: None,
++                    displacement: None,
++                    casts_shadows: None,
++                    primitives: Vec::new(),
++                });
++            }
++            "END_RIGID_BODY" => {
++                if let Some(mut b) = body.take() {
++                    b.total_mass = b.primitives.iter().map(|p| p.mass).sum();
++                    world.bodies.push(b);
++                }
++            }
++            "BEGIN_PRIMITIVE" => {
++                let kind = rest.first().copied().unwrap_or("");
++                let name = rest.get(1).copied().unwrap_or("").to_string();
++                prim = Some(HkePrimitive {
++                    kind: match kind {
++                        "SphericalPrimitive" | "SpherePrimitive" => HkePrimitiveKind::Sphere { radius: 0.0 },
++                        "PlanePrimitive" => HkePrimitiveKind::Plane { normal: [0.0, 0.0, 1.0], dist: 0.0 },
++                        _ => HkePrimitiveKind::Mesh { mesh_name: name },
++                    },
++                    local_translation: [0.0; 3],
++                    mass: 0.0,
++                });
++            }
++            "END_PRIMITIVE" => {
++                if let (Some(p), Some(b)) = (prim.take(), body.as_mut()) {
++                    b.primitives.push(p);
++                }
++            }
++            "BEGIN_ACTION" => action = rest.first().map(|a| a.to_string()),
++            "END_ACTION" => {
++                if action.as_deref() == Some("Drag") {
++                    world.drag = Some(HkeDragAction { linear_drag: drag_lin, angular_drag: drag_ang });
++                }
++                action = None;
++            }
++            "LINEAR_DRAG" => drag_lin = v.first().copied().unwrap_or(0.0),
++            "ANGULAR_DRAG" => drag_ang = v.first().copied().unwrap_or(0.0),
++            _ => {
++                if let Some(p) = prim.as_mut() {
++                    match key {
++                        "MASS" => p.mass = v.first().copied().unwrap_or(0.0),
++                        "RADIUS" => if let HkePrimitiveKind::Sphere { radius } = &mut p.kind { *radius = v.first().copied().unwrap_or(0.0); },
++                        "TRANSLATION" => if let Some(t) = v3(&v) { p.local_translation = t; },
++                        "PLANE" => if let (HkePrimitiveKind::Plane { normal, dist }, true) = (&mut p.kind, v.len() >= 4) { *normal = [v[0], v[1], v[2]]; *dist = v[3]; },
++                        _ => {}
++                    }
++                } else if let Some(b) = body.as_mut() {
++                    match key {
++                        "ELLASTICITY" | "ELASTICITY" | "RESTITUTION" => b.restitution = v.first().copied(),
++                        "STATIC_FRICTION" => b.static_friction = v.first().copied(),
++                        "DYNAMIC_FRICTION" => b.dynamic_friction = v.first().copied(),
++                        "ROTATION" => if v.len() >= 4 { b.orientation = Some([v[0], v[1], v[2], v[3]]); },
++                        "TRANSLATION" => b.translation = v3(&v),
++                        "LINEAR_VELOCITY" => b.linear_velocity = v3(&v),
++                        "ANGULAR_VELOCITY" => b.angular_velocity = v3(&v),
++                        "ACTIVE" => b.active = flag(rest),
++                        "COLLISIONS_DISABLED" => b.collisions_disabled = flag(rest),
++                        "DISPLACEMENT" => b.displacement = v3(&v),
++                        "CASTS_SHADOWS" => b.casts_shadows = flag(rest),
++                        _ => {}
++                    }
++                }
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod text_tests {
++    use super::*;
++
++    #[test]
++    fn the_text_form_gives_the_balls() {
++        let text = b"A\r\nBEGIN_WORLD MAX_exported_world \r\n  VERSION 1310 \r\n  WORLD_SCALE 0.01 \r\n  BEGIN_SUBSPACE default_subspace \r\n    GRAVITY 0 0 -9.81 \r\n    TOLERANCE 0.007 \r\n    RESOLVER ComplexFriction \r\n    BEGIN_COLLECTION RBCollection RBCollection01 \r\n      BEGIN_RIGID_BODY golf_ball_1 \r\n        ELLASTICITY 0.6 \r\n        STATIC_FRICTION 0.8 \r\n        DYNAMIC_FRICTION 0.4 \r\n        ROTATION 0 0 0 0 \r\n        TRANSLATION 1 2 3 \r\n        LINEAR_VELOCITY 0 0 0 \r\n        ANGULAR_VELOCITY 0 0 0 \r\n        COLLISIONS_DISABLED FALSE \r\n        ACTIVE TRUE \r\n        DISPLACEMENT 0 0 0 \r\n        BEGIN_PRIMITIVE SphericalPrimitive golf_ball_1 \r\n          MASS 1 \r\n          ROTATION 0 0 0 0 \r\n          TRANSLATION 0 0 0 \r\n          RADIUS 0.054 \r\n          COLLISIONS_DISABLED FALSE \r\n        END_PRIMITIVE \r\n      END_RIGID_BODY \r\n    END_COLLECTION \r\n    BEGIN_ACTION Drag Drag_1 \r\n      LINEAR_DRAG 0.35 \r\n      ANGULAR_DRAG 0.005\r\n    END_ACTION \r\n  END_SUBSPACE \r\nEND_WORLD \r\n";
++        let w = parse_hke(text);
++        assert_eq!(w.world_scale, 0.01);
++        assert_eq!(w.gravity, Some([0.0, 0.0, -9.81]));
++        assert_eq!(w.tolerance, Some(0.007));
++        assert_eq!(w.bodies.len(), 1);
++        let b = &w.bodies[0];
++        assert_eq!(b.name.as_str(), "golf_ball_1");
++        assert_eq!(b.total_mass, 1.0);
++        assert_eq!(b.restitution, Some(0.6));
++        assert_eq!(b.static_friction, Some(0.8));
++        assert_eq!(b.translation, Some([1.0, 2.0, 3.0]));
++        assert_eq!(b.active, Some(true));
++        assert_eq!(b.collisions_disabled, Some(false));
++        assert!(matches!(b.primitives[0].kind, HkePrimitiveKind::Sphere { radius } if (radius - 0.054).abs() < 1e-6));
++        let d = w.drag.as_ref().unwrap();
++        assert_eq!((d.linear_drag, d.angular_drag), (0.35, 0.005));
++        // the binary form is untouched
++        assert!(!is_text_hke(&[0x00, 0x01, 0x02, 0x03, 0x04, b'x', 0]));
++    }
++}
 diff --git a/vm-rust/src/player/handlers/datum_handlers/cast_member/shockwave3d.rs b/vm-rust/src/player/handlers/datum_handlers/cast_member/shockwave3d.rs
 index 8b702c18..79103875 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/cast_member/shockwave3d.rs
@@ -2014,6 +2641,44 @@ index ce5283ba..21ef7ad0 100644
  fn convert_js_result_to_lingo_datum(
      player: &mut crate::player::DirPlayer,
      result: JsValue,
+diff --git a/vm-rust/src/player/handlers/datum_handlers/havok_object.rs b/vm-rust/src/player/handlers/datum_handlers/havok_object.rs
+index 85eecf18..74f9fdaa 100644
+--- a/vm-rust/src/player/handlers/datum_handlers/havok_object.rs
++++ b/vm-rust/src/player/handlers/datum_handlers/havok_object.rs
+@@ -151,7 +151,14 @@ impl HavokObjectDatumHandlers {
+             "pinned" => Datum::Int(if rb.pinned { 1 } else { 0 }),
+             "linearVelocity" | "linearvelocity" => Datum::Vector(rb.linear_velocity),
+             "angularVelocity" | "angularvelocity" => Datum::Vector(rb.angular_velocity),
+-            "linearMomentum" | "linearmomentum" => Datum::Vector(rb.linear_momentum),
++            // PS5_RUFFLE_DIRPLAYER_NATIVE (Ruffle5 1.000.038): p = m · v, in display units as
++            // the Xtra's linear quantities are (the stored field was never written by the
++            // engine: 3D Golf read a zero momentum the frame after its shot, took the ball
++            // for stopped and put it back — "Shot distance: 0y" — every time)
++            "linearMomentum" | "linearmomentum" => {
++                use crate::player::handlers::datum_handlers::cast_member::havok_physics::v3_scale;
++                Datum::Vector(v3_scale(rb.linear_velocity, rb.mass))
++            }
+             "angularMomentum" | "angularmomentum" => {
+                 use crate::player::handlers::datum_handlers::cast_member::havok_physics::{quat_to_mat3, mat3_mul, mat3_transpose, mat3_transform, v3_scale};
+                 // L = I_world * omega (the engine derives angular momentum from the body's
+@@ -309,7 +316,16 @@ impl HavokObjectDatumHandlers {
+                 // isn't skipped in step (otherwise the new velocity is ignored).
+                 "linearVelocity" | "linearvelocity" => { if let Datum::Vector(v) = &value { rb.linear_velocity = *v; rb.active = true; rb.lingo_disturbed = true; } else { return Err(ScriptError::new("Expected vector".to_string())); } }
+                 "angularVelocity" | "angularvelocity" => { if let Datum::Vector(v) = &value { rb.angular_velocity = *v; rb.active = true; rb.lingo_disturbed = true; } else { return Err(ScriptError::new("Expected vector".to_string())); } }
+-                "linearMomentum" | "linearmomentum" => { if let Datum::Vector(v) = &value { rb.linear_momentum = *v; rb.active = true; rb.lingo_disturbed = true; } else { return Err(ScriptError::new("Expected vector".to_string())); } }
++                // PS5_RUFFLE_DIRPLAYER_NATIVE (Ruffle5 1.000.038): v = p / m (a fixed body is
++                // left alone), as the engine's setLinearMomentum drives the velocity; 3D Golf
++                // slows its ball by scaling the momentum each frame and stops it by zeroing it
++                "linearMomentum" | "linearmomentum" => { if let Datum::Vector(v) = &value {
++                    use crate::player::handlers::datum_handlers::cast_member::havok_physics::v3_scale;
++                    if rb.inverse_mass > 0.0 {
++                        rb.linear_velocity = v3_scale(*v, rb.inverse_mass);
++                    }
++                    rb.linear_momentum = *v; rb.active = true; rb.lingo_disturbed = true;
++                } else { return Err(ScriptError::new("Expected vector".to_string())); } }
+                 "angularMomentum" | "angularmomentum" => { if let Datum::Vector(v) = &value {
+                     use crate::player::handlers::datum_handlers::cast_member::havok_physics::{quat_to_mat3, mat3_mul, mat3_transpose, mat3_transform, v3_scale};
+                     // omega = I_world^-1 * L (the engine's setAngularMomentum drives the body's
 diff --git a/vm-rust/src/player/handlers/datum_handlers/mod.rs b/vm-rust/src/player/handlers/datum_handlers/mod.rs
 index 83967a2f..c0777b5f 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/mod.rs
@@ -2360,7 +3025,7 @@ index f4a22740..3e648b95 100644
          if let Some(ref pan_node) = self.pan_node {
              let _ = pan_node.pan().set_value(clamped as f32);
 diff --git a/vm-rust/src/player/handlers/datum_handlers/sprite.rs b/vm-rust/src/player/handlers/datum_handlers/sprite.rs
-index 2fe89176..efc1ba29 100644
+index 2fe89176..76bec491 100644
 --- a/vm-rust/src/player/handlers/datum_handlers/sprite.rs
 +++ b/vm-rust/src/player/handlers/datum_handlers/sprite.rs
 @@ -80,6 +80,10 @@ fn set_sprite_camera_list(
@@ -2421,7 +3086,36 @@ index 2fe89176..efc1ba29 100644
              std::time::Duration::from_millis(100),
              std::future::pending::<()>(),
          )
-@@ -1032,7 +1060,12 @@ impl SpriteDatumHandlers {
+@@ -957,6 +985,13 @@ impl SpriteDatumHandlers {
+                     // stringp() works. If it returns an object or undefined, return
+                     // a FlashObjectRef for setCallback/call usage.
+                     if let Ok(val) = ruffle_get_variable(sn as i32, &rooted) {
++                        // PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.038): a Boolean or a Number from the
++                        // native bridge is the value in Director's native form (1/0, a number),
++                        // not an object handle (3D Golf: `getVariable("externalImagesLoaded", 0)`)
++                        #[cfg(not(target_arch = "wasm32"))]
++                        if let Some(datum) = val.lingo_value().filter(|_| !val.is_string()) {
++                            return reserve_player_mut(|player| Ok(player.alloc_datum(datum)));
++                        }
+                         if val.is_string() {
+                             let s = val.as_string().unwrap();
+                             // Ruffle's GetVariable ALWAYS returns a string, coercing
+@@ -1017,6 +1052,14 @@ impl SpriteDatumHandlers {
+                         // true and stalled the loader. Bools → Int(0/1), integral
+                         // Numbers → Int, else Float, matching the callFunction
+                         // converter that already let `includeIsLoaded() = 1` work.
++                        // PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.038): the string form, as Flash's
++                        // String() writes a Boolean or a Number ("true": Miniclip's loader
++                        // compares `getVariable("introFinished") = "true"`)
++                        #[cfg(not(target_arch = "wasm32"))]
++                        let val = match val.flash_string() {
++                            Some(s) => crate::player::flash_host::FlashValue::String(s),
++                            None => val,
++                        };
+                         let datum = if let Some(s) = val.as_string() {
+                             Datum::String(s)
+                         } else if let Some(b) = val.as_bool() {
+@@ -1032,7 +1075,12 @@ impl SpriteDatumHandlers {
                          };
                          return reserve_player_mut(|player| Ok(player.alloc_datum(datum)));
                      }
@@ -2434,7 +3128,7 @@ index 2fe89176..efc1ba29 100644
                  }
                  Ok(DatumRef::Void)
              }
-@@ -1241,6 +1274,8 @@ impl SpriteDatumHandlers {
+@@ -1241,6 +1289,8 @@ impl SpriteDatumHandlers {
                          // The export is exposed under the dirplayer_ prefix
                          // (see ruffle/web/src/lib.rs and the matching JS in
                          // src/services/flashPlayerManager.ts).
@@ -2443,7 +3137,7 @@ index 2fe89176..efc1ba29 100644
                          if let Some(window) = web_sys::window() {
                              if let Ok(func) = js_sys::Reflect::get(&window, &"dirplayer_ruffleRegisterLingoCallback".into()) {
                                  if func.is_function() {
-@@ -1402,6 +1437,14 @@ impl SpriteDatumHandlers {
+@@ -1402,6 +1452,14 @@ impl SpriteDatumHandlers {
                          .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
                          .collect();
                      let path = format!("_root.__dpObj_{}_{}", safe, id);
@@ -2575,7 +3269,7 @@ index 7e0d99cd..9c8b3023 100644
                                  "🔧 Document {}.childNodes returning root element {}",
                                  xml_id, root_id
 diff --git a/vm-rust/src/player/handlers/manager.rs b/vm-rust/src/player/handlers/manager.rs
-index a4d15155..80c38aac 100644
+index a4d15155..d7db2c6b 100644
 --- a/vm-rust/src/player/handlers/manager.rs
 +++ b/vm-rust/src/player/handlers/manager.rs
 @@ -34,6 +34,10 @@ use crate::{
@@ -2638,7 +3332,26 @@ index a4d15155..80c38aac 100644
          reserve_player_ref(|player| {
              let datum = player.get_datum(datum_ref);
              let sprite_num = match datum {
-@@ -1679,7 +1711,12 @@ impl BuiltInHandlerManager {
+@@ -1644,6 +1676,18 @@ impl BuiltInHandlerManager {
+                             return Ok(DatumRef::Void);
+                         }
+                         match ruffle_get_variable(sn as i32, &path) {
++                            // PS5_RUFFLE_DIRPLAYER_NATIVE (1.000.038): the native bridge answers
++                            // typed values. The string form gets Flash's String() of them, the
++                            // native form (3rd arg 0) a Boolean as 1/0 and a Number as a number
++                            // (Director's getVariable with returnAsString FALSE: 3D Golf's menu
++                            // waits for `getVariable("externalImagesLoaded", 0) <> 1`).
++                            #[cfg(not(target_arch = "wasm32"))]
++                            Ok(val) if !val.is_string() && !val.is_object() && !val.is_null() && !val.is_undefined() => {
++                                let datum = if return_as_object { val.lingo_value() } else { val.flash_string().map(Datum::String) };
++                                if let Some(datum) = datum {
++                                    return reserve_player_mut(|player| Ok(player.alloc_datum(datum)));
++                                }
++                            }
+                             Ok(val) => {
+                                 if let Some(s) = val.as_string() {
+                                     // Ruffle's GetVariable coerces an AS OBJECT to
+@@ -1679,7 +1723,12 @@ impl BuiltInHandlerManager {
                                      }
                                  }
                              }
@@ -2651,7 +3364,7 @@ index a4d15155..80c38aac 100644
                          }
                          if return_as_object {
                              return reserve_player_mut(|player| {
-@@ -2289,6 +2326,9 @@ impl BuiltInHandlerManager {
+@@ -2289,6 +2338,9 @@ impl BuiltInHandlerManager {
  
                          // Build the measurement context once and reuse it for all
                          // word-wrap probes below.
@@ -2661,7 +3374,7 @@ index a4d15155..80c38aac 100644
                          let measure_ctx = {
                              use wasm_bindgen::JsCast;
                              let font_str = format!("{}px {}", display_font_size, display_font_name);
-@@ -2300,6 +2340,12 @@ impl BuiltInHandlerManager {
+@@ -2300,6 +2352,12 @@ impl BuiltInHandlerManager {
                                  .and_then(|c| c.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
                                  .map(|ctx| { ctx.set_font(&font_str); ctx })
                          };
@@ -2674,7 +3387,7 @@ index a4d15155..80c38aac 100644
                          let measure = |s: &str| -> f64 {
                              measure_ctx.as_ref()
                                  .and_then(|ctx| ctx.measure_text(s).ok())
-@@ -3347,13 +3393,19 @@ fn count_wraps_before_index(
+@@ -3347,13 +3405,19 @@ fn count_wraps_before_index(
      wrap_w: i16,
      target_char_idx: usize,
  ) -> usize {
@@ -2696,7 +3409,7 @@ index a4d15155..80c38aac 100644
      let Some(ctx) = ctx_opt else { return 0; };
      ctx.set_font(&format!("{}px {}", font_size, font_name));
      // Walk source lines; for each line, simulate word-wrap and count
-@@ -3382,7 +3434,7 @@ fn count_wraps_before_index(
+@@ -3382,7 +3446,7 @@ fn count_wraps_before_index(
  /// Total visual-line breaks (excluding the implicit final line) when
  /// `line` is word-wrapped at `wrap_w` pixels. Uses Canvas2D for width.
  fn wraps_in_line(
@@ -2705,7 +3418,7 @@ index a4d15155..80c38aac 100644
      line: &str,
      wrap_w: i16,
  ) -> usize {
-@@ -3397,7 +3449,7 @@ fn wraps_in_line(
+@@ -3397,7 +3461,7 @@ fn wraps_in_line(
  /// preserved). Per-char measurement, by contrast, over-estimates
  /// because kerning isn't applied between independent calls.
  fn wraps_in_line_up_to(
@@ -3311,6 +4024,49 @@ index 00000000..87000619
 +        assert_eq!(time_clip(-8.64e15), -8.64e15);
 +    }
 +}
+diff --git a/vm-rust/src/player/keyboard_map.rs b/vm-rust/src/player/keyboard_map.rs
+index b9261949..2e287da5 100644
+--- a/vm-rust/src/player/keyboard_map.rs
++++ b/vm-rust/src/player/keyboard_map.rs
+@@ -152,6 +152,38 @@ pub fn get_char_to_keycode_map() -> &'static HashMap<char, u16> {
+             ('7', 26),
+             ('8', 28),
+             ('9', 25),
++            // Ruffle5 1.000.038: the punctuation keys, with the same Mac virtual key
++            // codes `get_keyboard_key_map_js_to_sw` gives them when they are pressed.
++            // `keyPressed(",")` looked ',' up here, found nothing and tested key code 0
++            // (the `a` key) instead: 3D Blast Billiards charges and takes its shot on
++            // the comma key, and never could.
++            (' ', 49),
++            ('`', 50),
++            ('-', 27),
++            ('=', 24),
++            ('[', 33),
++            (']', 30),
++            (';', 41),
++            ('\'', 39),
++            ('\\', 42),
++            (',', 43),
++            ('.', 47),
++            ('/', 44),
+         ])
+     })
+ }
++
++#[cfg(test)]
++mod punctuation_tests {
++    use super::*;
++
++    /// `keyPressed(",")` asks for the key code the comma key reports when pressed.
++    #[test]
++    fn the_punctuation_keys_look_up_to_the_codes_they_are_pressed_with() {
++        let pressed = get_keyboard_key_map_js_to_sw();
++        let by_char = get_char_to_keycode_map();
++        for (js, ch) in [(188u16, ','), (190, '.'), (191, '/'), (186, ';'), (222, '\''), (219, '['), (221, ']'), (189, '-'), (187, '='), (192, '`'), (220, '\\'), (32, ' ')] {
++            assert_eq!(by_char.get(&ch), pressed.get(&js), "{ch:?}");
++        }
++    }
++}
 diff --git a/vm-rust/src/player/mod.rs b/vm-rust/src/player/mod.rs
 index 1c4a69a3..752bf15d 100644
 --- a/vm-rust/src/player/mod.rs
@@ -3766,10 +4522,10 @@ index fd461636..ec219dd8 100644
      }
 diff --git a/vm-rust/src/player/native.rs b/vm-rust/src/player/native.rs
 new file mode 100644
-index 00000000..7c92a589
+index 00000000..22e0aa60
 --- /dev/null
 +++ b/vm-rust/src/player/native.rs
-@@ -0,0 +1,713 @@
+@@ -0,0 +1,737 @@
 +//! PS5_RUFFLE_DIRPLAYER_NATIVE — DirPlayer inside another program, without a browser.
 +//!
 +//! The web front end drives the VM from JavaScript: it loads the movie, runs the frame loop on
@@ -4338,6 +5094,21 @@ index 00000000..7c92a589
 +            let player = crate::player::player_mut();
 +            player.load_movie_from_dir(dir_file).await;
 +        }
++        // 1.000.038: the movie's own stream. Shockwave reports the movie's download to
++        // `streamStatus` once the movie asked with tellStreamStatus(TRUE); loaders built on that
++        // (Cartoon Network's: The Jetsons' Longshot Golf, Meteor Mayhem) wait for its
++        // bytesSoFar = bytesTotal before leaving their loading frame. Here the file is all there at
++        // once, so it is a task done from the start — the web build's own load task, which the
++        // same reporting sees. Named by the address the movie is told it has, as the web build's.
++        reserve_player_mut(|player| {
++            let url = match &player.movie_path_override {
++                // the address as given (the movie's own), or its folder with the file's name
++                Some(a) if a.rsplit('/').next().is_some_and(|n| n.eq_ignore_ascii_case(&file_name)) => a.clone(),
++                Some(a) if !a.is_empty() => format!("{}/{}", a.trim_end_matches('/'), file_name),
++                _ => format!("{base_url}{file_name}"),
++            };
++            player.net_manager.add_done_task(&url, bytes);
++        });
 +        Ok(())
 +    }
 +
@@ -4386,6 +5157,15 @@ index 00000000..7c92a589
 +    /// One score frame, as [`run_native_frame`] runs it. False once the movie has stopped playing.
 +    pub async fn frame(&mut self) -> bool {
 +        run_native_frame().await
++    }
++
++    /// 1.000.038: what the movie's scripts `put` since the last call (Director's Message window;
++    /// a game says there what it waits for), taken out of the console buffer.
++    pub fn take_puts(&self) -> Vec<String> {
++        reserve_player_ref(|player| {
++            let text = player.console.read();
++            if text.is_empty() { Vec::new() } else { text.lines().map(|l| l.to_string()).collect() }
++        })
 +    }
 +
 +    /// Frames per second the score asks for now (puppetTempo or the tempo channel); 0 if none.
@@ -5707,7 +6487,7 @@ index 00000000..a159f906
 +    }
 +}
 diff --git a/vm-rust/src/player/net_manager.rs b/vm-rust/src/player/net_manager.rs
-index 0a4cb097..78cb61e6 100644
+index 0a4cb097..dbc65a5c 100644
 --- a/vm-rust/src/player/net_manager.rs
 +++ b/vm-rust/src/player/net_manager.rs
 @@ -91,9 +91,35 @@ impl NetManager {
@@ -5746,7 +6526,41 @@ index 0a4cb097..78cb61e6 100644
      pub fn get_task_state(&self, task_id: Option<u32>) -> Option<NetTaskState> {
          let shared_state = self.shared_state.try_lock().unwrap();
          let task_states = &shared_state.task_states;
-@@ -291,15 +317,9 @@ impl NetManager {
+@@ -190,6 +216,33 @@ impl NetManager {
+         }
+     }
+ 
++    /// Ruffle5 1.000.038: a task that is done before it is asked for — the movie's own stream,
++    /// which a native host loads from disk at once: `streamStatus` (when `tellStreamStatus` is
++    /// on) and `netDone`/`getStreamStatus` then see it as the web build's own load task is seen.
++    /// Returns the task's id (an existing task for the URL is kept).
++    pub fn add_done_task(&mut self, url: &str, bytes: Vec<u8>) -> u32 {
++        if let Some(existing) = find_task_with_url(&self.tasks, url) {
++            return existing.id;
++        }
++        let id = (self.tasks.len() + 1) as u32;
++        let net_task = NetTask::new(id, url, &normalize_task_url(url, self.base_path.as_ref()));
++        let len = bytes.len() as u64;
++        {
++            let mut shared = self.shared_state.try_lock().unwrap();
++            shared.update_task_state(id, NetTaskState { result: Some(Ok(bytes)), bytes_loaded: len, bytes_total: len });
++        }
++        self.tasks.insert(id, net_task);
++        id
++    }
++
++    /// Ruffle5 1.000.038: the address a request is read from, as `preload_net_thing` would
++    /// resolve it (the movie path override's folder part taken off, the base path applied).
++    pub fn resolve_for_read(&self, url: &str) -> Url {
++        let url = percent_decode_str(url).decode_utf8().map(|s| s.to_string()).unwrap_or_else(|_| url.to_string());
++        let url = self.strip_override_base(&url).unwrap_or(url);
++        normalize_task_url(&url, self.base_path.as_ref())
++    }
++
+     pub fn preload_net_thing(&mut self, url: String) -> u32 {
+         // Normalize the URL by decoding percent-encoded characters
+         let url = percent_decode_str(&url)
+@@ -291,15 +344,9 @@ impl NetManager {
                  // slash before the drive letter makes `fs::read` fail on Windows
                  // while working by accident on macOS/Linux. `to_file_path` decodes
                  // percent-escapes and yields a real platform path on all three.
@@ -6042,7 +6856,7 @@ index 731e9233..1823a0c5 100644
      "debugPlaybackEnabled" => DebugPlaybackEnabled,
      "alertHook" => AlertHook,
 diff --git a/vm-rust/src/player/testing.rs b/vm-rust/src/player/testing.rs
-index 7096c712..9d220653 100644
+index 7096c712..5ec0488b 100644
 --- a/vm-rust/src/player/testing.rs
 +++ b/vm-rust/src/player/testing.rs
 @@ -52,42 +52,11 @@ impl TestPlayer {
@@ -6093,10 +6907,20 @@ index 7096c712..9d220653 100644
          let file_name = Path::new(&abs_path)
              .file_name().unwrap().to_string_lossy().to_string();
  
-@@ -128,6 +97,45 @@ impl TestHarness for TestPlayer {
+@@ -127,6 +96,54 @@ impl TestHarness for TestPlayer {
+             let player = crate::player::player_mut();
              player.load_movie_from_dir(dir_file).await;
          }
-     }
++        // the movie's own stream, done (as NativePlayer::load_bytes registers it)
++        reserve_player_mut(|player| {
++            let url = match &player.movie_path_override {
++                Some(a) if a.rsplit('/').next().is_some_and(|n| n.eq_ignore_ascii_case(&file_name)) => a.clone(),
++                Some(a) if !a.is_empty() => format!("{}/{}", a.trim_end_matches('/'), file_name),
++                _ => format!("{base_url}{file_name}"),
++            };
++            player.net_manager.add_done_task(&url, data_bytes);
++        });
++    }
 +}
 +
 +impl TestHarness for TestPlayer {
@@ -6135,11 +6959,10 @@ index 7096c712..9d220653 100644
 +        let data_bytes =
 +            std::fs::read(&abs_path).unwrap_or_else(|e| panic!("Failed to read {}: {}", abs_path, e));
 +        self.load_movie_bytes(data_bytes, &abs_path).await;
-+    }
+     }
  
      async fn step_frame(&mut self) -> bool {
-         fire_pending_timeouts().await;
-@@ -196,7 +204,7 @@ pub fn run_test<F: std::future::Future<Output = ()>>(f: F) {
+@@ -196,7 +213,7 @@ pub fn run_test<F: std::future::Future<Output = ()>>(f: F) {
      // process); that is fine, ignore it.
      let _ = log::set_logger(&NATIVE_TEST_LOGGER)
          .map(|()| log::set_max_level(log::LevelFilter::Warn));
@@ -11695,7 +12518,7 @@ index 6ae8c20e..9f0f1b35 100644
                  );
              }
 diff --git a/vm-rust/src/rendering_gpu/webgl2/scene3d.rs b/vm-rust/src/rendering_gpu/webgl2/scene3d.rs
-index 1880c1df..852ace84 100644
+index 1880c1df..65d7300a 100644
 --- a/vm-rust/src/rendering_gpu/webgl2/scene3d.rs
 +++ b/vm-rust/src/rendering_gpu/webgl2/scene3d.rs
 @@ -9,8 +9,11 @@
@@ -11712,7 +12535,44 @@ index 1880c1df..852ace84 100644
      WebGl2RenderingContext, WebGlFramebuffer, WebGlProgram, WebGlTexture,
      WebGlUniformLocation,
  };
-@@ -1676,9 +1679,9 @@ void main() {
+@@ -1132,6 +1135,7 @@ void main() {
+         &mut self,
+         context: &WebGL2Context,
+         member_key: &(i32, i32),
++        scene: &W3dScene,
+         runtime_state: Option<&crate::player::cast_member::Shockwave3dRuntimeState>,
+         view_matrix: &[f32; 16],
+         projection_matrix: &[f32; 16],
+@@ -1140,6 +1144,17 @@ void main() {
+             Some(rs) if !rs.particles.is_empty() => rs,
+             _ => return Ok(()),
+         };
++        // Ruffle5 1.000.038: a particle system is keyed by its MODEL RESOURCE, and a
++        // resource is drawn only through a model that uses it (Director draws model
++        // resources through models, as with any other resource). 3D Blast Billiards
++        // makes its explosion resource ("partreso": 5001 orange particles bursting
++        // upward every 2.5 s) at setup and only makes a model from it when a bomb goes
++        // off; drawn by itself it was a fountain of sparks over the table, at the world
++        // origin, from the first frame of the game.
++        let used: std::collections::HashSet<Symbol> = scene.nodes.iter()
++            .filter(|n| n.node_type == W3dNodeType::Model)
++            .map(|n| if !n.model_resource_name.is_empty() { n.model_resource_name } else { n.resource_name })
++            .collect();
+         self.ensure_particle_shader(context)?;
+         let gl = context.gl();
+         let gpu_data = self.member_data.get(member_key);
+@@ -1179,8 +1194,9 @@ void main() {
+         gl.disable(WebGl2RenderingContext::CULL_FACE);
+         gl.depth_mask(false); // Don't write to depth buffer
+ 
+-        for (_name, ps) in &rs.particles {
++        for (name, ps) in &rs.particles {
+             if ps.positions.is_empty() { continue; }
++            if !used.contains(name) { continue; }
+ 
+             // colorRange / sizeRange / blendRange — interpolated over each particle's
+             // life in the shader (see vs/fs above).
+@@ -1676,9 +1692,9 @@ void main() {
                  // clamped to a black edge. That is why the baked light contributed
                  // nothing recognisable and had to be composited as ADD to look like
                  // anything at all (docs/areazero/README.md §3.3, "scene too bright").
@@ -11724,7 +12584,7 @@ index 1880c1df..852ace84 100644
                  }
                  group.push(buffers);
              }
-@@ -1777,6 +1780,9 @@ void main() {
+@@ -1777,6 +1793,9 @@ void main() {
                          if old.soft_alpha_textures.contains(tex_name) {
                              soft_alpha_textures.insert(*tex_name);
                          }
@@ -11734,7 +12594,7 @@ index 1880c1df..852ace84 100644
                          textures.insert(*tex_name, tex);
                          continue;
                      }
-@@ -1791,6 +1797,9 @@ void main() {
+@@ -1791,6 +1810,9 @@ void main() {
                  if soft_alpha {
                      soft_alpha_textures.insert(*tex_name);
                  }
@@ -11744,7 +12604,7 @@ index 1880c1df..852ace84 100644
                  textures.insert(*tex_name, tex);
              }
          }
-@@ -1931,6 +1940,9 @@ void main() {
+@@ -1931,6 +1953,9 @@ void main() {
                      } else {
                          gpu_data.soft_alpha_textures.remove(tex_name);
                      }
@@ -11754,7 +12614,7 @@ index 1880c1df..852ace84 100644
                      gpu_data.textures.insert(*tex_name, tex);
                      gpu_data.texture_versions.insert(*tex_name, write_version);
                  }
-@@ -2157,7 +2169,7 @@ void main() {
+@@ -2157,7 +2182,7 @@ void main() {
                                  // CLOD space. Passing this through is what keeps
                                  // the re-upload from flipping the flag.
                                  let uv2 = &mesh.tex_coords[1];
@@ -11763,7 +12623,16 @@ index 1880c1df..852ace84 100644
                                  mesh_buf.update_texcoord2(context.gl(), uv2, direct);
                                  mesh_buf.meshdeform_uv_synced = true;
                                  let resource_name = resource_name.as_str();
-@@ -3408,6 +3420,9 @@ void main() {
+@@ -2809,7 +2834,7 @@ void main() {
+         }
+ 
+         // Render particles (after opaque geometry), alpha-blended.
+-        let _ = self.render_particles(context, &member_key, runtime_state, &view_matrix, &projection_matrix);
++        let _ = self.render_particles(context, &member_key, scene, runtime_state, &view_matrix, &projection_matrix);
+ 
+         // #inker outlines, LAST. The inverted hull needs the inked model's own depth to
+         // clip it, and a translucent model wrote none (the transparent pass runs
+@@ -3408,6 +3433,9 @@ void main() {
              model_node.resource_name
          };
          let res_info = scene.model_resources.get(&resource);
@@ -11773,7 +12642,7 @@ index 1880c1df..852ace84 100644
  
          // Rasterwerks tags its skybox nodes `SB_*` under a `*SkyBox*` parent; other
          // movies just name a big camera-enclosing box "skybox" (unicraft clones one
-@@ -4735,6 +4750,13 @@ void main() {
+@@ -4735,6 +4763,13 @@ void main() {
          };
  
          let mut diffuse_name = String::new();
@@ -11787,7 +12656,7 @@ index 1880c1df..852ace84 100644
  
          // A #normalMap shader fixes its layer roles by slot: 1 = normal map,
          // 2 = diffuse, 3 = specular. Tangent-space normal mapping isn't
-@@ -4789,11 +4811,20 @@ void main() {
+@@ -4789,11 +4824,20 @@ void main() {
              // Require corroboration from position: only a layer AFTER the first
              // usable one can be baked lighting. Phosphor's lightmap sits in a later
              // slot, so its case is unaffected; a lone texture is always the diffuse.
@@ -11810,7 +12679,7 @@ index 1880c1df..852ace84 100644
                  result.diffuse = Some(tex);
                  diffuse_name = lower;
                  if layer.tex_transform != identity {
-@@ -4820,7 +4851,7 @@ void main() {
+@@ -4820,7 +4864,7 @@ void main() {
                  // textureList[2]) shade as material colour multiplied by light
                  // intensity, and have no diffuse layer to read a blend function
                  // against, so they are pinned to multiply.
@@ -11819,7 +12688,7 @@ index 1880c1df..852ace84 100644
                      && layer_idx > 0
                      && layers[..layer_idx].iter().all(|prev| prev.name.is_empty());
                  let blend = if lightmap_only {
-@@ -6854,6 +6885,29 @@ fn get_runtime_transform(rs: &crate::player::cast_member::Shockwave3dRuntimeStat
+@@ -6854,6 +6898,29 @@ fn get_runtime_transform(rs: &crate::player::cast_member::Shockwave3dRuntimeStat
      rs.node_transforms.get(&name).copied()
  }
  

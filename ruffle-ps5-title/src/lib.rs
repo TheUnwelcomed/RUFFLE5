@@ -155,6 +155,26 @@
 //! sound N` can be read (3D Pool's PlayMusic stopped its movie on it), `sqrt` of a negative number
 //! is NaN, not a script error (DQ Minigolf stopped in a beginSprite).
 //!
+//! 1.000.038 (2026-10-30): the Golf Ace engine (3D Golf, zapak 1178; Golf Ace itself untested, its
+//! files not sent) plays its holes through: DirPlayer's Havok reads the text form of a .hke
+//! (BEGIN_WORLD … END_WORLD: the ball and its drag, read as nothing before, so the shot had no
+//! ball), `linearMomentum` is mass × velocity (the shot's impulse went nowhere), a step reports
+//! only its own contacts (the last contact lingered while the ball flew, the game kept it "on the
+//! ground" and braked it in the air: a wedge carried 20 yards), a body held on a surface is in
+//! contact with it every step (the ball saw its green every other frame, rolled 35 yards off a
+//! 10-yard putt), and the held surface must be under the body (over the cup the ball sat on
+//! nothing and never dropped in). `keyPressed(",")` and the other punctuation keys look up their
+//! own key codes (3D Blast Billiards charges its shot on the comma key); a particle model resource
+//! without a model is not drawn (its explosion resource was a fountain over the table from the
+//! first frame). The Jetsons' loader gets its own movie as a done stream (a movie's own address
+//! answers getStreamStatus). Happy Wheels (Flash, the full version): every "+" in a level name is a
+//! space (URLVariables), keys reach the stage after the menu is taken down (the focus of an object
+//! removed with its ancestor is dropped), and its "User Submitted Levels" browser is answered from
+//! the game's own db/ folder (src/hwserver.rs: the level list filtered, sorted and paged as
+//! get_levels_wr2.php does, the levels from get_featured_levels.php) by the navigator
+//! (src/navigator.rs: a file: request for a missing db/*.php is answered by the stand-in server).
+//! What Lingo and a Flash member say is logged ("flash: sprite N (member L:M) trace: …").
+//!
 //! Progress is written to /data/ruffle5/ruffle.log by the shell's `ps5_log`.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -162,7 +182,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::time::{Duration, Instant};
 
 /// The title's version, as Settings shows it.
-pub const APP_VERSION: &str = "1.000.037";
+pub const APP_VERSION: &str = "1.000.038";
 pub const APP_NAME: &str = "Ruffle5";
 pub const AUTHOR: &str = "@TheUnwelcomed";
 
@@ -209,6 +229,7 @@ mod library;
 mod menu;
 #[cfg(feature = "ruffle")]
 mod navigator;
+mod hwserver;
 #[cfg(feature = "ruffle")]
 mod online;
 #[cfg(feature = "ruffle")]

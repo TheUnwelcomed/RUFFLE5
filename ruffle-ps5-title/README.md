@@ -89,7 +89,8 @@ two settings can be compared on the same game.
 | `src/game.rs` | one game: loading screen, the player and its options, quick menu, overlay, the frame-time log |
 | `src/dir3d.rs` | which Director games have Shockwave 3D (the menu's categories, 1.000.033) |
 | `src/dirinfo.rs` | what the menu says of a Director game and which file in its folder starts it: `Projector.ini`'s movie, the movie inside a Windows projector (`mallcop.exe`, 1.000.037), else its `.dcr` |
-| `src/navigator.rs` | where a Flash game's files come from: beside the movie, and (a Flashpoint game) by web address from its game data's `content/` (1.000.033), or from Flashpoint's server (1.000.034) |
+| `src/navigator.rs` | where a Flash game's files come from: beside the movie, and (a Flashpoint game) by web address from its game data's `content/` (1.000.033), or from Flashpoint's server (1.000.034); a missing `db/*.php` beside a game's level files is answered by the stand-in level server (1.000.038) |
+| `src/hwserver.rs` | the stand-in level server: Happy Wheels' "User Submitted Levels" browser answered from the game's own `db/` folder — the level list filtered, sorted and paged as `get_levels_wr2.php` does (1.000.038) |
 | `src/fpfetch.rs` | a Flashpoint game's files that are not on the console: asked of Flashpoint's server when the game asks for them, and kept (1.000.034) |
 | `src/pretend.rs` | Pretend to be on for Flash and Shockwave games, and its Automatic choice: the site the game's own file names (1.000.035) |
 | `src/dirflash.rs` | a Shockwave game's Flash cast members: a Ruffle player per Flash sprite, drawn into the sprite, talking with Lingo as through Director's Flash Asset Xtra (1.000.036) |
@@ -274,7 +275,9 @@ Ruffle it plays Flash games with (`src/dirflash.rs`):
 * what Lingo asks goes to `core/src/dirplayer.rs`, added to Ruffle by `tools/ruffle-dirplayer.patch`
   (`tools/fetch-ruffle.sh`, run by `build-title.sh`, puts the pinned Ruffle in `vendor/ruffle`
   and Cargo.toml builds Ruffle from there). It follows DirPlayer's own fork of Ruffle: a variable
-  is answered as a string, as the classic GetVariable gives it (ActionScript's `toString`), an
+  is answered as it is, and DirPlayer writes a number or a boolean as Flash's `String()` does
+  when `returnAsString` (the default) asks for text, else hands it over as a number or 1/0
+  (1.000.038: 3D Golf's menu asks `getVariable("externalImagesLoaded", 0) <> 1`); an
   object or movie clip as a handle; an object a function returns is kept in the movie
   (`_root.__dirplayer_ref_N`) for later calls; `newObject` makes the object (the web build answers
   a handle to nothing); `callFrame` runs a frame's actions and leaves the playhead (the web build
@@ -284,6 +287,19 @@ Ruffle it plays Flash games with (`src/dirflash.rs`):
 Not there yet: `setCallback` (a Lingo handler run when an ActionScript object's method is called),
 a LocalConnection between a Director movie and its Flash members, `convert(#image, …)` of a
 BitmapData, and Lingo reading the variables of a Flash member made for ActionScript 3 (it plays).
+
+### Havok (1.000.038)
+
+DirPlayer's Havok (its own physics in `havok_physics.rs`, standing in for the Havok Xtra) plays
+the Golf Ace engine's holes through (3D Golf, zapak 1178, is the copy checked; Golf Ace itself
+has the same scripts): a `.hke` in its text form (`BEGIN_WORLD … END_WORLD`) gives the world its
+bodies and drag action; `linearMomentum` is mass × velocity; a step reports the contacts of that
+step only, a body held on a surface by its resting contact is in contact with it every step (as
+the engine reports a body on a surface while it is awake; a game's collision callback is how it
+knows what the ball is on), and the held surface must be under the body (a ball over the cup cut
+out of its green drops into it). The ball's flight is the drag law's (a 1-wood 204 yards, a
+pitching wedge 72, at full power); how far a putt rolls on the green is not checked against
+Director (the green has no script drag: only the engine's own).
 
 ### Shockwave 3D (1.000.030)
 

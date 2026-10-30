@@ -10,6 +10,10 @@
 //! game data keeps its file names and as Flashpoint's server looks them up (the name as written
 //! when only that is there), the query left off. Relative names and file addresses are read as
 //! before, by Ruffle's own `fetch_path`. Nothing goes to the network.
+//!
+//! 1.000.038: a file under a game's `db/` folder that is not there, in a folder that has the level
+//! server's answers as files (Happy Wheels' full version: `db/get_featured_levels.php`), is
+//! answered by the stand-in server (src/hwserver.rs) — from bytes, not a file.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::path::{Path, PathBuf};
@@ -79,6 +83,73 @@ impl Ps5Navigator {
     pub fn web_root(&self) -> Option<&Path> {
         self.web_root.as_deref()
     }
+
+    /// 1.000.038: `<game>/db/<name>` asked for and not there, in a folder with the level server's
+    /// answers: what the stand-in server says (src/hwserver.rs).
+    fn stand_in_answer(&self, url: &Url, request: &Request) -> Option<Vec<u8>> {
+        if url.scheme() != "file" {
+            return None;
+        }
+        let mut plain = url.clone();
+        plain.set_query(None);
+        let path = plain.to_file_path().ok()?;
+        if path.is_file() {
+            return None;
+        }
+        let db = path.parent()?;
+        if db.file_name()?.to_str()? != "db" {
+            return None;
+        }
+        let game = db.parent()?;
+        if !crate::hwserver::serves(game) {
+            return None;
+        }
+        let name = path.file_name()?.to_str()?;
+        let body = request.body().as_ref().map(|(b, _)| b.as_slice());
+        let answer = crate::hwserver::answer(game, name, url.query().unwrap_or(""), body);
+        crate::say(&format!(
+            "     level server: db/{name}{}{} -> {}",
+            url.query().map(|q| format!("?{q}")).unwrap_or_default(),
+            body.map(|b| format!(" (form {} bytes)", b.len())).unwrap_or_default(),
+            answer.as_ref().map(|a| format!("answered, {} bytes", a.len())).unwrap_or_else(|| "not one of its files".to_string())
+        ));
+        answer
+    }
+}
+
+/// An answer made here, not read from a file.
+struct BytesResponse {
+    url: String,
+    bytes: Option<Vec<u8>>,
+}
+
+impl SuccessResponse for BytesResponse {
+    fn url(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(&self.url)
+    }
+    fn set_url(&mut self, url: String) {
+        self.url = url;
+    }
+    fn body(self: Box<Self>) -> OwnedFuture<Vec<u8>, ruffle_core::loader::Error> {
+        let bytes = self.bytes.unwrap_or_default();
+        Box::pin(async move { Ok(bytes) })
+    }
+    fn text_encoding(&self) -> Option<&'static encoding_rs::Encoding> {
+        None
+    }
+    fn status(&self) -> u16 {
+        200
+    }
+    fn redirected(&self) -> bool {
+        false
+    }
+    fn next_chunk(&mut self) -> OwnedFuture<Option<Vec<u8>>, ruffle_core::loader::Error> {
+        let chunk = self.bytes.take();
+        Box::pin(async move { Ok(chunk) })
+    }
+    fn expected_length(&self) -> Result<Option<u64>, ruffle_core::loader::Error> {
+        Ok(self.bytes.as_ref().map(|b| b.len() as u64))
+    }
 }
 
 impl NavigatorBackend for Ps5Navigator {
@@ -92,6 +163,10 @@ impl NavigatorBackend for Ps5Navigator {
             // not on the console: from Flashpoint's server first, when the game came from there
             if self.fetch.is_some() {
                 self.fetched(&url);
+            }
+            // 1.000.038: the level server's answers a Happy Wheels folder does not have
+            if let Some(bytes) = self.stand_in_answer(&url, &request) {
+                return Box::pin(async move { Ok(Box::new(BytesResponse { url: url.to_string(), bytes: Some(bytes) }) as Box<dyn SuccessResponse>) });
             }
             if let (Some(root), true) = (&self.web_root, matches!(url.scheme(), "http" | "https")) {
                 if let Some(file) = web_file(root, &url).and_then(|p| Url::from_file_path(p).ok()) {
@@ -184,6 +259,45 @@ mod tests {
         // without a web root, a web address is not read
         let (plain, _) = Ps5Navigator::new(&game, None, &executor);
         assert!(now(plain.fetch(Request::get("http://www.example.com/games/x/level.swf".to_string()))).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 1.000.038: Happy Wheels' level browser answered by the stand-in server.
+    #[test]
+    fn a_level_servers_missing_answers_are_made_up_from_the_featured_list() {
+        let root = std::env::temp_dir().join(format!("ruffle5-nav-hw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let game = root.join("HappyWheels Full");
+        std::fs::create_dir_all(game.join("db")).unwrap();
+        std::fs::write(game.join("Happy-Wheels.swf"), b"FWS-main").unwrap();
+        // the site's own form of the featured list: one level
+        std::fs::write(
+            game.join("db/get_featured_levels.php"),
+            b"ToFlash=a%3A1%3A%7Bi%3A0%3Ba%3A3%3A%7Bs%3A4%3A%22id_x%22%3Bs%3A1%3A%227%22%3Bs%3A4%3A%22name%22%3Bs%3A10%3A%22Crime+City%22%3Bs%3A6%3A%22public%22%3Bs%3A1%3A%221%22%3B%7D%7D",
+        )
+        .unwrap();
+        std::fs::write(game.join("db/get_login.php"), b"ToFlash=x").unwrap();
+        let executor = NullExecutor::new();
+        let (nav, err) = Ps5Navigator::new(&game, None, &executor);
+        assert!(err.is_none());
+        let read = |url: &str| -> Result<Vec<u8>, String> {
+            let response = now(nav.fetch(Request::get(url.to_string()))).map_err(|e| e.error.to_string())?;
+            now(response.body()).map_err(|e| e.to_string())
+        };
+        // a file that is there is read as before
+        assert_eq!(read("db/get_login.php").unwrap(), b"ToFlash=x");
+        // the browser's list, not a file: made up from the featured list
+        let list = read("./db/get_levels_wr2.php?offset=0&character=0&uploaded=week&sortby=newest&public=1").unwrap();
+        let text = String::from_utf8(list).unwrap();
+        assert!(text.starts_with("ToFlash=a%3A1%3A") && text.contains("Crime%20City"), "{text}");
+        // not one of the server's files: an error, as before
+        assert!(read("db/vote_level.php").is_err());
+        // a folder without the featured list is untouched
+        let other = root.join("Other");
+        std::fs::create_dir_all(other.join("db")).unwrap();
+        let (plain, _) = Ps5Navigator::new(&other, None, &executor);
+        let Ok(response) = now(plain.fetch(Request::get("db/get_levels_wr2.php".to_string()))) else { panic!("a file response") };
+        assert!(now(response.body()).is_err(), "nothing made up there");
         let _ = std::fs::remove_dir_all(&root);
     }
 

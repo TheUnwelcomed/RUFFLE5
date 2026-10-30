@@ -16,7 +16,7 @@ crate-type = ["staticlib", "rlib"]
 default = []
 # Phase 3b: Ruffle itself. The default build (3a) is only the GPU seam: wgpu on the static RADV,
 # clearing the display — nothing of Ruffle is compiled, so nothing of Ruffle can block it.
-ruffle = ["dep:ruffle_core", "dep:ruffle_render", "dep:ruffle_render_wgpu", "dep:ruffle_video_software", "dep:url", "dep:vm-rust", "dep:r5net", "dep:image", "dep:async-channel"]
+ruffle = ["dep:ruffle_core", "dep:ruffle_render", "dep:ruffle_render_wgpu", "dep:ruffle_video_software", "dep:url", "dep:vm-rust", "dep:r5net", "dep:image", "dep:async-channel", "dep:encoding_rs"]
 
 [dependencies]
 # Pinned to a Ruffle revision whose render/wgpu uses wgpu 30 (clone HEAD 2026-10-19).
@@ -42,6 +42,8 @@ url = { version = "2", optional = true }
 # Only for the channel types in Ruffle's NavigatorBackend trait (src/navigator.rs: a Flash game's
 # files by web address); the async-channel 2.x Ruffle already builds.
 async-channel = { version = "2", optional = true }
+# 1.000.038: the navigator's answers made here (the text encoding type of Ruffle's response trait)
+encoding_rs = { version = "0.8.35", optional = true }
 # Director / Shockwave games (src/shockwave.rs): DirPlayer's VM, fetched into vendor/dirplayer at the
 # commit tools/fetch-dirplayer.sh pins, with tools/dirplayer-native.patch (build-title.sh runs it).
 vm-rust = { path = "vendor/dirplayer/vm-rust", default-features = false, optional = true }

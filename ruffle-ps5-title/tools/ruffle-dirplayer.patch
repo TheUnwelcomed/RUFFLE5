@@ -51,12 +51,28 @@ index a47c3df..d8b2ad4 100644
  resolver = "2"
  
  [workspace.package]
+diff --git a/core/src/avm2/globals/flash/net/URLVariables.as b/core/src/avm2/globals/flash/net/URLVariables.as
+index ed17ecf..8865b3b 100644
+--- a/core/src/avm2/globals/flash/net/URLVariables.as
++++ b/core/src/avm2/globals/flash/net/URLVariables.as
+@@ -15,7 +15,10 @@ package flash.net {
+                 if (splitIndex === -1) {
+                     throw new Error("Error #2101: The String passed to URLVariables.decode() must be a URL-encoded query string containing name/value pairs.", 2101);
+                 }
+-                pair = pair.AS3::replace("+", " ");
++                // Ruffle5 1.000.038: every "+" is a space, not only the first (a String pattern
++                // replaces one; PHP's urlencode writes every space as "+": Happy Wheels' level
++                // names came as "Crime+City")
++                pair = pair.AS3::split("+").AS3::join(" ");
+                 var prop = unescapeMultiByte(pair.AS3::slice(0, splitIndex));
+                 var val = unescapeMultiByte(pair.AS3::slice(splitIndex + 1));
+                 if (this[prop] == null) {
 diff --git a/core/src/dirplayer.rs b/core/src/dirplayer.rs
 new file mode 100644
-index 0000000..0e94b88
+index 0000000..477e5fd
 --- /dev/null
 +++ b/core/src/dirplayer.rs
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,329 @@
 +//! PS5_RUFFLE_DIRPLAYER_FLASH_V1 — what a Director (Shockwave) movie asks of its Flash members.
 +//!
 +//! Ruffle5 plays a Shockwave game's Flash cast members with Ruffle, one player per Flash sprite,
@@ -208,6 +224,12 @@ index 0000000..0e94b88
 +                None | Some(Value::Undefined) => LingoValue::Undefined,
 +                Some(Value::Null) => LingoValue::Null,
 +                Some(Value::Object(_) | Value::MovieClip(_)) => LingoValue::Object(path.to_string()),
++                // typed (1.000.038): Director's getVariable with returnAsString FALSE gives a
++                // Boolean as 1/0 and a Number as a number (3D Golf's menu:
++                // `getVariable("externalImagesLoaded", 0) <> 1`); the string form is made by the
++                // caller as Flash's String() makes it
++                Some(Value::Bool(b)) => LingoValue::Bool(b),
++                Some(Value::Number(n)) => LingoValue::Number(n),
 +                Some(v) => match v.coerce_to_string(activation) {
 +                    Ok(s) => LingoValue::String(s.to_string()),
 +                    Err(_) => LingoValue::Undefined,
@@ -380,6 +402,33 @@ index 0000000..0e94b88
 +        }
 +    }
 +}
+diff --git a/core/src/display_object.rs b/core/src/display_object.rs
+index 574e95d..1175481 100644
+--- a/core/src/display_object.rs
++++ b/core/src/display_object.rs
+@@ -1954,6 +1954,22 @@ pub trait TDisplayObject<'gc>:
+             if let Some(int) = self.as_interactive() {
+                 int.drop_focus(context);
+             }
++            // PS5_RUFFLE_DIRPLAYER_FLASH_V1 (Ruffle5 1.000.038): the focus of an object inside
++            // what was removed goes too. Flash sets the stage's focus to null when the focused
++            // object leaves the display list with one of its ancestors; without this the keys kept
++            // going to a button of a menu already taken down and never reached the stage (Happy
++            // Wheels: after "PLAY NOW" the arrows did nothing until a click into the level).
++            if let Some(focused) = context.focus_tracker.get() {
++                let mut ancestor = focused.as_displayobject().parent();
++                while let Some(a) = ancestor {
++                    if std::ptr::eq(a.as_ptr(), self.as_ptr()) {
++                        let tracker = context.focus_tracker;
++                        tracker.set(None, context);
++                        break;
++                    }
++                    ancestor = a.parent();
++                }
++            }
+ 
+             self.on_parent_removed(context);
+         }
 diff --git a/core/src/lib.rs b/core/src/lib.rs
 index d76c1cb..dd485aa 100644
 --- a/core/src/lib.rs
